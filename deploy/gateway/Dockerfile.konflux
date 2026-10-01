@@ -1,6 +1,6 @@
 # Konflux build for the AI Grid data-plane gateway (RHOAI onboarding, RHOAIENG-95092).
 # Mirrors deploy/gateway/Containerfile.ubi9. FROM images pinned to @sha256 for renovate.
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:9295c5c688f487fa5cf27a734fa55ecd57aeb7dc0904ba537da4f42dfa1d0acb AS build
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:094ea2ecfd3225af8f93807b99daa9ff33710fc705ebdf6e8466f46ed605585c AS build
 
 # openssl-devel/pkgconf: praxis-proxy (Pingora) links OpenSSL.
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
@@ -20,7 +20,7 @@ COPY . .
 RUN cargo build --release --manifest-path gateway/Cargo.toml --bin grid-gateway \
     && cp gateway/target/release/grid-gateway /usr/local/bin/grid-gateway
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:fac0bde5012de6a8475bb5dc18db968cdc90b12d9dc2ffaddb4a4975d0b8a04f
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:154811228435396156662801174566829a2c27d8a0b0f9af6e6d6e76ddf87ffe
 
 RUN microdnf install -y --nodocs ca-certificates \
     && microdnf clean all
