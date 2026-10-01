@@ -1,3 +1,4 @@
+{{- include "grid-enrollment.validateAuthz" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,6 +16,7 @@ spec:
       labels:
         {{- include "grid-enrollment.enrollmentSelectorLabels" . | nindent 8 }}
     spec:
+      enableServiceLinks: false
       serviceAccountName: {{ include "grid-enrollment.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -27,7 +29,7 @@ spec:
         # The service applies its schema on first connect, so it only needs the
         # DB reachable. External DBs are assumed already up.
         - name: wait-for-db
-          image: {{ .Values.db.builtin.image }}
+          image: {{ include "grid-enrollment.dbImage" . | quote }}
           imagePullPolicy: {{ .Values.db.builtin.pullPolicy }}
           securityContext:
             {{- toYaml .Values.enrollment.securityContext | nindent 12 }}
@@ -38,7 +40,7 @@ spec:
       {{- end }}
       containers:
         - name: enrollment
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "grid-enrollment.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.enrollment.securityContext | nindent 12 }}
@@ -77,6 +79,14 @@ spec:
               value: {{ .Values.enrollment.listenAddr | quote }}
             - name: ENROLLMENT_AUTHZ
               value: {{ .Values.enrollment.authz | quote }}
+            {{- if eq .Values.enrollment.authz "kube" }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENROLLMENT_TOKEN_AUDIENCE
+              value: {{ .Values.enrollment.tokenAudience | quote }}
+            {{- end }}
             {{- if .Values.enrollment.certLifetimeSecs }}
             - name: ENROLLMENT_CERT_LIFETIME_SECS
               value: {{ .Values.enrollment.certLifetimeSecs | quote }}
