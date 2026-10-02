@@ -15,7 +15,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit lint lint-extra fmt doc audit \
-	generate-api-types codegen-check \
+	generate-api-types codegen-check generate-crds crds-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
@@ -56,14 +56,14 @@ clean:
 test: test-unit
 
 test-unit:
-	cargo test --workspace $(_NOCAPTURE)
+	cargo test --locked --workspace $(_NOCAPTURE)
 
 # -------------------------------------------------------------------
 # Quality
 # -------------------------------------------------------------------
 
 lint:
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
 	cargo machete
 
@@ -84,6 +84,15 @@ generate-api-types:
 # Fail if the checked-in wire types no longer match the spec.
 codegen-check:
 	cargo run --quiet -p xtask -- check-api-types
+
+# Regenerate the CRD manifests in deploy/crds and charts/grid-operator/templates/crds
+# from the Rust types in operator/src/crd.
+generate-crds:
+	./scripts/generate-deployment-crds.sh
+
+# Fail if the checked-in CRD manifests no longer match the Rust types.
+crds-check:
+	./scripts/generate-deployment-crds.sh --check
 
 audit:
 	cargo audit

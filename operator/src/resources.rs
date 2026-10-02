@@ -37,6 +37,8 @@ pub(crate) mod provider_metrics;
 pub mod routing_overlay;
 /// Secret builders for grid TLS certificates.
 pub mod secret;
+/// Grid serving config the gateway's cross-site pollers read.
+pub(crate) mod serving_config;
 /// Shared Kubernetes Secret test doubles, reused by `secret`/`endpoint_tls`
 /// unit tests instead of each keeping its own copy of the same mock.
 #[cfg(test)]
@@ -50,6 +52,8 @@ pub(crate) mod endpoint_tls;
 pub(crate) mod gateway_probe;
 /// Live MCP `tools/list` probe for [`AgentToolProvider`](crate::crd::agent_tool_provider::AgentToolProvider).
 pub(crate) mod mcp_probe;
+/// Served-model discovery sources for [`InferenceProvider`](crate::crd::inference_provider::InferenceProvider).
+pub(crate) mod model_discovery;
 /// TLS backend abstraction: client config, connectors, handshake, PEM gates.
 pub mod tls_backend;
 /// TLS gateway probe — bounded handshake and peer certificate extraction.
