@@ -30,6 +30,9 @@ use crate::{
 /// How long a token stays usable when the grid-admin names no expiry.
 const DEFAULT_TOKEN_TTL_SECS: i64 = 24 * 60 * 60;
 
+/// Longest token lifetime a grid-admin may ask for.
+const MAX_TOKEN_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// How long a single request may run before it is cut off. Bounds the time a slow
 /// caller holds a task, the way the body limit bounds the bytes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -324,10 +327,10 @@ async fn mint_site_token(
     // is reserved for an unset expiry.
     let ttl_secs = match input.expires_in_secs {
         None => DEFAULT_TOKEN_TTL_SECS,
-        Some(secs) if secs <= 0 => {
+        Some(secs) if !(1..=MAX_TOKEN_TTL_SECS).contains(&secs) => {
             return Err(ApiError::BadRequest {
                 code: "invalid_token_ttl",
-                message: "expiresInSecs must be greater than zero".to_owned(),
+                message: format!("expiresInSecs must be between 1 and {MAX_TOKEN_TTL_SECS}"),
             });
         },
         Some(secs) => secs,
@@ -457,12 +460,21 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// A fresh one-time site token: 256 bits from the system CSPRNG, hex encoded.
+fn generate_token() -> Result<String, ApiError> {
+    random_hex(32)
+}
+
+/// `len` bytes from the system CSPRNG, hex encoded.
 ///
 /// The default build draws from ring's `SystemRandom`. A fips build draws from
 /// system openssl so the entropy source stays in the validated module. Hex keeps
 /// it header-safe with no padding.
-fn generate_token() -> Result<String, ApiError> {
-    let mut bytes = [0_u8; 32];
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] when the system random source fails.
+pub fn random_hex(len: usize) -> Result<String, ApiError> {
+    let mut bytes = vec![0_u8; len];
     fill_random(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }

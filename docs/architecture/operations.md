@@ -29,14 +29,9 @@ helm upgrade grid-operator \
   --namespace grid-system
 ```
 
-Helm installs CRDs on first install but does not upgrade them. When upgrading
-to a version with changed CRDs, apply the new CRDs before the chart upgrade:
-
-```console
-kubectl apply -f charts/grid-operator/crds/
-helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
-  --version <new-version> --namespace grid-system
-```
+The chart installs and upgrades the CRDs. A platform that owns them sets
+`crds.enabled: false`. The chart README covers adopting CRDs that an older
+release installed.
 
 Uninstalling the chart removes namespaced resources but retains CRDs.
 Custom resources created by other chart releases (e.g., grid-site) are
@@ -58,9 +53,7 @@ kubectl apply -k deploy/operator/
 
 ```console
 # Apply CRDs first
-kubectl apply -f deploy/crds/gridnetwork.yaml
-kubectl apply -f deploy/crds/gridsite.yaml
-kubectl apply -f deploy/crds/inferenceprovider.yaml
+kubectl apply -k deploy/crds/
 
 # Apply operator resources with Kustomize
 kubectl apply -k deploy/operator/
@@ -77,8 +70,12 @@ kubectl apply -k deploy/operator/
 For regenerating CRDs after schema changes:
 
 ```console
-./scripts/generate-deployment-crds.sh
+make generate-crds
 ```
+
+This writes `deploy/crds/` and `charts/grid-operator/templates/crds/`. CI runs
+`make crds-check`, which fails when the committed CRDs no longer match the
+Rust types.
 
 **Container image pattern**: The operator Containerfile uses a
 `rust:1.96-alpine` builder with BuildKit cache mounts, and an `alpine:3.23`
@@ -156,9 +153,9 @@ kubectl set image deployment/grid-operator \
 
 **Registry namespace:** the image is published under `ghcr.io/praxis-proxy/`.
 
-**CI publishing setup:** the
-`.github/workflows/operator-image.yaml` publishes source-SHA images from
-`main`. `.github/workflows/release.yaml` publishes version and source-SHA tags
+**CI publishing setup:** the `publish` job in
+`.github/workflows/helm.yaml` publishes source-SHA images from `main`, using
+the images the e2e jobs tested. `.github/workflows/release.yaml` publishes version and source-SHA tags
 after the tagged source passes release gates.
 
 **Security:** the operator image contains only the
@@ -200,6 +197,9 @@ granted for `secrets` and `configmaps`.  `delete` and
 | Resource | Verbs | Why |
 |---|---|---|
 | `events` | `create`, `patch` | Published on `GridSite` phase/reason transitions with action `GatewayProbe` |
+
+`GridSite` is cluster-scoped, so its events land in the operator namespace:
+`kubectl -n <operator namespace> get events --field-selector involvedObject.kind=GridSite`.
 
 **Core resources (namespaced, `grid-operator-resources`):**
 
@@ -303,13 +303,25 @@ unrelated address.
 |---|---|
 | `GRID_SWIM_BIND_ADDR` | UDP address to bind the SWIM listener |
 | `GRID_SWIM_ADVERTISE_ADDR` | Advertised SWIM endpoint; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` and defaults to `$(POD_IP):7946` |
+| `GRID_SWIM_SERVICE_NAME` | SWIM Service in the operator namespace, which must be type LoadBalancer. The operator advertises its LoadBalancer address, waiting for it without a fallback and reporting not ready until then. Controllers run during the wait, and writes derived from membership wait for a first peer or a 15 second grace. When three polls in a row no longer list the advertised hostname or IP, the operator leaves the cluster and exits, so the restarted pod advertises the new one |
+| `GRID_SWIM_ADVERTISE_FALLBACK` | Marks a `GRID_SWIM_ADVERTISE_ADDR` equal to it as the Pod IP default. The operator then builds the Pod IP endpoint itself, bracketing IPv6, or discovers the LoadBalancer address when `GRID_SWIM_SERVICE_NAME` names a Service. An older operator ignores it and advertises the Pod IP |
+| `GRID_SWIM_REQUIRE_KEY` | Hold all SWIM traffic until the `GridNetwork` key loads or the network declares none. Defaults to `true`. With `false`, SWIM is plaintext while no network exists |
 | `GRID_SWIM_SITE_NAME` | Unique site identity for this operator instance |
 | `GRID_SWIM_SEEDS` | Comma-separated SWIM seed endpoints; accepts `ip:port`, `[ipv6]:port`, or `hostname:port` |
+| `GRID_SIGNALS_ADDR` | Signals listener address. Defaults to `[::]:9091`, or `0.0.0.0:9091` on a host without IPv6 |
+| `GRID_SIGNALS_ADVERTISE_ADDR` | Signals endpoint gossiped to peers, as `ip:port`, `[ipv6]:port`, or `hostname:port`. Without it, a site advertising the SWIM LoadBalancer gossips that address on the Service port named `signals`, and any other site gossips none. A LoadBalancer site needs one of the two, and the Service port needs a LoadBalancer that serves UDP and TCP on one Service |
+| `GRID_SIGNALS_PEER_PORT` | Port dialed on a peer's SWIM host when the peer gossips no signals endpoint. Defaults to `9091` |
+| `GRID_SIGNALS_MAX_PER_PEER` | Concurrent authenticated signals connections one peer site may hold. Defaults to `8` |
 | `GRID_GATEWAY_ADDRESS` | Explicit gateway address override (skips self-discovery) |
 | `GRID_GATEWAY_SERVICE_NAME` | Service name for gateway self-discovery (default: `provider-gateway`) |
 | `GRID_GATEWAY_NAMESPACE` | Namespace for gateway Service lookup (default: `grid-system`) |
 | `GRID_GATEWAY_PORT` | Port appended to discovered address (default: `8080`) |
 | `GRID_GATEWAY_DISCOVERY_INTERVAL_MS` | Polling interval for gateway discovery (default: `5000`) |
+
+The signals listener caps handshakes per client source address. Behind a
+LoadBalancer, set `externalTrafficPolicy: Local` on the Service that carries
+the signals port. With `Cluster`, node SNAT gives many clients one source
+address, and they share its cap.
 
 `GRID_SWIM_ENCRYPT_KEY` is intentionally omitted from the
 `Deployment`.  Production SWIM encryption uses

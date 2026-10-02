@@ -17,7 +17,7 @@ use openssl::{
     },
 };
 
-use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, SignedCsr};
+use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, GeneratedCsr, SignedCsr};
 
 /// Material for signing site certificates under a CA.
 pub(crate) struct CaMaterial {
@@ -99,15 +99,28 @@ fn append_ca_extensions(builder: &mut X509Builder) -> Result<(), BackendError> {
     builder.append_extension(usage).map_err(|err| sign_err(&err))
 }
 
-/// Append the leaf extensions: basic-constraints, server/client EKU, and SANs.
+/// Append the X.509-SVID leaf constraints: critical CA:FALSE and digitalSignature only.
+fn append_svid_leaf_extensions(builder: &mut X509Builder) -> Result<(), BackendError> {
+    let constraints = BasicConstraints::new()
+        .critical()
+        .build()
+        .map_err(|err| sign_err(&err))?;
+    builder.append_extension(constraints).map_err(|err| sign_err(&err))?;
+    let usage = KeyUsage::new()
+        .critical()
+        .digital_signature()
+        .build()
+        .map_err(|err| sign_err(&err))?;
+    builder.append_extension(usage).map_err(|err| sign_err(&err))
+}
+
+/// Append the leaf extensions: the X.509-SVID constraints, server/client EKU, and SANs.
 fn append_leaf_extensions(
     builder: &mut X509Builder,
     spec: &CertSpec<'_>,
     issuer_cert: Option<&X509Ref>,
 ) -> Result<(), BackendError> {
-    builder
-        .append_extension(BasicConstraints::new().build().map_err(|err| sign_err(&err))?)
-        .map_err(|err| sign_err(&err))?;
+    append_svid_leaf_extensions(builder)?;
     let eku = ExtendedKeyUsage::new()
         .server_auth()
         .client_auth()
@@ -204,6 +217,29 @@ pub(crate) fn generate_ca(spec: &CertSpec<'_>) -> Result<GeneratedCa, BackendErr
         cert_pem: to_pem(&cert)?,
         key_pem: key_to_pem(&key)?,
         material: CaMaterial { cert, key },
+    })
+}
+
+/// Generate a key and a CSR naming only `common_name`.
+pub(crate) fn generate_csr(common_name: &str) -> Result<GeneratedCsr, BackendError> {
+    let key = generate_p256()?;
+    let mut subject = X509NameBuilder::new().map_err(|err| sign_err(&err))?;
+    subject
+        .append_entry_by_text("CN", common_name)
+        .map_err(|err| sign_err(&err))?;
+    let subject = subject.build();
+    let mut builder = X509Req::builder().map_err(|err| sign_err(&err))?;
+    builder.set_subject_name(&subject).map_err(|err| sign_err(&err))?;
+    builder.set_pubkey(&key).map_err(|err| sign_err(&err))?;
+    builder
+        .sign(&key, MessageDigest::sha256())
+        .map_err(|err| sign_err(&err))?;
+    let req = builder.build();
+    let csr_pem = String::from_utf8(req.to_pem().map_err(|err| sign_err(&err))?)
+        .map_err(|err| BackendError::Sign(err.to_string()))?;
+    Ok(GeneratedCsr {
+        csr_pem,
+        key_pem: key_to_pem(&key)?,
     })
 }
 

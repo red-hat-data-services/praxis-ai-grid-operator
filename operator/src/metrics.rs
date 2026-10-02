@@ -6,8 +6,8 @@
 use std::{sync::LazyLock, time::Duration};
 
 use prometheus::{
-    Encoder as _, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder, proto::MetricFamily,
+    Encoder as _, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder, proto::MetricFamily,
 };
 
 // ---------------------------------------------------------------------------
@@ -45,8 +45,44 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .unwrap_or_else(|_| std::process::abort());
     r.register(Box::new(PEER_POLLS_IN_FLIGHT.clone()))
         .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SWIM_KEY_PENDING.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SWIM_PENDING_DROPS.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(SIGNALS_SHED.clone()))
+        .unwrap_or_else(|_| std::process::abort());
+    r.register(Box::new(MODEL_DISCOVERY_TOTAL.clone()))
+        .unwrap_or_else(|_| std::process::abort());
     r
 });
+
+/// Signals connections shed at accept, by the limit that shed them.
+static SIGNALS_SHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "grid_signals_connections_shed_total",
+            "Signals connections shed at accept",
+        ),
+        &["limit"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
+/// 1 while SWIM holds traffic for a key that has not loaded.
+static SWIM_KEY_PENDING: LazyLock<IntGauge> = LazyLock::new(|| {
+    IntGauge::new("grid_swim_key_pending", "1 while SWIM holds traffic for its key")
+        .unwrap_or_else(|_| std::process::abort())
+});
+
+/// Inbound SWIM packets dropped while the key is pending.
+static SWIM_PENDING_DROPS: LazyLock<IntCounter> = LazyLock::new(|| {
+    IntCounter::new(
+        "grid_swim_key_pending_dropped_total",
+        "Inbound SWIM packets dropped while the key is pending",
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
 
 // ---------------------------------------------------------------------------
 // Peer polling
@@ -223,6 +259,15 @@ static MCP_PROBE_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
     .unwrap_or_else(|_| std::process::abort())
 });
 
+/// Served-model discovery polls by provider and outcome.
+static MODEL_DISCOVERY_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        Opts::new("grid_model_discovery_total", "Served-model discovery polls by outcome"),
+        &["provider", "outcome"],
+    )
+    .unwrap_or_else(|_| std::process::abort())
+});
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -249,6 +294,16 @@ pub(crate) fn record_agent_tool_provider_phase_transition(from: &str, to: &str, 
 pub(crate) fn record_mcp_probe(outcome: &str, duration: Duration) {
     MCP_PROBE_TOTAL.with_label_values(&[outcome]).inc();
     MCP_PROBE_DURATION.observe(duration.as_secs_f64());
+}
+
+/// Record a successful served-model discovery poll.
+pub(crate) fn record_model_discovery_success(provider: &str) {
+    MODEL_DISCOVERY_TOTAL.with_label_values(&[provider, "ok"]).inc();
+}
+
+/// Record a failed served-model discovery poll; `reason` must be bounded.
+pub(crate) fn record_model_discovery_failure(provider: &str, reason: &str) {
+    MODEL_DISCOVERY_TOTAL.with_label_values(&[provider, reason]).inc();
 }
 
 /// Record a finished peer poll, retries included.
@@ -293,6 +348,21 @@ pub(crate) fn set_peer_collection_up(peer: &str, up: bool, at: std::time::System
 /// Move the in-flight count, so the worker pool's saturation is visible.
 pub(crate) fn peer_polls_in_flight(delta: i64) {
     PEER_POLLS_IN_FLIGHT.add(delta);
+}
+
+/// Set whether SWIM is holding traffic for its key.
+pub(crate) fn set_swim_key_pending(pending: bool) {
+    SWIM_KEY_PENDING.set(i64::from(pending));
+}
+
+/// Count an inbound SWIM packet dropped while the key is pending.
+pub(crate) fn record_swim_pending_drop() {
+    SWIM_PENDING_DROPS.inc();
+}
+
+/// Count a signals connection shed by `limit`, `total` or `source`.
+pub fn record_signals_shed(limit: &str) {
+    SIGNALS_SHED.with_label_values(&[limit]).inc();
 }
 
 /// Gather all registered metrics for serialization.

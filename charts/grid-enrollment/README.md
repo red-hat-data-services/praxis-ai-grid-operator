@@ -18,10 +18,17 @@ Batteries included. Off OpenShift no values are required:
 helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace
 ```
 
-The default install generates the Grid CA and the endpoint serving cert through a
-pre-install hook, deploys Postgres, and runs the service over TLS. Under
-`enrollment.authz=local` it also generates a grid-admin token. `helm install
+The default install generates the Grid CA, the endpoint serving cert, and the
+Postgres credentials through a pre-install hook, deploys Postgres, and runs the
+service over TLS. Under `enrollment.authz=local` the hook also generates a
+grid-admin token. The hook creates each Secret once and never rotates it, so
+`helm template` and Argo CD render the same manifests on every sync. `helm install
 --dry-run` and the NOTES output show the endpoint and the trust anchor.
+
+`host` names the enrollment endpoint sites connect to. It joins the serving cert names,
+is the default `route.host`, and makes the enrollment Service a LoadBalancer when no
+Route renders. `invites` takes sites keyed by name, for example
+`--set invites.east2.network=grid`.
 
 ## Route
 
@@ -74,6 +81,10 @@ Each override takes a Secret reference, so no key material is inlined in values.
 | `enrollment.authz` | `kube` (SAR, needs the sar-feature image) | `local` (standalone grid-admin token table) |
 | `enrollment.gridAdminTokens.existingSecretRef` | generated (local authz) | pre-created token Secret (name:token lines) |
 
+## Site invites
+
+Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up to 604800) has a post-install and post-upgrade Job mint a one-time site token into Secret `grid-invite-<siteName>` (key `token`). The Job skips sites whose Secret already exists, so an upgrade mints only for new sites. Invites need `enrollment.authz=kube`. Before Helm 3.19, a failed invite run leaves its hook RBAC in place until the next run. [Site Enrollment](../../docs/installation/enrollment.md#invite-a-site-on-the-hub) covers delivery and revocation.
+
 ## Limitations
 
 The builtin Postgres serves TLS with a cert the bootstrap Job issues from the
@@ -88,6 +99,12 @@ annotation with the cert in its Secret and rolls the Deployment when they
 differ, for example after a re-issue or a CA regeneration. A sync that replaces
 the Deployment (Argo CD `Replace=true`) drops the annotation, so the next
 bootstrap run restarts Postgres once more, harmlessly.
+
+The bootstrap runs as one Helm hook Job, replaced on each upgrade or Argo CD
+sync. It adopts the DB and grid-admin token Secrets an earlier chart version
+rendered. `helm
+uninstall` does not delete it, so a finished Job stays for
+`ca.bootstrap.ttlSecondsAfterFinished`, a day by default, for its logs.
 
 After a CA change, the enrollment service's first DB reconnect can fail
 verify-full until the grid-ca-bundle mount refreshes, typically within 1-2

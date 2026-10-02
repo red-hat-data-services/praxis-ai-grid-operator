@@ -15,7 +15,7 @@ use x509_parser::{
     prelude::{FromDer as _, X509Certificate},
 };
 
-use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, SignedCsr};
+use super::{BackendError, CertSpec, GeneratedCa, GeneratedCert, GeneratedCsr, SignedCsr};
 
 /// Parse a request, verify its self-signature, and return its
 /// `SubjectPublicKeyInfo` DER.
@@ -55,26 +55,34 @@ fn params_from_spec(spec: &CertSpec<'_>) -> Result<CertificateParams, BackendErr
         params.key_usages.push(KeyUsagePurpose::KeyCertSign);
         params.key_usages.push(KeyUsagePurpose::CrlSign);
     } else {
-        for dns in spec.dns_sans {
-            let name = dns
-                .clone()
-                .try_into()
-                .map_err(|err: rcgen::Error| BackendError::Sign(err.to_string()))?;
-            params.subject_alt_names.push(SanType::DnsName(name));
-        }
-        for uri in spec.uri_sans {
-            let name = uri
-                .clone()
-                .try_into()
-                .map_err(|err: rcgen::Error| BackendError::Sign(err.to_string()))?;
-            params.subject_alt_names.push(SanType::URI(name));
-        }
-        params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
-        params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
+        leaf_params(&mut params, spec)?;
     }
     params.not_before = spec.not_before;
     params.not_after = spec.not_after;
     Ok(params)
+}
+
+/// Leaf extensions: the X.509-SVID profile, server and client EKU, and the SANs.
+fn leaf_params(params: &mut CertificateParams, spec: &CertSpec<'_>) -> Result<(), BackendError> {
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    for dns in spec.dns_sans {
+        let name = dns
+            .clone()
+            .try_into()
+            .map_err(|err: rcgen::Error| BackendError::Sign(err.to_string()))?;
+        params.subject_alt_names.push(SanType::DnsName(name));
+    }
+    for uri in spec.uri_sans {
+        let name = uri
+            .clone()
+            .try_into()
+            .map_err(|err: rcgen::Error| BackendError::Sign(err.to_string()))?;
+        params.subject_alt_names.push(SanType::URI(name));
+    }
+    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ServerAuth);
+    params.extended_key_usages.push(ExtendedKeyUsagePurpose::ClientAuth);
+    Ok(())
 }
 
 /// Generate a self-signed CA from the spec.
@@ -90,6 +98,20 @@ pub(crate) fn generate_ca(spec: &CertSpec<'_>) -> Result<GeneratedCa, BackendErr
         material: CaMaterial {
             issuer: Issuer::new(params, key_pair),
         },
+    })
+}
+
+/// Generate a key and a CSR naming only `common_name`.
+pub(crate) fn generate_csr(common_name: &str) -> Result<GeneratedCsr, BackendError> {
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, common_name);
+    let key = KeyPair::generate().map_err(|err| BackendError::KeyGen(err.to_string()))?;
+    let csr = params
+        .serialize_request(&key)
+        .map_err(|err| BackendError::Sign(err.to_string()))?;
+    Ok(GeneratedCsr {
+        csr_pem: csr.pem().map_err(|err| BackendError::Sign(err.to_string()))?,
+        key_pem: key.serialize_pem(),
     })
 }
 
@@ -254,7 +276,12 @@ mod tests {
     #[test]
     fn params_from_spec_gives_a_leaf_server_and_client_eku_and_no_ca_flag() {
         let params = params_from_spec(&leaf_spec("site-d", &[], &[])).expect("params");
-        assert!(matches!(params.is_ca, IsCa::NoCa), "a leaf spec must not be a CA");
+        assert!(matches!(params.is_ca, IsCa::ExplicitNoCa), "a leaf states CA:FALSE");
+        assert_eq!(
+            params.key_usages,
+            [KeyUsagePurpose::DigitalSignature],
+            "a leaf may only sign, per the X.509-SVID profile"
+        );
         assert!(
             params
                 .extended_key_usages

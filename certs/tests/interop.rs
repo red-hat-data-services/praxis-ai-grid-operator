@@ -197,3 +197,75 @@ fn the_key_fingerprint_is_the_canonical_spki_digest_under_either_backend() {
         "the fingerprint must be SHA-256 over the SubjectPublicKeyInfo DER, identical across backends"
     );
 }
+
+#[test]
+fn generate_csr_carries_only_a_name_and_a_key_the_server_signs() {
+    use x509_parser::certification_request::X509CertificationRequest;
+
+    let ca = generate_ca("grid-ca").expect("test fixture");
+    let request = certs::generate_csr("site-d").expect("a well-formed request must generate");
+    assert!(
+        request.key_pem.contains("PRIVATE KEY"),
+        "the requester keeps a usable key"
+    );
+    let der = pem::parse(&request.csr_pem).expect("pem");
+    let (_rest, csr) = X509CertificationRequest::from_der(der.contents()).expect("parse");
+    assert!(
+        csr.requested_extensions().is_none_or(|mut ext| ext.next().is_none()),
+        "the request asks for no extensions"
+    );
+    let issued = sign_csr(&ca, "site-d", &request.csr_pem, Validity::default()).expect("test fixture");
+    assert!(
+        verify_site_cert(&ca.cert_pem, &issued.cert_pem, "site-d").is_ok(),
+        "the issued leaf verifies as the assigned site"
+    );
+    assert_eq!(
+        certs::cert_public_key(&issued.cert_pem).expect("leaf key"),
+        certs::csr_public_key(&request.csr_pem).expect("request key"),
+        "the leaf carries the requester's key"
+    );
+}
+
+/// DER of the first PEM block.
+fn der(pem_text: &str) -> Vec<u8> {
+    pem::parse(pem_text).expect("test fixture").into_contents()
+}
+
+/// The SPIFFE ID the spiffe crate reads from `leaf` signed by `ca`, as praxis checks it.
+fn svid(leaf_pem: &str, ca_pem: &str) -> Result<String, spiffe::X509SvidError> {
+    let key = KeyPair::generate().expect("test fixture").serialize_der();
+    let chain = [der(leaf_pem), der(ca_pem)].concat();
+    spiffe::X509Svid::parse_from_der(&chain, &key).map(|svid| svid.spiffe_id().to_string())
+}
+
+#[test]
+fn site_leaves_from_both_backends_are_valid_x509_svids() {
+    for (backend, leaf, ca) in [("rcgen", RCGEN_LEAF, RCGEN_CA), ("openssl", OPENSSL_LEAF, OPENSSL_CA)] {
+        assert_eq!(
+            svid(leaf, ca).expect(backend),
+            "spiffe://grid.internal/site/alpha",
+            "{backend} leaf and CA must pass the X.509-SVID leaf and signing rules"
+        );
+    }
+}
+
+#[test]
+fn an_enrolled_site_certificate_is_a_valid_x509_svid() {
+    let ca = generate_ca("grid-ca").expect("test fixture");
+    let issued = sign_csr(&ca, "site-d", &request_with_custom_extension(), Validity::default()).expect("test fixture");
+    assert_eq!(
+        svid(&issued.cert_pem, &ca.cert_pem).expect("this build's enrollment path"),
+        "spiffe://grid.internal/site/site-d"
+    );
+    let generated = certs::generate_site_cert(&ca, "site-e").expect("test fixture");
+    assert_eq!(
+        svid(&generated.cert_pem, &ca.cert_pem).expect("this build's generated path"),
+        "spiffe://grid.internal/site/site-e"
+    );
+    for leaf in [&issued.cert_pem, &generated.cert_pem] {
+        assert!(
+            certs::has_svid_profile(leaf).expect("parse"),
+            "the enroll warning stays quiet"
+        );
+    }
+}

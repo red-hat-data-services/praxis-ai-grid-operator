@@ -27,6 +27,8 @@ pub mod cli;
 pub mod controller;
 /// Custom resource definitions.
 pub mod crd;
+/// Site auto-enroll on startup.
+pub mod enroll;
 /// Operator error types.
 pub mod error;
 /// Prometheus metrics for gateway probe and phase-transition observability.
@@ -37,6 +39,7 @@ pub mod metrics_parser;
 pub mod metrics_scraper;
 /// Kubernetes resource builders.
 pub mod resources;
+pub mod served_models;
 
 pub use resources::{tls_backend::init_process_crypto, trust_bundle::sha256_fingerprint};
 /// Provider gateway address self-discovery.
@@ -50,6 +53,8 @@ pub mod signals;
 /// Pure data layer for peer discovery; the live UDP runtime is implemented in
 /// [`swim_runtime`].
 pub mod swim;
+/// SWIM advertise endpoint selection and Service `LoadBalancer` discovery.
+pub mod swim_advertise;
 /// SWIM endpoint parsing and bounded DNS resolution.
 pub mod swim_endpoint;
 /// Live SWIM membership runtime (foca-backed UDP event loop).
