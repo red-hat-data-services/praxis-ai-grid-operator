@@ -64,7 +64,7 @@ socket2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true, features = ["ring"] }
 tokio-openssl = { workspace = true, optional = true }
 tower = { workspace = true }
 tracing = { workspace = true }
@@ -77,6 +77,7 @@ zeroize = { workspace = true }
 # spin up a real Streamable HTTP MCP server to probe against.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 pem = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }

@@ -276,8 +276,8 @@ roleRef:
 
 Add one `RoleBinding` per namespace referenced by
 `GatewayRef.namespace`, `tls.caSecretRef.namespace`,
-`tls.siteSecretRef.namespace`, `tls.swimKeyRef.namespace`,
-and `auth.secretRef.namespace` in your CRD specs.
+`tls.caConfigMapRef.namespace`, `tls.siteSecretRef.namespace`,
+`tls.swimKeyRef.namespace`, and `auth.secretRef.namespace` in your CRD specs.
 
 ### Deployment configuration
 
@@ -346,7 +346,7 @@ using only the installed `ServiceAccount`.
 ## 2. Create a GridNetwork
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: GridNetwork
 metadata:
   name: production
@@ -650,7 +650,7 @@ See the [CRDs doc](crds.md) for full specs.
 
 Example — an API provider:
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: InferenceProvider
 metadata:
   name: anthropic-api
@@ -673,7 +673,7 @@ spec:
 
 Example — a local llm-d cluster:
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: InferenceProvider
 metadata:
   name: local-vllm
@@ -955,7 +955,7 @@ separate steps.
 
 **Phase stays Pending after SWIM convergence**
 
-- Check the `GridNetwork` has the label `grid.praxis-proxy.io/auto-discover-sites: "true"`.
+- Check the `GridNetwork` has the label `grid.praxis.fast/auto-discover-sites: "true"`.
 - Check that the `GridNetwork` controller has SWIM running (`GRID_SWIM_BIND_ADDR` env var set).
 - Check `kubectl get gridnetwork <name> -o jsonpath='{.status.connectedSites}'` — must be > 0.
 

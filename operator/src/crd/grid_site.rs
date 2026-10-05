@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// grid membership.
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
-    group = "grid.praxis-proxy.io",
+    group = "grid.praxis.fast",
     version = "v1alpha1",
     kind = "GridSite",
     plural = "gridsites",
@@ -154,6 +154,13 @@ pub enum EgressTlsMode {
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridSiteStatus {
+    /// When gossip stopped vouching for this auto-discovered site; cleared when it returns.
+    ///
+    /// Auto discovery deletes the site once this is older than 24 hours. Never set on a
+    /// declared site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent_since: Option<String>,
+
     /// Capabilities offered by this site.
     #[serde(default)]
     pub capabilities: SiteCapabilities,
@@ -310,7 +317,7 @@ mod tests {
                 .and_then(|spec| spec.get("group"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_else(|| std::process::abort()),
-            "grid.praxis-proxy.io",
+            "grid.praxis.fast",
             "wrong CRD group"
         );
         assert_eq!(

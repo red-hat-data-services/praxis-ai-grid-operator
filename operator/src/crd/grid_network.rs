@@ -171,7 +171,7 @@ pub struct SelectionPolicyConfig {
 ///
 /// The mode names the dissemination path, not the transport: SWIM membership
 /// runs in both modes. Only where the load signal travels changes.
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum SignalMode {
     /// Propagate signals over the SWIM and CRDT dissemination overlay, with
@@ -187,7 +187,7 @@ pub enum SignalMode {
 ///
 /// A property of the grid, not of one operator: every site propagates the same
 /// way. Absent, the grid gossips, which is non-breaking. A mode change takes
-/// effect at operator start, so flipping it is an operator restart.
+/// effect at operator start, so the operator restarts itself when it flips.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -197,7 +197,7 @@ pub struct SignalTransportConfig {
 }
 
 /// How a peer site proves its identity beyond chaining to the Grid CA.
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum PeerTrustMode {
     /// Its leaf digest is declared on its `GridSite`.
@@ -554,7 +554,7 @@ pub fn resolve_budget_statuses(
 /// tuning, and TLS secret references.
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
-    group = "grid.praxis-proxy.io",
+    group = "grid.praxis.fast",
     version = "v1alpha1",
     kind = "GridNetwork",
     plural = "gridnetworks",
@@ -699,6 +699,10 @@ pub struct GridNetworkSpec {
     /// omitted from the rendered overlay.  Fresh (`fresh=true`) candidates and
     /// local candidates are never evicted.  CRDT provider records in storage
     /// are not deleted.
+    ///
+    /// It does not delete `GridSite` objects: auto-discovered stubs that gossip
+    /// stops vouching for are collected after a fixed 24 hours, whatever this
+    /// field is. Declared `GridSite` objects are never deleted.
     ///
     /// **Default (absent):** stale candidates are retained indefinitely —
     /// the same behaviour as before this field existed.
@@ -1054,6 +1058,31 @@ pub struct GridNetworkStatus {
     /// Grid does not enforce budget limits itself (see [`BudgetPolicyConfig`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_status: Vec<TenantBudgetStatus>,
+
+    /// This site's identity certificate: when it expires and when rotation is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<SiteIdentityStatus>,
+}
+
+/// This site's identity certificate.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteIdentityStatus {
+    /// When the certificate expires, RFC 3339.
+    pub not_after: String,
+    /// When rotation is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
+    /// under pin peer trust, or when this site's operator does not rotate.
+    pub rotate_after: String,
+    /// SHA-256 of the certificate DER, the digest peers pin.
+    pub fingerprint: String,
+    /// `IdentityExpired` once the certificate has expired, `IdentityUnreadable` when the
+    /// Secret holds no usable certificate.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(regex(pattern = "^(IdentityExpired|IdentityUnreadable)$"))]
+    pub reason: String,
+    /// How to recover.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 /// Phase of an operator-generated consumer Praxis `ConfigMap` for one gateway.
@@ -1330,7 +1359,7 @@ mod tests {
     #[test]
     fn grid_network_crd_has_correct_group_and_plural() {
         let crd = crd_json();
-        assert_eq!(crd_spec(&crd, "group"), "grid.praxis-proxy.io", "wrong CRD group");
+        assert_eq!(crd_spec(&crd, "group"), "grid.praxis.fast", "wrong CRD group");
         assert_eq!(
             crd.get("spec")
                 .and_then(|spec| spec.get("names"))

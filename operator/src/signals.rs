@@ -725,7 +725,7 @@ fn warn_refused_once(site: &str, endpoint: &str) -> bool {
 const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254);
 
 /// Whether a peer IP may be dialed: anything but local and metadata addresses.
-fn is_dialable_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_dialable_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             !(v4.is_loopback()
@@ -815,9 +815,11 @@ fn classify(error: &MetricsScrapeError) -> PollOutcome {
             }
         },
         MetricsScrapeError::Encoding(_) => PollOutcome::Encoding,
-        MetricsScrapeError::InvalidUrl(_) | MetricsScrapeError::HttpWithTls(_) | MetricsScrapeError::TlsMaterial(_) => {
-            PollOutcome::Config
-        },
+        MetricsScrapeError::InvalidUrl(_)
+        | MetricsScrapeError::HttpWithTls(_)
+        | MetricsScrapeError::TlsMaterial(_)
+        | MetricsScrapeError::Credential(_)
+        | MetricsScrapeError::PlaintextCredential(_) => PollOutcome::Config,
         MetricsScrapeError::Transport(inner) => classify_transport(&**inner),
     }
 }
@@ -1060,7 +1062,7 @@ impl PollPeers {
                 Err(error) => {
                     outcome = classify(&error);
                     if attempt + 1 >= attempts || !outcome.is_retryable() {
-                        tracing::warn!(site = %peer, outcome = outcome.as_str(), %error, "peer poll failed");
+                        tracing::warn!(site = %peer, %url, outcome = outcome.as_str(), %error, "peer poll failed");
                         break;
                     }
                     crate::metrics::record_peer_retry(peer, outcome.as_str());

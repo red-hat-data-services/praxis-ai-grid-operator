@@ -18,7 +18,7 @@ use super::{
 /// Specification for an [`AgentToolProvider`].
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
-    group = "grid.praxis-proxy.io",
+    group = "grid.praxis.fast",
     version = "v1alpha1",
     kind = "AgentToolProvider",
     plural = "agenttoolproviders",
@@ -186,9 +186,14 @@ mod tests {
         });
         let spec: AgentToolProviderSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let tls = spec.tls.unwrap_or_else(|| std::process::abort());
-        assert_eq!(tls.ca_secret_ref.name, "tools-ca", "caSecretRef.name must round-trip");
         assert_eq!(
-            tls.ca_secret_ref.namespace, "grid-system",
+            tls.ca_secret_ref.as_ref().map(|r| r.name.as_str()),
+            Some("tools-ca"),
+            "caSecretRef.name must round-trip"
+        );
+        assert_eq!(
+            tls.ca_secret_ref.as_ref().map(|r| r.namespace.as_str()),
+            Some("grid-system"),
             "caSecretRef.namespace must round-trip"
         );
         assert!(

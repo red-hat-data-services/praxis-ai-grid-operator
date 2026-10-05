@@ -13,7 +13,7 @@ Verify the operator is running:
 {{- if .Values.crds.enabled }}
 CRDs install and upgrade with this release{{ if .Values.crds.keep }} and stay on uninstall{{ end }}:
 
-  kubectl api-resources --api-group=grid.praxis-proxy.io
+  kubectl api-resources --api-group=grid.praxis.fast
 {{- else }}
 crds.enabled is false: the platform installs the Grid CRDs.
 {{- end }}
@@ -22,6 +22,12 @@ crds.enabled is false: the platform installs the Grid CRDs.
 Run Helm tests:
 
   helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{- end }}
+
+{{- if and (not (include "grid-operator.metricsTls.enabled" .)) (ne (toString .Values.metrics.tls.enabled) "false") }}
+
+Metrics and health are plaintext: this install has no grid identity to serve. Set
+grid.id or enrollment.enabled to serve the site identity, or metrics.tls.source.
 {{- end }}
 
 Next steps:

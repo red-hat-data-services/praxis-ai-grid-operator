@@ -1,7 +1,9 @@
 {{/*
 Normalize values once per render, in place and idempotently: backends keyed by site
 become the list the templates read, keys in sorted order. A provider, or a consumer
-with a site backend, gets the grid identity. render follows a missing BYO config.
+with a site backend, gets the grid identity. render follows a missing BYO config when
+the values configure grid routing (backends, the provider role, or gridServing);
+otherwise config.inline serves.
 */}}
 {{- define "praxis-gateway.normalize" -}}
 {{- $v := .Values }}
@@ -30,7 +32,8 @@ with a site backend, gets the grid identity. render follows a missing BYO config
 {{- $_ := set $v.tls "enabled" true }}
 {{- if not $v.tls.caSecret }}{{- $_ := set $v.tls "caSecret" "grid-ca" }}{{- end }}
 {{- end }}
-{{- if not ($v.config).existingConfigMap }}{{- $_ := set $cfg "render" true }}{{- end }}
+{{- $gridRouting := or $cfg.backends $provider ($v.gridServing).enabled }}
+{{- if and (not ($v.config).existingConfigMap) $gridRouting }}{{- $_ := set $cfg "render" true }}{{- end }}
 {{- if not $v.service.type }}{{- $_ := set $v.service "type" (ternary "LoadBalancer" "ClusterIP" $provider) }}{{- end }}
 {{- if hasSuffix "/grid-gateway" $v.image.repository }}{{- $_ := set $v.image "flavor" "grid-gateway" }}{{- end }}
 {{- $t := $cfg.peerTrust | default dict }}
@@ -187,8 +190,90 @@ Validate required config ConfigMap name.
 {{- end }}
 {{- include "praxis-gateway.validateBackends" . }}
 {{- else if not .Values.config.existingConfigMap }}
-{{- fail "config.existingConfigMap is required (or set gatewayConfig.render: true)" }}
+{{- include "praxis-gateway.validateInlineConfig" . }}
 {{- end }}
+{{- end }}
+
+{{/*
+Where praxis.yaml comes from: render (gatewayConfig.render), existing
+(config.existingConfigMap), or inline (config.inline in a chart-managed ConfigMap).
+*/}}
+{{- define "praxis-gateway.configSource" -}}
+{{- if .Values.gatewayConfig.render -}}
+render
+{{- else if .Values.config.existingConfigMap -}}
+existing
+{{- else -}}
+inline
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail early on a blank or unparseable config.inline, or one with no listener on
+port.containerPort, instead of a pod that crash-loops or never turns ready. Also fail
+on grid settings that only the rendered config reads, which inline would drop quietly.
+*/}}
+{{- define "praxis-gateway.validateInlineConfig" -}}
+{{- range $key := list "localSite" "model" }}
+{{- if get $.Values.gatewayConfig $key }}
+{{- fail (printf "gatewayConfig.%s is set but config.inline is serving, and inline ignores it: add gatewayConfig.backends, role provider, or gridServing to render the grid config, or unset gatewayConfig.%s" $key $key) }}
+{{- end }}
+{{- end }}
+{{- $inline := toString (.Values.config.inline | default "") }}
+{{- if not (trim $inline) }}
+{{- fail "config.inline is empty: set it to a Praxis configuration, or set config.existingConfigMap" }}
+{{- end }}
+{{- $parsed := fromYaml $inline }}
+{{- if hasKey $parsed "Error" }}
+{{- fail (printf "config.inline is not a valid YAML mapping: %s" (get $parsed "Error")) }}
+{{- end }}
+{{- $port := int .Values.port.containerPort }}
+{{- $listeners := $parsed.listeners }}
+{{- if not (kindIs "slice" $listeners) }}{{- $listeners = list }}{{- end }}
+{{- $bound := false }}
+{{- range $listeners }}
+{{- if and (kindIs "map" .) (hasSuffix (printf ":%d" $port) (toString .address)) }}{{- $bound = true }}{{- end }}
+{{- end }}
+{{- if not $bound }}
+{{- fail (printf "config.inline has no listener on port.containerPort %d, where the Service and probes connect: bind a listener address to port %d, or change port.containerPort" $port $port) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether the Praxis container gets imageUser's numeric IDs: only when podSecurityContext
+sets no runAsUser, and imageUser.enabled is true, or auto on an official image off
+OpenShift. The kubelet needs a numeric user to enforce runAsNonRoot, and a pod
+runAsGroup does not provide one. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.applyImageUser" -}}
+{{- $psc := .Values.podSecurityContext | default dict -}}
+{{- $e := toString (.Values.imageUser | default dict).enabled -}}
+{{- $auto := and (eq $e "auto") (include "praxis-gateway.officialImageUser" .) (not (include "praxis-gateway.openshift" .)) -}}
+{{- if and (not (hasKey $psc "runAsUser")) (or (eq $e "true") $auto) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the image is one whose user imageUser's defaults describe: the official
+praxis-proxy ai, praxis, or grid-gateway repository, or a mirror that keeps that path.
+-fips tags are left out, since their UBI build runs as 1001:1001. Any other image keeps
+the user it declares. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.officialImageUser" -}}
+{{- if and (regexMatch "(^|/)praxis-proxy/(ai|praxis|grid-gateway)$" .Values.image.repository) (not (hasSuffix "-fips" (toString .Values.image.tag))) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the cluster is OpenShift, where the restricted SCC assigns pod UIDs from the
+namespace range and rejects fixed ones outside it. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.openshift" -}}
+{{- if .Capabilities.APIVersions.Has "security.openshift.io/v1" -}}
+true
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -270,7 +355,7 @@ Validate enabled mounts have a non-empty resource name.
 {{- fail "gridServing needs gridServing.network, the GridNetwork name, or gridServing.configMap" }}
 {{- end }}
 {{- if gt (len $name) 63 }}
-{{- fail (printf "gridServing: the operator hash-suffixes %s; set gridServing.configMap to the ConfigMap labeled grid.praxis-proxy.io/gateway" $name) }}
+{{- fail (printf "gridServing: the operator hash-suffixes %s; set gridServing.configMap to the ConfigMap labeled grid.praxis.fast/gateway" $name) }}
 {{- end }}
 {{- if not (and $.Values.tls.enabled $.Values.tls.existingSecret $.Values.tls.caSecret) }}
 {{- fail "gridServing polls peers with the grid identity: set tls.enabled, tls.existingSecret, and tls.caSecret" }}
@@ -310,15 +395,101 @@ Listener port name: port.name when set, else https when the listener terminates 
 {{/*
 Probe with an empty tcpSocket pointed at the listener port.
 */}}
+{{/*
+Whether the gateway forwards to backend clusters: rendered backends, gridServing, or
+clusters in config.inline. Praxis /ready fails while any of them is down. Emits "true"
+or nothing.
+*/}}
+{{- define "praxis-gateway.servesBackends" -}}
+{{- $v := .Values -}}
+{{- if or (and $v.gatewayConfig.render $v.gatewayConfig.backends) ($v.gridServing).enabled -}}
+true
+{{- else if and (not ($v.config).existingConfigMap) (not $v.gatewayConfig.render) ((fromYaml (($v.config).inline | default "")).clusters) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Refuse a probe on Praxis /ready while the gateway forwards to backends: one failing
+backend would take every pod out of service.
+*/}}
+{{- define "praxis-gateway.validateProbes" -}}
+{{- if include "praxis-gateway.servesBackends" . }}
+{{- range $name, $probe := pick (.Values.health | default dict) "readiness" "liveness" }}
+{{- $probe = $probe | default dict }}
+{{- $target := printf "%s %s" (($probe.httpGet).path | default "") (join " " (($probe.exec).command | default list)) }}
+{{- if regexMatch "/ready([?/ ]|$)" $target }}
+{{- fail (printf "health.%s must not probe Praxis /ready while the gateway forwards to backends: one failing backend would take every gateway pod out of service. Probe /healthy, which only checks that Praxis is up." $name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
 {{- define "praxis-gateway.probe" -}}
 {{- $probe := deepCopy (index . 0) -}}
 {{- $root := index . 1 -}}
+{{- $path := index . 2 -}}
+{{- $admin := include "praxis-gateway.adminAddress" $root -}}
 {{- if or $probe.httpGet $probe.exec $probe.grpc -}}
 {{- $_ := unset $probe "tcpSocket" -}}
 {{- else if and (hasKey $probe "tcpSocket") (not (($probe.tcpSocket | default dict).port)) -}}
+{{- if $admin -}}
+{{- /* A TCP connect to a TLS listener logs a failed handshake every period, so ask the admin listener instead. */ -}}
+{{- $_ := unset $probe "tcpSocket" -}}
+{{- $url := printf "http://%s%s" $admin $path -}}
+{{- /* health.adminProbeCommand with the URL appended, else curl or wget, whichever the image has. */ -}}
+{{- $cmd := (($root.Values.health).adminProbeCommand | default list) -}}
+{{- if $cmd -}}
+{{- $cmd = append $cmd $url -}}
+{{- else -}}
+{{- $cmd = list "/bin/sh" "-c" "if command -v curl >/dev/null 2>&1; then exec curl -fsS -m 2 -o /dev/null -H 'Host: 127.0.0.1' \"$1\"; else exec wget -q -T 2 --header 'Host: 127.0.0.1' -O /dev/null \"$1\"; fi" "probe" $url -}}
+{{- end -}}
+{{- $_ := set $probe "exec" (dict "command" $cmd) -}}
+{{- if not (hasKey $probe "timeoutSeconds") -}}{{- $_ := set $probe "timeoutSeconds" 3 -}}{{- end -}}
+{{- else if include "praxis-gateway.maybeTLSListener" $root -}}
+{{- fail "health: the gateway serves TLS and the chart cannot see a loopback admin listener, so a TCP probe would fail a TLS handshake every period; give health.readiness and health.liveness an httpGet or exec probe, or add a loopback admin listener to config.inline" -}}
+{{- else -}}
 {{- $_ := set $probe "tcpSocket" (dict "port" (include "praxis-gateway.portName" $root)) -}}
 {{- end -}}
+{{- end -}}
 {{- toYaml $probe -}}
+{{- end }}
+
+{{/*
+Whether config.inline declares a TLS listener. An existingConfigMap is opaque, so it yields
+nothing. Emits "true" or nothing.
+*/}}
+{{- define "praxis-gateway.maybeTLSListener" -}}
+{{- $v := .Values -}}
+{{- if not ($v.config).existingConfigMap -}}
+{{- range ((fromYaml (($v.config).inline | default "")).listeners | default list) -}}
+{{- if .tls }}true{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Admin listener address the chart rendered itself.
+*/}}
+{{- define "praxis-gateway.renderedAdminAddress" -}}
+127.0.0.1:9901
+{{- end }}
+
+{{/*
+Loopback host:port of the admin listener when the chart knows the config: the rendered
+config, else config.inline. An existingConfigMap is opaque, so it yields nothing.
+*/}}
+{{- define "praxis-gateway.adminAddress" -}}
+{{- $v := .Values -}}
+{{- $addr := "" -}}
+{{- if $v.gatewayConfig.render -}}
+{{- $addr = include "praxis-gateway.renderedAdminAddress" . -}}
+{{- else if not ($v.config).existingConfigMap -}}
+{{- $addr = (((fromYaml (($v.config).inline | default "")).admin | default dict).address | default "") | toString -}}
+{{- end -}}
+{{- if regexMatch "^(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0):[0-9]+$" $addr -}}
+{{- printf "127.0.0.1:%s" (regexReplaceAll "^.*:" $addr "") -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -375,4 +546,12 @@ A grid gateway: a provider, or a consumer with a site backend. Emits "true" or n
 {{- if kindIs "map" $cfg.backends }}{{- if $cfg.backends }}{{- $grid = true }}{{- end }}{{- end }}
 {{- if kindIs "slice" $cfg.backends }}{{- range $cfg.backends }}{{- if .site }}{{- $grid = true }}{{- end }}{{- end }}{{- end }}
 {{- if $grid }}true{{- end }}
+{{- end }}
+
+{{/*
+RUST_LOG for the gateway and overlay-sync: log.filter when set, else log.level, else empty (the binary default).
+*/}}
+{{- define "praxis-gateway.rustLog" -}}
+{{- $log := .Values.log | default dict -}}
+{{- $log.filter | default $log.level -}}
 {{- end }}

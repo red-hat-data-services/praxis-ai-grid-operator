@@ -1,6 +1,6 @@
 # Custom Resource Definitions
 
-API group: `grid.praxis-proxy.io/v1alpha1`
+API group: `grid.praxis.fast/v1alpha1`
 
 The AI Grid Network (AGN) Operator defines these resources to describe sites,
 provider capacity, and routing policy. The established API identities remain
@@ -15,7 +15,7 @@ cluster can host multiple `GridNetworks` for
 multi-tenancy.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: GridNetwork
 metadata:
   name: production
@@ -231,6 +231,21 @@ candidates are evicted from the rendered overlay.
 Local and healthy remote candidates are never evicted.  CRDT storage records
 are not deleted by this mechanism.
 
+With site auto discovery on, the same TTL bounds auto-discovered GridSites. When
+gossip stops vouching for a stub's site (any SWIM state but `Dead`), the operator
+records `status.absentSince` and clears it if the site returns. Once that is at
+least `N` seconds old, the stub is deleted and no longer counts against the
+256-site discovery cap. The delete is conditional on the object being unchanged,
+so a site that rejoins first keeps its stub. Declared GridSites are never deleted.
+With the TTL absent, stubs use a 24-hour default, so the cap always drains; the
+overlay still keeps stale candidates.
+
+The operator judges no site absent until it has been up for one gossip
+verification window (a 10-minute record expiry plus convergence), so a restart
+never starts clocks or collects. A pass that would delete more than half the
+stubs, and more than 8, deletes none and logs a warning; a partition looks like
+mass departure.
+
 ### GatewayRef.consumerConfig
 
 `spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
@@ -283,12 +298,12 @@ Represents another site in the grid. Created manually
 for seed peers or automatically by SWIM discovery.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: GridSite
 metadata:
   name: cluster-b
   labels:
-    grid.praxis-proxy.io/network: production
+    grid.praxis.fast/network: production
 spec:
   gridNetworkRef: production
   egress:
@@ -308,7 +323,7 @@ spec:
 
 **Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `lastTransitionTime`
+`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
 
 ### GridSite lifecycle
 
@@ -356,7 +371,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 **GridSite phase transitions:**
 
 - Pending → Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
-  peer is first observed as Alive (requires `grid.praxis-proxy.io/auto-discover-sites: "true"`
+  peer is first observed as Alive (requires `grid.praxis.fast/auto-discover-sites: "true"`
   label on the `GridNetwork`).
 - Discovered → Connecting: the `GridSite` controller advances automatically when
   `spec.egress.address` is non-empty. For auto-discovered sites, the egress address comes from
@@ -373,6 +388,14 @@ A discovered SWIM peer is not automatically authorized for routing.
 - Active → Unreachable: the `GridSite` controller demotes Active to Unreachable when the probe
   cannot connect. Identity or trust failures demote Active to Connecting, distinguishing a
   reachable but unverified endpoint from an unreachable endpoint.
+
+**Metrics:** `grid_site_phase{site,phase}` reports each `GridSite`'s phase as a state
+set, the shape of kube-state-metrics' `kube_pod_status_phase`. The series for the
+current phase is 1 and the other five are 0, so a site is ready when
+`grid_site_phase{phase="Active"} == 1`. It follows the phase the printer column shows,
+updates on every `GridNetwork` reconcile, and drops a site's series once its `GridSite`
+is gone. Cardinality is six series per site. `grid_site_phase_transition_total`
+still counts the transitions by phase and reason.
 
 **`spec.egress.address` source:** For auto-discovered sites, the egress address is sourced from
 the remote operator's `GRID_GATEWAY_ADDRESS` environment variable, propagated through the SWIM
@@ -506,7 +529,7 @@ Represents an inference backend available over the
 grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: InferenceProvider
 metadata:
   name: openai-api
@@ -638,13 +661,15 @@ requests to this provider's metrics endpoint.
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `tls.caSecretRef` | yes | Secret containing the CA certificate for server verification. Default key: `ca.crt`. |
+| `tls.caSecretRef` | one of | Secret containing the CA certificate for server verification. Default key: `ca.crt`. |
+| `tls.caConfigMapRef` | one of | ConfigMap containing the CA certificate, such as the platform service CA (`openshift-service-ca.crt`, key `service-ca.crt`). Default key: `ca.crt`. |
 | `tls.clientCertificateSecretRef` | no | Secret containing client certificate and private key for mTLS. |
 | `tls.clientCertificateSecretRef.certificateKey` | no | Key within `Secret.data` for the certificate PEM. Default: `tls.crt`. |
 | `tls.clientCertificateSecretRef.privateKeyKey` | no | Key within `Secret.data` for the private key PEM. Default: `tls.key`. |
 
-`caSecretRef` follows the same [`SecretRef`](#credential-projection) schema used by
-`spec.auth.secretRef`.  `clientCertificateSecretRef` adds explicit
+Set exactly one of `caSecretRef` and `caConfigMapRef`; the configured CA is the only
+trust used. `caSecretRef` follows the same [`SecretRef`](#credential-projection) schema used by
+`spec.auth.secretRef`. `caConfigMapRef` takes `name`, `namespace`, and an optional `key`.  `clientCertificateSecretRef` adds explicit
 `certificateKey` and `privateKeyKey` fields with serde defaults.
 
 **Failure behavior**: when TLS material cannot be resolved or parsed, the
@@ -698,6 +723,46 @@ metricsConfig:
       namespace: grid-system
       certificateKey: tls.crt
       privateKeyKey: tls.key
+```
+
+#### Bearer authentication
+
+An llm-d EPP serves `/metrics` behind TokenReview and SubjectAccessReview by
+default. `metricsConfig.auth` sends a credential the EPP can authorize.
+
+| Field | Meaning |
+|-------|---------|
+| `auth.type` | `serviceAccountToken`: a short-lived token for the grid metrics scraper ServiceAccount, sent as `Authorization: Bearer`. |
+| `auth.allowPlaintext` | Send the credential over `http://`. Default `false`. For a lab only. |
+
+Whoever runs the EPP receives the token, and it is valid against the API server, so
+the operator never sends its own token. The grid-operator chart creates a scraper
+ServiceAccount allowed only `get` on the nonResourceURL `/metrics`
+(`rbac.metricsScraper`, default `true`), and the operator mints a 10-minute token for it
+with the TokenRequest API, bound to the operator Pod, reusing it until two thirds of its
+lifetime has passed (about 400 seconds). The token is never logged.
+
+A credential goes only to a host proven by the CA `metricsConfig.tls` names: with
+`auth` set, an `https://` endpoint without `tls` is refused rather than trusted through
+the system roots, and an `http://` endpoint is refused unless `allowPlaintext` is set.
+
+Example (an EPP serving its metrics with the platform service CA):
+
+```yaml
+metricsConfig:
+  metricsEndpoint: https://qwen3-epp-service.ai-tenant-site-a.svc:9090
+  path: /metrics
+  poolName: qwen3-inference-pool
+  signalNames:
+    queueDepth: llm_d_epp_average_queue_size
+    kvCacheUtilization: llm_d_epp_average_kv_cache_utilization
+  tls:
+    caConfigMapRef:
+      name: openshift-service-ca.crt
+      namespace: grid
+      key: service-ca.crt
+  auth:
+    type: serviceAccountToken
 ```
 
 #### Queue depth normalization
@@ -766,7 +831,7 @@ Each poll increments `grid_model_discovery_total{provider,outcome}`, where
 Represents MCP tool servers available over the grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: AgentToolProvider
 metadata:
   name: db-tools
@@ -785,7 +850,7 @@ spec:
   accessPolicy:
     siteSelector:
       matchLabels:
-        grid.praxis-proxy.io/site: cluster-a
+        grid.praxis.fast/site: cluster-a
 ```
 
 **Phases**: Pending → Available → Unavailable
@@ -828,7 +893,7 @@ telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
 Represents A2A agents available over the grid.
 
 ```yaml
-apiVersion: grid.praxis-proxy.io/v1alpha1
+apiVersion: grid.praxis.fast/v1alpha1
 kind: AgentToAgentProvider
 metadata:
   name: claims-agent
@@ -844,7 +909,7 @@ spec:
   accessPolicy:
     siteSelector:
       matchLabels:
-        grid.praxis-proxy.io/site: cluster-a
+        grid.praxis.fast/site: cluster-a
 ```
 
 **Phases**: Pending → Available → Degraded → Unavailable
