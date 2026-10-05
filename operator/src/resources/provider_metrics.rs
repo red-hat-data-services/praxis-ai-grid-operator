@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     crd::inference_provider::{EndpointTlsConfig, InferenceProvider, MetricSignalNames},
-    metrics_parser::{MetricNames, parse_prometheus_text},
+    metrics_parser::{MetricNames, PartialMetrics, parse_prometheus_text},
     metrics_scraper::{self, scrape_metrics},
     resources::routing_overlay::routing_identity,
 };
@@ -151,12 +151,13 @@ async fn scrape_provider_signals(
             return None;
         },
     };
-    let text = scrape_metrics(&url, parse_metrics_timeout(&mc.timeout), tls_config)
+    let timeout = parse_metrics_timeout(&mc.timeout);
+    let text = scrape_metrics(&url, timeout, tls_config, mc.auth.as_ref().zip(client))
         .await
         .inspect_err(|e| {
-            tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
-        })
-        .ok()?;
+        tracing::debug!(provider = identity, error = %e, "signals: provider scrape failed; last value left to expire");
+    })
+    .ok()?;
     let observations = crate::signals::parse(&text)
         .into_iter()
         .filter(|o| wanted.contains(o.metric.as_str()))
@@ -258,6 +259,17 @@ pub(crate) fn metric_names_from_config(
 // ---------------------------------------------------------------------------
 // Timeout parsing
 // ---------------------------------------------------------------------------
+
+/// Parse a scrape, scoring neutrally when the provider's pool matched no configured signal.
+///
+/// A missing pool series is a configuration gap, not a failed scrape, so the provider
+/// stays routable, as it would with no `poolName`.
+fn parse_or_neutral(text: &str, names: &MetricNames, provider: &str) -> PartialMetrics {
+    parse_prometheus_text(text, names).unwrap_or_else(|error| {
+        tracing::warn!(provider, %error, "no configured signal for the provider's pool; scoring neutrally");
+        PartialMetrics::default()
+    })
+}
 
 /// Parse a timeout string (`"2s"`, `"500ms"`) to a [`Duration`].
 ///
@@ -456,9 +468,9 @@ pub(crate) async fn collect_provider_metrics_with_refresh_interval(
             },
         };
 
-        let scrape_result = scrape_metrics(&url, timeout, tls_config).await;
+        let scrape_result = scrape_metrics(&url, timeout, tls_config, mc.auth.as_ref().zip(client)).await;
         let parse_result = match &scrape_result {
-            Ok(text) => parse_prometheus_text(text, &names),
+            Ok(text) => Ok(parse_or_neutral(text, &names, identity)),
             Err(e) => Err(e.to_string()),
         };
         match parse_result {
@@ -640,6 +652,8 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
         metrics_scraper::MetricsScrapeError::TlsMaterial(_) | metrics_scraper::MetricsScrapeError::HttpWithTls(_) => {
             "MetricsTlsMaterialInvalid"
         },
+        metrics_scraper::MetricsScrapeError::Credential(_)
+        | metrics_scraper::MetricsScrapeError::PlaintextCredential(_) => "MetricsCredentialUnavailable",
         metrics_scraper::MetricsScrapeError::InvalidUrl(_)
         | metrics_scraper::MetricsScrapeError::NonOkStatus { .. }
         | metrics_scraper::MetricsScrapeError::Encoding(_) => "MetricsScrapeError",
@@ -653,6 +667,27 @@ pub(crate) fn classify_scrape_error(err: &metrics_scraper::MetricsScrapeError) -
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn a_pool_with_no_configured_signal_scores_neutrally() {
+        let names = MetricNames {
+            queue_depth: Some("llm_d_epp_average_queue_size".to_owned()),
+            pool_name: Some("pool-a".to_owned()),
+            ..Default::default()
+        };
+        let other_pool = "llm_d_epp_average_queue_size{name=\"pool-b\"} 7\n";
+        assert_eq!(
+            parse_or_neutral(other_pool, &names, "p"),
+            PartialMetrics::default(),
+            "a pool miss keeps the provider, with neutral metrics"
+        );
+        let own_pool = "llm_d_epp_average_queue_size{name=\"pool-a\"} 3\n";
+        assert_eq!(
+            parse_or_neutral(own_pool, &names, "p").queue_depth,
+            Some(3.0),
+            "a pool hit keeps its signal"
+        );
+    }
 
     use super::*;
     use crate::crd::inference_provider::MetricsConfig;
@@ -710,7 +745,7 @@ mod tests {
             );
         }
         serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": {"name": name},
             "spec": spec
@@ -731,6 +766,7 @@ mod tests {
             pool_name: None,
             queue_capacity: None,
             tls: None,
+            auth: None,
         }
     }
 
@@ -747,6 +783,7 @@ mod tests {
             pool_name: None,
             queue_capacity: None,
             tls: None,
+            auth: None,
         }
     }
 
@@ -942,7 +979,7 @@ mod tests {
         let body = "my_queue 0.3\n";
         let base_url = start_test_server(ok_response(body)).await;
         let provider: InferenceProvider = serde_json::from_value(serde_json::json!({
-            "apiVersion": "grid.praxis-proxy.io/v1alpha1",
+            "apiVersion": "grid.praxis.fast/v1alpha1",
             "kind": "InferenceProvider",
             "metadata": {"name": "prov-a"},
             "spec": {
@@ -1021,6 +1058,38 @@ mod tests {
         assert!(
             bm.latency_p99_ms.is_finite(),
             "malformed body must produce finite latency_p99_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_metrics_pool_miss_scores_neutrally_and_caches() {
+        // A 200 scrape whose only series belongs to a different pool is a pool miss.
+        let body = "llm_d_epp_average_queue_size{name=\"pool-b\"} 7\n";
+        let base_url = start_test_server(ok_response(body)).await;
+        let mut mc = mc_with_queue("llm_d_epp_average_queue_size");
+        mc.pool_name = Some("pool-a".to_owned());
+        let provider = provider_fixture("prov-a", &base_url, Some(mc));
+        let cache = empty_cache();
+
+        let result = collect_provider_metrics("net", &[provider], &cache, Instant::now(), None).await;
+
+        let bm = result
+            .metrics
+            .get("prov-a")
+            .copied()
+            .unwrap_or_else(|| std::process::abort());
+        let neutral = PartialMetrics::default().into_backend_metrics();
+        assert!(
+            (bm.queue_depth - neutral.queue_depth).abs() < f64::EPSILON,
+            "a pool miss scores neutrally, not from the other pool's series"
+        );
+        assert!(
+            cache
+                .lock()
+                .await
+                .entries
+                .contains_key(&("net".to_owned(), "prov-a".to_owned())),
+            "a neutral pool-miss sample is written to the cache"
         );
     }
 

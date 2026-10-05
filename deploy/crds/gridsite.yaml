@@ -1,9 +1,9 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: gridsites.grid.praxis-proxy.io
+  name: gridsites.grid.praxis.fast
 spec:
-  group: grid.praxis-proxy.io
+  group: grid.praxis.fast
   names:
     kind: GridSite
     plural: gridsites
@@ -134,6 +134,14 @@ spec:
               description: Observed status of a [`GridSite`].
               nullable: true
               properties:
+                absentSince:
+                  description: |-
+                    When gossip stopped vouching for this auto-discovered site; cleared when it returns.
+
+                    Auto discovery deletes the site once this is older than 24 hours. Never set on a
+                    declared site.
+                  nullable: true
+                  type: string
                 capabilities:
                   default:
                     agentToAgent: false
