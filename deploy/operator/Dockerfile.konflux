@@ -1,27 +1,19 @@
 # Konflux build for the AI Grid operator (RHOAI onboarding, RHOAIENG-95092).
-# Mirrors deploy/operator/Containerfile.ubi9. FROM images pinned to @sha256 for renovate.
+# Hermetic: RPMs and crates come from the Konflux prefetch, so this no longer mirrors
+# deploy/operator/Containerfile.ubi9. FROM images pinned to @sha256 for renovate.
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:803a35a0a8e6a84e8d8b00ae862ac501526211c9b11a61b0fda2afe9c6e4834f AS build
 
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        gcc gcc-c++ make cmake \
+        --setopt=reposdir=/cachi2/output/deps/rpm/$(uname -m)/repos.d \
+        gcc gcc-c++ make cmake rust cargo \
     && dnf clean all
-
-# Grid pins the toolchain in rust-toolchain.toml; --default-toolchain none lets the
-# first cargo invocation install exactly that pin. curl-minimal is already present.
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
 
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p operator --bin operator \
+RUN cargo build --release --locked --ignore-rust-version -p operator --bin operator \
     && cp target/release/operator /usr/local/bin/operator
 
 FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:e8673bd338b3f093501a9a9088f043d8959df120edd9947583e2d9bb3aacc3a8
-
-RUN microdnf install -y --nodocs ca-certificates \
-    && microdnf clean all
 
 COPY --from=build --chmod=0555 /usr/local/bin/operator /usr/local/bin/operator
 

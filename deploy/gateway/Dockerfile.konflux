@@ -1,29 +1,26 @@
 # Konflux build for the AI Grid data-plane gateway (RHOAI onboarding, RHOAIENG-95092).
-# Mirrors deploy/gateway/Containerfile.ubi9. FROM images pinned to @sha256 for renovate.
+# Hermetic: RPMs and crates come from the Konflux prefetch, so this no longer mirrors
+# deploy/gateway/Containerfile.ubi9. FROM images pinned to @sha256 for renovate.
 FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:803a35a0a8e6a84e8d8b00ae862ac501526211c9b11a61b0fda2afe9c6e4834f AS build
 
-# openssl-devel/pkgconf: praxis-proxy (Pingora) links OpenSSL.
+# openssl-devel/pkgconf: praxis-proxy (Pingora) links OpenSSL. rust/cargo come from
+# the prefetched repo because rustup cannot be fetched under hermetic mode.
 RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        gcc gcc-c++ make cmake openssl-devel pkgconf-pkg-config \
+        --setopt=reposdir=/cachi2/output/deps/rpm/$(uname -m)/repos.d \
+        gcc gcc-c++ make cmake openssl-devel pkgconf-pkg-config rust cargo \
     && dnf clean all
-
-# Grid pins the toolchain in rust-toolchain.toml; --default-toolchain none lets the
-# first cargo invocation install exactly that pin. curl-minimal is already present.
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
 
 WORKDIR /src
 COPY . .
-# The gateway is its own workspace (gateway/Cargo.toml), not a root member.
-RUN cargo build --release --manifest-path gateway/Cargo.toml --bin grid-gateway \
-    && cp gateway/target/release/grid-gateway /usr/local/bin/grid-gateway
+
+# The gateway is its own workspace, and its prefetched .cargo/config.toml holds the git
+# source replacement. Cargo finds that file from the working directory, not from
+# --manifest-path, so the build has to run from here or the git dependency is unresolvable.
+WORKDIR /src/gateway
+RUN cargo build --release --locked --ignore-rust-version --bin grid-gateway \
+    && cp target/release/grid-gateway /usr/local/bin/grid-gateway
 
 FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:e8673bd338b3f093501a9a9088f043d8959df120edd9947583e2d9bb3aacc3a8
-
-RUN microdnf install -y --nodocs ca-certificates \
-    && microdnf clean all
 
 COPY --from=build --chmod=0555 /usr/local/bin/grid-gateway /usr/local/bin/grid-gateway
 

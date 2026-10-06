@@ -297,7 +297,7 @@ private_doc_tests = "allow"
 [package]
 name = "gateway"
 description = "Praxis-based grid data-plane gateway"
-version.workspace = true
+version = "0.1.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

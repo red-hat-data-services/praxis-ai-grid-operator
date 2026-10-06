@@ -1,0 +1,15 @@
+packages:
+  - gcc
+  - gcc-c++
+  - make
+  - cmake
+  - openssl-devel
+  - pkgconf-pkg-config
+  - rust
+  - cargo
+contentOrigin:
+  repofiles:
+    - ./ubi.repo
+arches:
+  - x86_64
+  - aarch64
