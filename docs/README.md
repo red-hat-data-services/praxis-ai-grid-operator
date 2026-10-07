@@ -1,5 +1,8 @@
 # AI Grid Network (AGN) Documentation
 
+- [Technical Preview Scope and Limitations](technical-preview-scope.md):
+  routing scope, deployment-owner responsibilities, and topology boundaries.
+
 ## Routing
 
 - [Routing Guide](routing.md): choose a routing behavior and configure policy,
@@ -19,12 +22,17 @@
   access policy, and trust model.
 - [Consumer Config](architecture/consumer-config.md) — operator-generated
   consumer Praxis `ConfigMap` and the `GatewayRef.consumerConfig` API.
+- [OpenTelemetry](architecture/opentelemetry.md) - exporter configuration,
+  secret handling, image requirements, and the Praxis 0.7.1 trace-linkage limit.
 - [External Client Ingress](architecture/external-ingress.md) — GTM/GLB edge
   selection, AGN provider routing, trust boundaries, affinity, snapshot
   delivery, and provider-boundary ownership.
 
 ## Operations
 
+- [Fleet Dashboard](../fleet-dashboard/README.md) — optional hub web UI drawing
+  every site on a map with health from its own Prometheus; deployed only when
+  you install its chart.
 - [Adding an Inference Provider](adding-provider.md) — step-by-step
   workflow for in-cluster, existing-service, and external HTTPS providers.
 - [Operations](architecture/operations.md) — local environment setup,

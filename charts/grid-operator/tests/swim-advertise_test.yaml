@@ -62,6 +62,38 @@ tests:
             name: GRID_SWIM_SERVICE_NAME
             value: grid-grid-operator-swim
 
+  - it: disables gateway address discovery when requested
+    template: templates/deployment.yaml
+    set:
+      gateway.discoveryEnabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_GATEWAY_DISCOVERY_ENABLED
+            value: "false"
+
+  - it: leaves the gateway port unset for Service-port discovery
+    template: templates/deployment.yaml
+    set:
+      gateway.port: null
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_GATEWAY_PORT
+
+  - it: enables gateway discovery when the value is null
+    template: templates/deployment.yaml
+    set:
+      gateway.discoveryEnabled: null
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_GATEWAY_DISCOVERY_ENABLED
+            value: "true"
+
   - it: NodePort keeps the Pod IP default
     template: templates/deployment.yaml
     set:
@@ -74,7 +106,7 @@ tests:
             name: GRID_SWIM_ADVERTISE_ADDR
             value: "$(POD_IP):7946"
 
-  - it: operator may get only the gateway and SWIM Services
+  - it: operator may get only the gateway and the Services it advertises
     template: templates/clusterrole-resources.yaml
     set:
       gateway.serviceName: grid-gateway
@@ -84,7 +116,10 @@ tests:
           content:
             apiGroups: [""]
             resources: ["services"]
-            resourceNames: ["grid-gateway", "grid-grid-operator-swim"]
+            resourceNames:
+              - grid-gateway
+              - grid-grid-operator-swim
+              - grid-grid-operator-signals
             verbs: ["get"]
 
   - it: resources ClusterRole is bound in the release namespace

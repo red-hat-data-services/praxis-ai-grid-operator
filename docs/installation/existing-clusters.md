@@ -6,6 +6,9 @@ same charts and installer scripts. The workflow has been validated through
 chart rendering, disposable local clusters, and existing single-node
 Kubernetes clusters.
 
+Review the [technical preview scope and limitations](../technical-preview-scope.md)
+before planning cluster connectivity, provider deployment, and gateway roles.
+
 ## Guides
 
 - **[Adding an Inference Provider](../adding-provider.md)** —
@@ -267,12 +270,14 @@ DnsName("east1-provider.grid.internal")
 ```
 
 The preflight script inspects TLS Secret SANs and prints them for
-manual verification. Generate per-site certificates:
+manual verification. Generate per-site certificates, naming the site in both the
+organization and the common name, since a receiving gateway authorizes on the
+organization:
 
 ```bash
 openssl ecparam -genkey -name prime256v1 -noout -out provider.key
 openssl req -new -key provider.key \
-  -subj "/O=ai-grid/CN=provider-gateway" \
+  -subj "/O=east2-provider/CN=east2-provider" \
   -addext "subjectAltName=DNS:provider-gateway.grid-system.svc.cluster.local,DNS:east2-provider.grid.internal" \
   -addext "keyUsage=digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=clientAuth,serverAuth" \
@@ -673,27 +678,32 @@ imagePullSecrets:
 
 ### Service Names
 
-Set `fullnameOverride` to control the exact Service name. The AGN Operator's
-`gateway.serviceName` must match:
+Set `fullnameOverride` to control the provider gateway Service name. The AGN
+Operator's `gateway.serviceName` must match that provider Service:
 
 ```yaml
-# consumer-gateway-overrides.yaml
-fullnameOverride: consumer-gateway
+# provider-gateway-overrides.yaml
+fullnameOverride: provider-gateway
 
 # operator-overrides.yaml
 gateway:
-  serviceName: consumer-gateway
+  serviceName: provider-gateway
+  port: "8443"
 ```
 
 ### Service Type and Ports
 
 ```yaml
 service:
-  type: NodePort        # or LoadBalancer
-  port: 8080
+  type: LoadBalancer    # automatic provider-gateway discovery needs this
+  port: 8443
   annotations:
     service.beta.kubernetes.io/aws-load-balancer-type: nlb
 ```
+
+With a `ClusterIP` or `NodePort` provider Service, set the operator's
+`gateway.address` to a reachable `host:port` instead; the operator cannot
+derive a cross-site address from those Service types.
 
 ### SWIM Addresses
 
@@ -838,15 +848,15 @@ kubectl delete crd gridnetworks.grid.praxis.fast \
 
 ### Service name does not match operator expectation
 
-**Symptom:** Operator logs show it cannot find the consumer gateway
+**Symptom:** Operator logs show it cannot find the provider gateway
 Service.
 
-**Cause:** Helm's fullname template produces `{release}-praxis-gateway`
-by default. If the operator's `gateway.serviceName` expects
-`consumer-gateway`, the names don't match.
+**Cause:** The provider gateway Service name differs from the operator's
+`gateway.serviceName`. A Grid gateway uses its Helm release name by default;
+`fullnameOverride` can replace that name.
 
-**Fix:** Set `fullnameOverride: consumer-gateway` in the consumer
-gateway values and `gateway.serviceName: consumer-gateway` in the
+**Fix:** Set `fullnameOverride: provider-gateway` in the provider
+gateway values and `gateway.serviceName: provider-gateway` in the
 operator values.
 
 ### Overlay ConfigMap not created

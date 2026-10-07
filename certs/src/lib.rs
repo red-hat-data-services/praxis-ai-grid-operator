@@ -23,10 +23,10 @@ pub use enroll::{
     key_matches_cert, sign_csr, validate_site_name, verify_csr,
 };
 pub use generate::{
-    CaCert, DEFAULT_ORGANIZATION, GenerateError, GeneratedCsr, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
+    CaCert, GenerateError, GeneratedCsr, MAX_SITE_NAME_LEN, SPIFFE_TRUST_DOMAIN, SiteCertOutput, generate_ca,
     generate_cert_with_org, generate_csr, generate_dns_cert, generate_dns_only_cert, generate_expired_dns_cert,
-    generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, load_ca, sign_with_ca,
-    spiffe_id,
+    generate_not_yet_valid_dns_cert, generate_site_cert, generate_site_cert_with_names, is_valid_site_name, load_ca,
+    sign_with_ca, spiffe_id,
 };
 #[cfg(feature = "verifier")]
 pub use grid_verifier::{DEFAULT_TRUST_DOMAIN, GridSpiffeClientVerifier, GridSpiffeServerVerifier};
@@ -49,4 +49,15 @@ pub use verify::{
 #[must_use]
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     backend::sha256(data)
+}
+
+/// HMAC-SHA256 through the active backend, as [`sha256`] is.
+///
+/// # Panics
+///
+/// Under `fips`, panics if the OpenSSL EVP HMAC fails, since a FIPS-approved MAC
+/// failing means the crypto module is unusable.
+#[must_use]
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    backend::hmac_sha256(key, data)
 }
