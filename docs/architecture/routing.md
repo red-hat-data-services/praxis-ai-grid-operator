@@ -924,8 +924,8 @@ the current scrape fails but the cached sample is no older than
 scoring.
 
 After the grace period expires, plaintext metrics failures use the neutral
-compatibility behavior. When `metricsConfig.tls` is configured, a TLS
-resolution or scrape failure with no unexpired successful sample instead
+compatibility behavior. When `spec.tls` or a `metricsConfig.tls` override is
+configured, a TLS resolution or scrape failure with no unexpired successful sample instead
 marks the provider unhealthy, excluding it from routing. The cache is
 per-operator-process; restarting the operator clears all cached samples.
 
@@ -939,10 +939,10 @@ there is no usable last-known-good sample.
 
 ### KV-cache affinity
 
-Routing decisions based on KV-cache affinity — routing requests to backends
-that already hold relevant KV-cache entries — are not implemented in the current
-operator.  The `kv_cache_utilization` signal influences scoring but does not
-implement affinity-aware routing.
+The operator's scoring does not route by KV-cache affinity. The
+`kv_cache_utilization` signal influences scoring but does not implement
+affinity-aware routing. The grid gateway's `grid_site_route` filter prefers the
+site holding a request's prompt; see [Prefix Affinity](prefix-affinity.md).
 
 ## When the routing overlay regenerates
 
@@ -981,8 +981,8 @@ Direct ConfigMap projection remains available when
 `overlay.sidecar.enabled=false`, but its delivery latency is controlled by the
 kubelet and it does not provide the sidecar's validation or delivery status.
 
-Consumers that do not enable overlay-file reload still require a rollout or
-another deployment-owned reload mechanism. See
+Consumers without overlay-file reload must apply changes through supported
+`praxis.yaml` file watching or a deployment rollout. See
 [Consumer Config](consumer-config.md#reload-and-rollout).
 
 ## Relevant files

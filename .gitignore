@@ -34,7 +34,12 @@ tests/env/certs/
 
 # Forge runtime state and generated files
 .forge/
-tests/e2e/topologies/**/.forge.resolved.yaml
+tests/e2e/topologies/**/.*.resolved.yaml
 
 # Helm chart packaging artifacts
 *.tgz
+
+# fleet-dashboard: Vite build output and the copy build.rs embeds
+/fleet-dashboard/web/node_modules/
+/fleet-dashboard/web/dist/
+/fleet-dashboard/webui/

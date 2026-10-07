@@ -120,6 +120,34 @@ Defaults the tag to the chart appVersion when empty.
 {{- end }}
 
 {{/*
+Site names the configured SPIFFE IDs belong to, newline separated.
+
+A site certificate carries its site name in the subject organization and in the
+SPIFFE path segment, so one list drives both the handshake allowlist and the
+filter-level check. Deriving rather than taking a second value is what keeps them
+from disagreeing.
+
+values.schema.json is the primary gate on the ID's shape. This refuses a
+malformed one as well, because the alternative is rendering a trust list that
+silently matches nothing.
+*/}}
+{{- define "praxis-gateway.peerSites" -}}
+{{- $sites := list -}}
+{{- range . -}}
+{{- $rest := . | trimPrefix "spiffe://" -}}
+{{- if eq $rest . -}}
+{{- fail (printf "gatewayConfig.peerTrust.spiffeIds: %q is not a spiffe:// identity" .) -}}
+{{- end -}}
+{{- $parts := splitList "/" $rest -}}
+{{- if or (ne (len $parts) 3) (ne (index $parts 1) "site") (not (index $parts 2)) -}}
+{{- fail (printf "gatewayConfig.peerTrust.spiffeIds: %q is not spiffe://<trust-domain>/site/<name>" .) -}}
+{{- end -}}
+{{- $sites = append $sites (index $parts 2) -}}
+{{- end -}}
+{{- join "\n" ($sites | uniq) -}}
+{{- end -}}
+
+{{/*
 Validate image digest format when provided.
 */}}
 {{- define "praxis-gateway.validateDigest" -}}
@@ -132,6 +160,15 @@ Validate image digest format when provided.
 Validate required config ConfigMap name.
 */}}
 {{- define "praxis-gateway.validateConfig" -}}
+{{- $telemetry := .Values.gatewayConfig.telemetry | default dict }}
+{{- if $telemetry.enabled }}
+{{- if ne .Values.image.flavor "grid-gateway" }}
+{{- fail "gatewayConfig.telemetry.enabled needs image.flavor grid-gateway, whose Grid gateway build includes the OTLP and AI routing span features" }}
+{{- end }}
+{{- if not .Values.gatewayConfig.render }}
+{{- fail "gatewayConfig.telemetry.enabled needs gatewayConfig.render true so the exporter settings are written to praxis.yaml" }}
+{{- end }}
+{{- end }}
 {{- if .Values.gatewayConfig.render }}
 {{- $consumer := ne (.Values.gatewayConfig.role | default "consumer") "provider" }}
 {{- if and $consumer (not (.Values.gridServing).enabled) (not (trim (toString .Values.gatewayConfig.model))) }}
@@ -163,6 +200,10 @@ Validate required config ConfigMap name.
 {{- if and (not $trust.spiffeIds) (not $trust.allowAnyGridSite) }}
 {{- fail "gatewayConfig.peerTrust spiffe mode needs spiffeIds, or allowAnyGridSite true to admit every Grid-CA site" }}
 {{- end }}
+{{- if and $trust.spiffeIds $trust.allowAnyGridSite }}
+{{- fail "gatewayConfig.peerTrust.allowAnyGridSite admits every Grid-CA site, so it cannot be set beside spiffeIds: the filter would name sites the handshake does not restrict" }}
+{{- end }}
+{{- $_ := include "praxis-gateway.peerSites" ($trust.spiffeIds | default list) }}
 {{- else if not $trust.certDigests }}
 {{- fail "gatewayConfig.peerTrust pin mode needs certDigests" }}
 {{- end }}
@@ -191,6 +232,18 @@ Validate required config ConfigMap name.
 {{- include "praxis-gateway.validateBackends" . }}
 {{- else if not .Values.config.existingConfigMap }}
 {{- include "praxis-gateway.validateInlineConfig" . }}
+{{- else }}
+{{- /*
+In a live cluster, require the BYO ConfigMap; skip this for offline rendering.
+Read the named ConfigMap first; an existing one needs no cluster-wide read.
+When it is missing, read Namespace kube-system to detect a live cluster.
+Offline helm template skips both reads; denied reads fail with the API error.
+*/}}
+{{- if not (lookup "v1" "ConfigMap" .Release.Namespace .Values.config.existingConfigMap) }}
+{{- if lookup "v1" "Namespace" "" "kube-system" }}
+{{- fail (printf "ConfigMap %q not found in namespace %q. Create it before installing praxis-gateway." .Values.config.existingConfigMap .Release.Namespace) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 

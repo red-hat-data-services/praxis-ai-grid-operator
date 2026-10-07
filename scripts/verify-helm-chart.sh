@@ -10,7 +10,7 @@ FAIL=0
 KIND_CLUSTER=""
 
 OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
-OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.4}"
+OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.5}"
 DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.4.0"
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -161,12 +161,56 @@ try_template "$CHART_DIR" "SWIM LoadBalancer" \
   --set swim.service.loadBalancerIP=10.0.0.1
 SIG_RENDER=$(helm template v-sig "$CHART_DIR" --namespace grid-system --set signals.enabled=true \
   --set swim.service.enabled=true --set swim.service.type=LoadBalancer 2>&1 || true)
-if grep -q 'value: "v-sig-grid-operator-swim.grid-system.svc:9091"' <<<"$SIG_RENDER" \
+if grep -q 'value: "v-sig-grid-operator-signals.grid-system.svc:9091"' <<<"$SIG_RENDER" \
+  && grep -q 'value: "v-sig-grid-operator-signals"' <<<"$SIG_RENDER" \
   && grep -A3 -- '- name: signals' <<<"$SIG_RENDER" | matches 'targetPort: signals'; then
-  pass "signals: TCP port on the SWIM Service and the local gateway address"
+  pass "signals: own TCP Service, named to the operator, with the local gateway address"
 else
   fail "signals: unexpected render: $(grep -E 'SIGNALS|signals|Error' <<<"$SIG_RENDER" | head -3 | tr '\n' ' ')"
 fi
+# Every Service the Deployment is told to read has to be granted. A name the operator
+# resolves but RBAC omits is a 403 it retries forever, so the pod never goes ready and
+# the symptom lands on an unrelated deployment.
+SIG_READS=$(grep -A1 'name: GRID_SIGNALS_SERVICE_NAME' <<<"$SIG_RENDER" | awk '/value:/{print $2}' | tr -d '"')
+SIG_GRANTS=$(yq 'select(.kind == "ClusterRole") | .rules[] | select(.resources[] == "services") | .resourceNames[]' <<<"$SIG_RENDER" 2>/dev/null)
+if [ -n "$SIG_READS" ] && grep -qx "$SIG_READS" <<<"$SIG_GRANTS"; then
+  pass "signals: the Service the Deployment reads is granted in the resources ClusterRole"
+else
+  fail "signals: Deployment reads '$SIG_READS', ClusterRole grants $(tr '\n' ' ' <<<"$SIG_GRANTS")"
+fi
+# Gossip must stay the SWIM Service's only port: a mixed UDP and TCP Service is refused
+# outright by some providers, which then create no load balancer at all.
+SWIM_PORTS=$(helm template v-sp "$CHART_DIR" --namespace grid-system --set signals.enabled=true \
+  --set swim.service.enabled=true --set swim.service.type=LoadBalancer \
+  --show-only templates/service-swim.yaml 2>&1 || true)
+if [ "$(grep -c -- 'protocol: UDP' <<<"$SWIM_PORTS")" = "1" ] \
+  && ! grep -q -- 'protocol: TCP' <<<"$SWIM_PORTS"; then
+  pass "swim: gossip is the only port on the SWIM Service"
+else
+  fail "swim: SWIM Service carries more than gossip: $(grep -E 'protocol|name:' <<<"$SWIM_PORTS" | tr '\n' ' ')"
+fi
+
+# platform=aws asks for an NLB on both Services, since the default carries no UDP.
+AWS_RENDER=$(helm template v-aws "$CHART_DIR" --namespace grid-system --set platform=aws \
+  --set signals.enabled=true --set swim.service.enabled=true --set swim.service.type=LoadBalancer 2>&1 || true)
+if [ "$(grep -c 'aws-load-balancer-type: nlb' <<<"$AWS_RENDER")" = "2" ]; then
+  pass "platform aws: both Services ask for an NLB"
+else
+  fail "platform aws: expected two NLB annotations: $(grep -c 'aws-load-balancer-type' <<<"$AWS_RENDER")"
+fi
+
+# peers feeds the seeds and both Services' source ranges; a name seeds but is no host route.
+PEERS_RENDER=$(helm template v-peers "$CHART_DIR" --namespace grid-system --set signals.enabled=true \
+  --set swim.service.enabled=true --set swim.service.type=LoadBalancer \
+  --set 'peers=10.0.0.1 peer-b.example.com' 2>&1 || true)
+if grep -q 'value: "10.0.0.1:7946,peer-b.example.com:7946"' <<<"$PEERS_RENDER" \
+  && [ "$(grep -c -- '- 10.0.0.1/32' <<<"$PEERS_RENDER")" = "2" ] \
+  && ! grep -q 'peer-b.example.com/32' <<<"$PEERS_RENDER"; then
+  pass "peers: seeds every peer, host routes only the addresses"
+else
+  fail "peers: unexpected render: $(grep -E 'SEEDS|/32' <<<"$PEERS_RENDER" | head -3 | tr '\n' ' ')"
+fi
+
 try_reject_msg "$CHART_DIR" "signals without the SWIM Service" "needs swim.service.enabled" --set signals.enabled=true
 # --reuse-values from a release predating these keys leaves them absent.
 try_template "$CHART_DIR" "absent signals map" --set signals=null
@@ -228,11 +272,11 @@ if render verify-links "$CHART_DIR" --namespace grid-system --show-only template
   else
     fail "operator pod must set enableServiceLinks: false"
   fi
-  # Even with service links off, pin the port so no injected value can win.
-  if grep -A1 'name: GRID_GATEWAY_PORT' <<<"$RENDERED" | matches 'value: "8080"'; then
-    pass "operator pod sets GRID_GATEWAY_PORT by default"
+  # Leave the port unset so the operator can read it from the gateway Service.
+  if ! grep -q 'name: GRID_GATEWAY_PORT' <<<"$RENDERED"; then
+    pass "operator pod leaves GRID_GATEWAY_PORT unset for Service-port discovery"
   else
-    fail "operator pod must set GRID_GATEWAY_PORT by default"
+    fail "operator pod must leave GRID_GATEWAY_PORT unset for Service-port discovery"
   fi
 fi
 # Every grid workload pod disables service links, not just the operator.
@@ -538,6 +582,21 @@ try_template "$GW_DIR" "subchart keys (gw)" "${GW_REQ[@]}" --set enabled=true --
 try_reject "$GW_DIR" "runAsNonRoot override" "${GW_REQ[@]}" --set podSecurityContext.runAsNonRoot=false
 try_reject "$GW_DIR" "overlay enabled no name" "${GW_REQ[@]}" --set overlay.enabled=true
 try_reject "$GW_DIR" "tls enabled no secret" "${GW_REQ[@]}" --set tls.enabled=true --set tls.existingSecret=""
+try_reject_msg "$GW_DIR" "telemetry sampling rate above one" \
+  "gatewayConfig[./]telemetry[./]samplingRate.*(less than or equal to 1|maximum: got 1\\.01)" \
+  --set gatewayConfig.telemetry.enabled=true --set-json gatewayConfig.telemetry.samplingRate=1.01
+try_reject_msg "$GW_DIR" "telemetry sampling rate below zero" \
+  "gatewayConfig[./]telemetry[./]samplingRate.*(greater than or equal to 0|minimum: got -0\\.01)" \
+  --set gatewayConfig.telemetry.enabled=true --set-json gatewayConfig.telemetry.samplingRate=-0.01
+try_reject_msg "$GW_DIR" "telemetry endpoint userinfo credentials" \
+  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://user:password@collector:4317'
+try_reject_msg "$GW_DIR" "telemetry endpoint query credentials" \
+  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://collector:4317?api_key=sentinel'
+try_reject_msg "$GW_DIR" "telemetry endpoint fragment credentials" \
+  "gatewayConfig[./]telemetry[./]otlpEndpoint.*([Dd]oes not match pattern|does not match the regex)" \
+  "${GW_REQ[@]}" --set-string 'gatewayConfig.telemetry.otlpEndpoint=https://collector:4317/otlp#token=sentinel'
 
 # ── Secure gateway config (render) ──────────────────────────────────
 GW_RENDER=(--set gatewayConfig.render=true --set gatewayConfig.localSite=hub --set gatewayConfig.model=q --set gatewayConfig.auth.mode=none
@@ -802,10 +861,11 @@ fi
 SPIFFE_RENDER=$(helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" \
   --set "gatewayConfig.peerTrust.spiffeIds[0]=spiffe://grid.internal/site/hub" 2>&1 || true)
 if grep -q 'client_cert_mode: require_named$' <<<"$SPIFFE_RENDER" && grep -q -- '- "spiffe://grid.internal/site/hub"' <<<"$SPIFFE_RENDER" \
-  && ! grep -q 'peer_identity_trust' <<<"$SPIFFE_RENDER"; then
-  pass "provider spiffe: require_named with the SPIFFE allowlist and no pins"
+  && grep -q 'peer_identity_trust' <<<"$SPIFFE_RENDER" && grep -q -- '- organization: "hub"' <<<"$SPIFFE_RENDER" \
+  && ! grep -q 'cert_digest' <<<"$SPIFFE_RENDER"; then
+  pass "provider spiffe: require_named, and the chain names the same site it admits"
 else
-  fail "provider spiffe: unexpected render: $(grep -E 'client_cert_mode|spiffe|Error' <<<"$SPIFFE_RENDER" | head -3 | tr '\n' ' ')"
+  fail "provider spiffe: unexpected render: $(grep -E 'client_cert_mode|spiffe|organization|Error' <<<"$SPIFFE_RENDER" | head -4 | tr '\n' ' ')"
 fi
 if helm template v-prov "$GW_DIR" "${PROVIDER[@]}" "${SPIFFE[@]}" --set gatewayConfig.peerTrust.allowAnyGridSite=true 2>&1 \
   | matches 'client_cert_mode: require_named$'; then
@@ -1261,6 +1321,19 @@ CR_EOF
   echo ""
   echo "=== Praxis Gateway Kind lifecycle (chart wiring, not runtime) ==="
 
+  if MISSING_OUT=$(helm install test-gateway-missing "$GW_DIR" \
+    --namespace grid-system \
+    --kube-context "$KCTX" \
+    --set config.existingConfigMap=missing-gateway-config \
+    --set nameOverride=test-gateway-missing 2>&1); then
+    fail "kind: BYO mode accepts a missing ConfigMap"
+    helm uninstall test-gateway-missing --namespace grid-system --kube-context "$KCTX" >/dev/null 2>&1 || true
+  elif echo "$MISSING_OUT" | matches -F 'ConfigMap "missing-gateway-config" not found in namespace "grid-system"'; then
+    pass "kind: BYO mode fails when ConfigMap is missing"
+  else
+    fail "kind: BYO mode failed without the missing ConfigMap error: $MISSING_OUT"
+  fi
+
   kubectl --context "$KCTX" -n grid-system create configmap test-gateway-config \
     --from-literal=praxis.yaml='admin: {address: "0.0.0.0:9901"}' 2>/dev/null || true
 
@@ -1699,11 +1772,25 @@ echo "======================================================================"
 
 # Argo CD renders with helm template, no cluster access, on every sync.
 echo ""
-echo "=== No cluster lookups or render-varying functions ==="
+echo "=== No manifest lookups or render-varying functions ==="
 NONDET='\b(lookup|randAlphaNum|randAlpha|randNumeric|randAscii|randBytes|randInt|shuffle|uuidv4|now|htpasswd|bcrypt|encryptAES|genCA|genPrivateKey|genSelfSignedCert|genSignedCert)\b|\.Release\.Revision'
 for chart in charts/*/; do
   # A YAML # comment still executes its template actions, so only template comments are skipped.
   hits=$(grep -rnE "$NONDET" "$chart/templates" | grep -vE '^[^:]+:[0-9]+:\s*(#[^{]*$|\{\{-? */\*)' || true)
+  # The BYO preflight only refuses live installs; it supplies no manifest values.
+  # Allow its two exact calls. Other lookups and random/time functions stay banned.
+  hits=$(awk '
+    {
+      code = $0
+      sub(/^[^:]+:[0-9]+:/, "", code)
+      if ($0 ~ /^charts\/praxis-gateway\/+templates\/_helpers\.tpl:[0-9]+:/ &&
+          (code == "{{- if not (lookup \"v1\" \"ConfigMap\" .Release.Namespace .Values.config.existingConfigMap) }}" ||
+           code == "{{- if lookup \"v1\" \"Namespace\" \"\" \"kube-system\" }}")) {
+        next
+      }
+      if (length($0)) print
+    }
+  ' <<<"$hits")
   if [ -z "$hits" ]; then
     pass "deterministic functions only: $chart"
   else

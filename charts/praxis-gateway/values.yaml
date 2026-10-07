@@ -132,6 +132,26 @@ gatewayConfig:
   # when config.existingConfigMap is empty and backends, role provider, or gridServing is set.
   # Changing the rendered config rolls the pods.
   render: false
+  # -- Opt in to OTLP tracing in the generated praxis.yaml. Requires
+  # image.flavor: grid-gateway, whose Grid image build includes the Praxis OTLP
+  # exporter and Praxis AI routing-span features. Credentials belong in env as
+  # Secret-backed OTEL_EXPORTER_OTLP_HEADERS, never here.
+  telemetry:
+    enabled: false
+    # -- OTLP/gRPC endpoint. Empty uses OTEL_EXPORTER_OTLP_ENDPOINT from env.
+    otlpEndpoint: ""
+    # -- Root sampling probability in the inclusive range 0.0..1.0.
+    samplingRate: null
+    # -- OpenTelemetry service.name resource attribute.
+    serviceName: ""
+    # -- OpenTelemetry service.version resource attribute.
+    serviceVersion: ""
+    # -- deployment.environment resource attribute.
+    environment: ""
+    # -- Batch export interval in seconds; must be positive.
+    batchIntervalSecs: null
+    # -- Maximum spans per export batch; must be positive.
+    batchSize: null
   # -- consumer routes callers. provider serves grid peers on the grid identity and forwards to one backend.
   role: consumer
   # -- Grid peers a provider accepts, each with a Grid-CA client certificate.
@@ -144,11 +164,14 @@ gatewayConfig:
     digest: ""
     # -- pin mode: the next leaf digest during a rotation.
     nextDigest: ""
-    # -- spiffe mode: allowed peer SPIFFE IDs (spiffe://grid.internal/site/<name>).
+    # -- spiffe mode: allowed peer SPIFFE IDs (spiffe://grid.internal/site/<name>). The
+    # handshake admits exactly these, and the filter chain names the same sites, so a
+    # narrower per-candidate check can only take sites away from what is admitted here.
     spiffeIds: []
     # -- spiffe mode: one allowed SPIFFE ID, added to spiffeIds.
     spiffeId: ""
-    # -- spiffe mode with no spiffeIds: accept any site the Grid CA signed.
+    # -- spiffe mode with no spiffeIds: accept any site the Grid CA signed. Names no site,
+    # so the chain gets no peer check; cannot be set beside spiffeIds.
     allowAnyGridSite: false
     # -- Optional inbound budget shared by all peers, for example { rate: 20, burst: 40 }.
     rateLimit: {}
@@ -254,11 +277,12 @@ gatewayConfig:
   # -- Inbound TLS on the gateway listener. The default posture assumes an inbound TLS
   # front (an OpenShift Route or a Gateway) terminates TLS and forwards to this plaintext
   # listener. Enable to terminate TLS at the gateway itself from a mounted server cert
-  # (tls.crt/tls.key in the Secret). Works with render and with a BYO config, which must
+  # (tls.crt/tls.key in the Secret). Works with render consumers and BYO, which must
   # reference mountPath (a BYO config moving off tls.enabled must change its listener
   # cert paths to it). Enabling it names the container port https. On OpenShift, set
   # service.annotations service.beta.openshift.io/serving-cert-secret-name to the Secret
   # name and the service CA issues the cert.
+  # Render providers use tls.existingSecret and reject gatewayConfig.listenerTls.enabled.
   listenerTls:
     # -- Terminate TLS at the gateway listener instead of at an inbound front.
     enabled: false

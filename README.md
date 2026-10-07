@@ -150,6 +150,7 @@ AGN and Praxis on running Kubernetes clusters with Helm.
 | `mock-providers` | Mock OpenAI, Anthropic, Bedrock, Vertex APIs |
 | `forge` | Generic development-environment orchestrator for Kubernetes |
 | `xtask` | Dev task runner for multi-cluster test environments |
+| `fleet-dashboard` | Opt-in hub web UI: fleet map and per-site health from each site's Prometheus (Axum + React) |
 
 ## Project name and compatibility
 
@@ -190,6 +191,7 @@ See the [development guide](docs/development.md) and
 
 ## Documentation
 
+- [Technical preview scope and limitations](docs/technical-preview-scope.md)
 - [Architecture overview](docs/architecture/overview.md)
 - [Custom resources](docs/architecture/crds.md)
 - [Routing Guide](docs/routing.md)

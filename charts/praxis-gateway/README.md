@@ -121,6 +121,19 @@ helm upgrade --install praxis-gateway charts/praxis-gateway \
   --namespace praxis --set config.existingConfigMap=praxis-config
 ```
 
+With `config.existingConfigMap` set and `gatewayConfig.render: false`, a live
+Helm install or upgrade looks up that ConfigMap in the release namespace. If
+it is missing, the chart looks up the `kube-system` Namespace to detect a live
+cluster and then fails before creating the Deployment. Offline `helm template`
+skips this check. Inline defaults still work without an existing ConfigMap.
+Any named ConfigMap must already exist, including one created by the operator.
+
+The Helm client's credentials need `get` access to the named ConfigMap. When
+it is missing, they also need `get` access to Namespace `kube-system`. A denied
+lookup fails with the API permission error rather than the chart's missing
+ConfigMap message. This check runs during rendering; it does not monitor the
+ConfigMap after installation.
+
 Set `config.key` when the configuration lives under another key. The chart
 does not manage this ConfigMap, so editing it does not restart the pods. The
 default Praxis AI image watches its configuration file and reloads routes and
@@ -186,7 +199,7 @@ Praxis AI image; these values may advance independently.
 | `image.repository` | string | `ghcr.io/praxis-proxy/ai` | Image repository. |
 | `image.tag` | string | `0.4.0` | Image tag (ignored when `image.digest` is set). |
 | `image.digest` | string | `""` | Immutable digest (sha256:…). When set, tag is ignored. |
-| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider` and `gridServing` need. A repository ending in `/grid-gateway` sets it. |
+| `image.flavor` | string | `ai` | `ai` or `grid-gateway`, the grid build that `gatewayConfig.role: provider`, `gridServing`, and telemetry need. A repository ending in `/grid-gateway` sets it. |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | list | `[]` | Pull secrets for private registries. |
 | `log.level` | string | `""` | Level for every module, rendered as RUST_LOG on the gateway and overlay-sync: off, error, warn, info, debug, or trace, in any case. Empty leaves RUST_LOG unset, so the binaries use their info default. An `env` entry named RUST_LOG takes precedence on the gateway. |
@@ -206,6 +219,11 @@ Praxis AI image; these values may advance independently.
 | `config.key` | string | `praxis.yaml` | Key in the ConfigMap. |
 | `config.inline` | string | answers `GET /` with a JSON status, else 404 | Praxis config stored in a chart-managed ConfigMap when neither `config.existingConfigMap` nor `gatewayConfig.render` applies. Changing it rolls the pods. |
 | `gatewayConfig.render` | bool | `false` | Render the Praxis config from these values instead of a BYO ConfigMap. Also on when `config.existingConfigMap` is empty and the values configure grid routing (`gatewayConfig.backends`, `role: provider`, or `gridServing`). Never emits `insecure_options`. Changing the rendered config rolls the pods. See [AI Grid Network](#ai-grid-network-agn). |
+| `gatewayConfig.telemetry.enabled` | bool | `false` | Enable OTLP/gRPC export and W3C header propagation in generated `praxis.yaml`. Requires `gatewayConfig.render: true` and `image.flavor: grid-gateway`. Configuration changes roll the pods. The tracked Grid build uses Praxis 0.7.3, which exports local HTTP and AI routing spans while forwarding W3C headers. Cross-gateway exported parentage requires the follow-up Praxis framework release described in [OpenTelemetry for Grid gateways](../../docs/architecture/opentelemetry.md). |
+| `gatewayConfig.telemetry.otlpEndpoint` | string | `""` | OTLP endpoint without URL userinfo, query, or fragment credentials. Omitted or empty uses `OTEL_EXPORTER_OTLP_ENDPOINT` from the container environment. If configured or generic/trace-specific exporter headers are present, the endpoint must explicitly use `https://`; scheme-less endpoints are rejected. |
+| `gatewayConfig.telemetry.samplingRate` | number | unset | Root sampling probability, from `0.0` through `1.0`. |
+| `gatewayConfig.telemetry.serviceName` / `serviceVersion` / `environment` | string | unset | OpenTelemetry resource attributes. |
+| `gatewayConfig.telemetry.batchIntervalSecs` / `batchSize` | int | unset | OTLP batch export interval from 1 through 300 seconds and maximum batch size from 1 through 65,536 spans. |
 | `gatewayConfig.model` | string | **required** for a consumer without `gridServing` | Model advertised on the routing candidates. |
 | `gatewayConfig.backends` | map | **required** when rendered | Backends keyed by site, each with `endpoint` and optional `healthCheck` and `transport`. A consumer's key is the site it reaches over mutual TLS. A provider's `local` key is its one plaintext backend. The older list of `cluster`, `endpoints` entries still renders. |
 | `gatewayConfig.backends[].site` | string | `localSite` | Grid site the backend serves. A consumer's remote `mutual_tls` backend must name it, and it must differ from `localSite`. Its `transport.sni` defaults to `<site>.grid.internal`. |
@@ -217,7 +235,8 @@ Praxis AI image; these values may advance independently.
 | `gatewayConfig.peerTrust.digest` | string | `""` | Pin mode: lowercase hex SHA-256 of the allowed peer's DER leaf. `nextDigest` adds the next one during a rotation. |
 | `gatewayConfig.peerTrust.certDigests` | list | `[]` | Pin mode: more allowed digests. |
 | `gatewayConfig.peerTrust.spiffeId` | string | `""` | SPIFFE mode: an allowed SPIFFE ID. `spiffeIds` takes more. The render needs one unless `allowAnyGridSite`. |
-| `gatewayConfig.peerTrust.allowAnyGridSite` | bool | `false` | SPIFFE mode with no IDs: accept any enrolled site. |
+| `gatewayConfig.peerTrust.spiffeIds` | list | `[]` | SPIFFE mode: every allowed peer. The handshake admits exactly these through `trusted_spiffe_ids`, and the filter chain names the same sites in an unconditional `peer_identity_trust`. A site certificate carries its site name in both the SPIFFE path segment and the subject organization, so one list drives both and a narrower per-candidate check can only take sites away from what is already admitted. |
+| `gatewayConfig.peerTrust.allowAnyGridSite` | bool | `false` | SPIFFE mode with no IDs: accept any enrolled site. It names no site, so the chain gets no peer check, and it is refused beside `spiffeIds`. |
 | `gatewayConfig.provider.allowedPaths` | list | chat, completions, models, embeddings | Exact paths a provider forwards, GET and POST only. Other paths get a 404, other methods a 405. |
 | `gatewayConfig.localSite` | string | **required** when rendered | This gateway's site name. A consumer scores locality with it, and a provider returns it in `X-Grid-Provider-Site`. |
 | `gatewayConfig.auth.mode` | string | **required** when rendered | `api-key` validates the caller's key and needs an image that registers `identity/api-key` (praxis-policy 0.4 or later); the render refuses it on the default `ai:0.4.0` image (by effective reference; a digest pin of that same image is not detected). `none` renders no policy filter, for use only behind an authenticating front. |
@@ -229,7 +248,7 @@ Praxis AI image; these values may advance independently.
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
 | `gatewayConfig.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
-| `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render or BYO mode. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
+| `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render consumer or BYO mode. Render providers reject this setting and use `tls.existingSecret` for listener TLS. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
 | `port.name` | string | `""` | Port name. Empty: `https` with `gatewayConfig.listenerTls.enabled`, else `http`. |
 | `port.protocol` | string | `TCP` | Port protocol. |
@@ -366,16 +385,19 @@ AGN runs this chart in two roles with different values:
 
 ### Resource names for the AGN Operator
 
-The chart's fullname template produces `{release}-praxis-gateway` by
-default (e.g., release `consumer-gateway` → Service name
-`consumer-gateway-praxis-gateway`). Set `fullnameOverride` to control
-the exact Service name:
+A Grid gateway (a provider or a consumer with site backends) uses its Helm
+release name as the Service name by default. A provider release named
+`provider-gateway` therefore creates Service `provider-gateway`.
+
+Other releases use `{release}-praxis-gateway` unless the release name already
+contains `praxis-gateway`. Set `fullnameOverride` to control the exact Service
+name:
 
 ```yaml
-fullnameOverride: consumer-gateway   # Service name = consumer-gateway
+fullnameOverride: provider-gateway   # Service name = provider-gateway
 ```
 
-The AGN Operator's `gateway.serviceName` must match the consumer
+The AGN Operator's `gateway.serviceName` must match the provider
 gateway's Service name. When using `fullnameOverride`, set
 `gateway.serviceName` to the same value in the operator Helm values.
 
@@ -388,9 +410,20 @@ each model to the least-loaded admitted site. The chosen candidate's cluster mus
 name a `gatewayConfig.backends` cluster, so give each backend the operator's
 candidate cluster (the provider's `routingClusterRef`, else its name).
 
-The gateway reads the file only at start. When the ConfigMap's
-`grid.praxis.fast/serving-digest` annotation changes, restart the gateway
-(`kubectl rollout restart`).
+A `grid-gateway` built from the current source re-reads `serving-config.json`
+every five seconds after the kubelet updates the mounted ConfigMap. It applies
+candidate, peer, address, and pin changes without a pod restart. Invalid updates
+keep the last accepted serving settings and topology. Changes to mounted
+identity files can still restart signals pollers using those accepted settings.
+Check gateway logs and
+`grid_serving_config_reload_total{result="applied"}` for acceptance; the
+`grid.praxis.fast/serving-digest` annotation records publication, not acceptance.
+
+The same watcher detects changes to the mounted CA, client certificate, and
+key, and rebuilds the signals pollers. This refreshes their mTLS identity; it
+does not renew certificates or change provider-listener TLS settings. Older
+images without this watcher still need a rollout. Choose an image that includes
+the watcher before relying on live updates.
 
 Known limits:
 
@@ -398,10 +431,15 @@ Known limits:
   provider gateway is down. That request fails rather than failing over.
 - The gateway matches a candidate's cluster to `gatewayConfig.backends` by name only.
   Nothing checks that the backend serves the candidate's site.
-- Site certificates last 180 days. Under `spiffe` trust the operator rotates them
-  around day 120 and rolls the gateway Deployment, because the gateway reads its
-  upstream client certificate only at start. Under `pin` trust nothing rotates
-  them: re-enroll each site and update the peers' digests before it expires.
+- The serving watcher does not add load-balancer clusters to `praxis.yaml`.
+  Add each new candidate's backend there too. Listener changes and serving
+  `window_secs` changes require a restart.
+- Site certificates last 180 days by default. Under `spiffe` trust, the operator
+  rotates them around day 120 and rolls the gateway Deployment to refresh its
+  upstream mTLS client identity. Under `pin` trust, rotation is disabled:
+  re-enroll each site and update the peers' digests before its certificate expires.
+  The serving watcher refreshes signals-poller identity files; provider-listener
+  certificate reload depends on the Praxis build.
 
 ### Routing overlay delivery
 

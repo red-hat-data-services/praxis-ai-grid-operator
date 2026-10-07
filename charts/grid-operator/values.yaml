@@ -180,29 +180,54 @@ swim:
     loadBalancerSourceRanges: []
 
 # -- mTLS signals endpoint, for a GridNetwork with signalTransport poll.
+# -- Cloud the grid runs on. `aws` asks for an NLB, since the default carries no UDP.
+platform: ""
+
+# -- The grid's other sites, separated by spaces or commas. Each becomes a SWIM seed and,
+# if a bare IPv4 address, a host route in both Services. swim.seeds and either Service's
+# loadBalancerSourceRanges override it.
+peers: ""
+
 signals:
-  # -- Serve signals on the SWIM Service. Needs swim.service.enabled and, for a LoadBalancer, mixed UDP and TCP support.
+  # -- Serve this site's signals endpoint for peers to poll.
   enabled: false
-  # -- Signals TCP port on the SWIM Service, gossiped to peers with its LoadBalancer address.
+  # -- Signals TCP port, gossiped to peers with this Service's address.
   port: 9091
+  service:
+    # -- Render the signals Service.
+    enabled: true
+    # -- Service type. Empty follows swim.service.type, so one knob covers both.
+    type: ""
+    # -- Address to request, where the environment assigns them.
+    loadBalancerIP: ""
+    # -- Annotations, an NLB class among them.
+    annotations: {}
+    # -- Source ranges allowed to poll signals. Empty inherits swim.service's.
+    loadBalancerSourceRanges: []
+    # -- Empty keeps Local for a LoadBalancer.
+    externalTrafficPolicy: ""
   # -- Signals endpoint gossiped to peers (ip:port, [ipv6]:port, or dns-name:port). Set it when swim.advertiseAddress is set or the Service is not a LoadBalancer.
   advertiseAddress: ""
 
-# -- Advertised gateway address configuration.
+# -- Advertised site gateway address configuration.
 gateway:
-  # -- Gateway address override.
+  # -- Discover and advertise a LoadBalancer address for the site gateway.
+  discoveryEnabled: true
+  # -- Reachable site gateway host:port override. Set this for ClusterIP or
+  # NodePort Services; otherwise the operator discovers a LoadBalancer address.
   address: ""
-  # -- Gateway Kubernetes Service name for the operator to discover. Maps to
-  # GRID_GATEWAY_SERVICE_NAME. Defaults to grid-gateway with enrollment on or grid.id,
-  # which also names it in the GridNetwork's gatewayRefs.
+  # -- Site gateway Kubernetes Service name for the operator to discover. Defaults
+  # to grid-gateway with enrollment enabled or grid.id set; it also names the
+  # gateway in GridNetwork spec.gatewayRefs. Maps to GRID_GATEWAY_SERVICE_NAME.
   serviceName: ""
-  # -- Namespace of the gateway Service. Empty uses the release namespace. Maps
-  # to GRID_GATEWAY_NAMESPACE.
+  # -- Namespace of the site gateway Service. Empty uses the release
+  # namespace. Maps to GRID_GATEWAY_NAMESPACE.
   namespace: ""
   # -- Allow gateway.namespace to be default, kube-*, or openshift-*.
   allowSystemNamespace: false
-  # -- Gateway port for operator-to-gateway discovery. Maps to
-  # GRID_GATEWAY_PORT.
+  # -- Site gateway Service port advertised to remote sites. Empty uses the
+  # Service's declared port; if several are present, the first spec.ports entry
+  # is used. Maps to GRID_GATEWAY_PORT.
   port: ""
 
 # -- Probe timing configuration.
