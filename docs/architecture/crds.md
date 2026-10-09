@@ -29,9 +29,15 @@ spec:
       localSiteName: cluster-east   # optional; defaults to network name
       consumerConfig:               # optional; opt-in consumer Praxis config generation
         enabled: true
+        enableProjectedCredentials: true  # generate filter, then roll out consumer
+        supportsProjectedCredentials: true # set only after that rollout
         credentialMountBase: /run/secrets/grid-credentials
         configMapName: praxis-consumer-config
         tlsCertMountPath: /etc/praxis/tls
+        mountReconciliation:
+          enabled: true
+          deploymentName: inference-gw
+          containerName: praxis
         clusterEndpoints:           # endpoint topology for load_balancer
           - cluster: site-a
             address: "10.0.0.4:30080"
@@ -39,9 +45,13 @@ spec:
               mode: mutual_tls         # mTLS with CA verification and client cert
               sni: site-a.grid.internal
           - cluster: api-provider
-            address: "mock-api.default.svc:8080"
+            address: "api.example.internal:443"
             transport:
-              mode: plaintext          # explicit insecure/dev-only — no TLS
+              mode: tls                # verified server TLS
+              sni: api.example.internal
+              caSecretRef:
+                name: api-provider-ca  # Secret in praxis-system (gateway namespace)
+                # key: ca.crt          # optional; defaults to ca.crt
   region: us-east-1
   zone: us-east-1a
   swim:
@@ -90,7 +100,8 @@ not part of this CRD.
 **Phases**: Pending → Initializing → Active → Degraded
 
 **Status fields**: `gridId`, `connectedSites`, `distributedProviderCount`,
-`observedGeneration`, `phase`, `consumerConfigStatus[]`, `budgetStatus[]`
+`observedGeneration`, `phase`, `consumerConfigStatus[]`,
+`mountReconciliationStatus[]`, `budgetStatus[]`
 
 `distributedProviderCount` reflects the number of remote `InferenceProvider`
 records received from peer sites via CRDT broadcast.  Local providers and records
@@ -99,6 +110,28 @@ from other `GridNetwork`s are excluded from the count.
 `consumerConfigStatus[]` is populated for each gateway with
 `consumerConfig.enabled: true`, reporting the outcome of the most recent
 render/apply attempt.
+
+Set `consumerConfig.mountReconciliation.enabled: true` to delegate generated
+Secret mounts and coordinated Deployment rollouts to Grid. This requires an
+explicitly annotated Deployment in `GatewayRef.namespace`. The operator manages
+only its reserved projected volumes and the selected container's mounts. Secret
+references must be in the gateway namespace. `consumerConfigStatus[].phase` of
+`Rendered` describes the ConfigMap; only
+`mountReconciliationStatus[].phase: Ready` reports a ready gateway revision.
+With delegation disabled, the operator still publishes a reference-only
+`grid-mount-requirements-<hash>` ConfigMap with the document under
+`mount-requirements.json` for the gateway owner to consume.
+
+`clusterEndpoints[].transport.mode` accepts `mutual_tls`, `tls`, or `plaintext`.
+The optional `transport.caSecretRef` is valid for `tls` and names a custom CA
+Secret in the target `GatewayRef.namespace`; it has `name` and optional `key`
+fields only, with the key defaulting to `ca.crt`. Existing manifests must remove
+its former `namespace` field and place the Secret in the gateway namespace.
+CRD pruning removes unknown fields: `Warn` mode accepts the object and reports a
+warning, `Ignore` silently drops the field, and `Strict` rejects the request.
+This namespace-local reference is distinct from `spec.tls.caSecretRef`, which
+retains its explicit `namespace`. `mutual_tls` uses `spec.tls.caSecretRef` and
+`spec.tls.siteSecretRef` and does not accept a custom CA override.
 
 ### Tenant budget tracking
 
@@ -138,6 +171,12 @@ options under consideration if per-tenant confidentiality is required.
 | `reason` | string | Machine-readable reason (`MissingClusterEndpoint`, `ConsumerConfigRenderFailed`, `ConsumerConfigApplyFailed`) — empty when `Rendered` |
 | `message` | string | Human-readable diagnostic; never contains token bytes |
 | `observedGeneration` | integer | `GridNetwork` generation when this entry was last updated |
+
+For a delegated gateway, `mountReconciliationStatus[]` reports the rendered
+requirements revision, the config revision last rolled out, the Deployment
+generation, and one of `RequirementsRendered`, `WaitingForSecret`,
+`MountsReconciling`, `WaitingForRollout`, `Ready`, or `Error`. Messages contain
+resource names and paths only. They never contain Secret data or private keys.
 
 Example status output:
 
@@ -246,6 +285,16 @@ never starts clocks or collects. A pass that would delete more than half the
 stubs, and more than 8, deletes none and logs a warning; a partition looks like
 mass departure.
 
+### GatewayRef.providerHopEndpoints
+
+`spec.gatewayRefs[].providerHopEndpoints` independently configures the
+provider-hop trust allowlist used by the embedded `grid-gateway`. Each entry
+names a provider cluster and declares its verified mTLS mode and SNI. The
+embedded gateway's startup upstream configuration must use that TLS identity.
+This field is independent of `consumerConfig`; absent or disabled generated
+consumer Praxis config cannot make embedded serving fail validation or change
+its provider-hop allowlist.
+
 ### GatewayRef.consumerConfig
 
 `spec.gatewayRefs[].consumerConfig` opts a gateway into operator-managed consumer
@@ -254,13 +303,23 @@ Praxis `ConfigMap` generation.
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Set to `true` to enable consumer config generation for this gateway. |
-| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory where credential Secrets are mounted inside the consumer pod. |
+| `enableProjectedCredentials` | `false` | Generate the dynamic `credential_inject` filter and projected mount root, including with an empty candidate set. Roll out the consumer after enabling this. |
+| `supportsProjectedCredentials` | `false` | Attest that the consumer has loaded that filter/config and mounted its referenced Secrets. Until true, credential-bearing overlay revisions are retained with `ProjectedCredentialsUnsupported`. |
+| `credentialMountBase` | `/run/secrets/grid-credentials` | Base directory for projected credentials. In projected mode, mount each Secret at `{base}/{namespace}/{name}` with Secret keys as files. Static `file:` entries continue using their explicitly configured paths. |
 | `configMapName` | `praxis-consumer-config` | Name of the generated `ConfigMap` in the gateway namespace. |
 | `clusterEndpoints[]` | `[]` | Endpoint topology for `load_balancer` clusters. Each entry maps a candidate cluster name to an address with explicit `transport` configuration. Missing transport fails closed. |
-| `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (mTLS with CA/client cert/SNI/verify) or `plaintext` (no TLS, insecure/dev-only). |
-| `clusterEndpoints[].transport.sni` | _(required for `mutual_tls`)_ | TLS Server Name Indication; must match the provider certificate SAN. |
+| `clusterEndpoints[].transport.mode` | _(required)_ | `mutual_tls` (CA/client cert/SNI/verify), `tls` (server-authenticated TLS), or `plaintext` (no TLS, insecure/dev-only). |
+| `clusterEndpoints[].transport.sni` | _(required for TLS modes)_ | TLS Server Name Indication; must match the provider certificate SAN. |
+| `clusterEndpoints[].transport.caSecretRef` | omitted | Optional CA Secret for `tls`, resolved in `GatewayRef.namespace`; `name` required, `key` defaults to `ca.crt`, and `namespace` is not a field. |
 | `tlsCertMountPath` | `/etc/praxis/tls` | Base path for mounted TLS files used when a `clusterEndpoints[]` entry uses `mutual_tls` transport. |
 | `listenerPort` | `8080` | HTTP port for the generated `listeners[0].address` (`0.0.0.0:{listenerPort}`). |
+
+Grid publishes a valid empty versioned overlay when no candidates remain.
+Every consumer of that overlay must use a Praxis AI image that accepts empty
+versioned snapshots; older images, including the chart-default 0.4.0 image,
+are incompatible. Upgrade and roll out the consumers before deploying this
+Grid version. Malformed or undeliverable updates still retain the last valid
+revision; an authoritative empty candidate set does not.
 
 When `enabled: true`, the `GridNetwork` controller renders a `praxis.yaml`-keyed
 `ConfigMap` in the gateway namespace on each reconcile.  The generated config is a
@@ -268,29 +327,52 @@ complete, runnable Praxis config containing:
 
 - `listeners:` — one public listener at `0.0.0.0:{listenerPort}`
 - `filter_chains:` — the consumer chain with:
-  - `intelligent_route` candidates from the routing overlay (with `credential.secretRef` for
-    credential-bearing candidates)
-  - `credential_inject` entries (one per unique credential reference) using
-    `file:` sources — token bytes are never written to the `ConfigMap`
-  - `load_balancer` entries (one per unique candidate cluster). Every referenced
+  - `intelligent_route` reading the versioned routing overlay with expected
+    network, gateway, namespace, and local-site scope. Candidates and selection
+    policy are not copied into startup-only YAML.
+  - `credential_inject` is included when current candidates have credential
+    references or `enableProjectedCredentials: true`. In projected mode it
+    starts with an empty table and resolves later references under the
+    projected Secret mount; missing files fail closed. Token bytes are never
+    written to the `ConfigMap`.
+  - `load_balancer` entries for every configured endpoint, including currently
+    inactive providers needed for restoration. Every potentially routable
     cluster must have a matching `clusterEndpoints[]` entry with endpoint address
     and explicit `transport` configuration.  `transport.mode` is the security
     switch — not `sni` presence.  Missing transport fails closed
 - `admin:` — admin listener at `127.0.0.1:9901`
 - `shutdown_timeout_secs: 5`
 
-The generated credential-injection config assumes the gateway is the egress
-component for the selected backend.  This is correct for direct API-provider and
-cloud-provider fallback routes.  For remote provider sites, provider credentials
-should be mounted only in the remote site or provider-side component that makes
-the final backend call.
+The generated credential-injection config is for credentials intentionally
+projected into the consumer gateway's namespace. For remote provider sites,
+credentials should normally be mounted only in the remote site or provider-side
+component that makes the final backend call.
 
 The `credential_inject` filter is a Praxis AI runtime dependency. The AGN
 operator can render the config shape, but the deployed Praxis AI image must
 include that filter for the generated config to start successfully.
 
-When `enabled: false` or `consumerConfig` is absent, this gateway behaves as before
-— only the routing overlay `ConfigMap` is applied.
+The consumer Deployment must mount the gateway's `grid-overlay-<network>-<gateway>`
+ConfigMap key `routing-overlay.json` at `/etc/praxis/routing/routing-overlay.json`
+as a projected volume (never with `subPath`). Cross-cluster consumers must
+deliver both the Praxis config ConfigMap and routing overlay to the consumer
+cluster. The initial migration from static inline candidates requires a
+consumer rollout; listener, endpoint/TLS, or credential-table changes continue
+to require a rollout, while route-only overlay revisions hot reload.
+
+For generated consumer configs, first set `enableProjectedCredentials: true`
+and roll out the consumer so it loads the filter and mount root. Then set
+`supportsProjectedCredentials: true` to attest that rollout and mount the
+referenced Secret. The Grid controller does not own or restart consumer
+Deployments. Until readiness is attested, credential-bearing overlay revisions
+are retained. In projected mode, the generated config uses an empty credential
+table and resolves the selected Secret reference at request time, failing
+closed when it cannot read it.
+
+When `enabled: false` or `consumerConfig` is absent, no generated consumer
+Praxis `ConfigMap` is applied. The routing overlay remains active, and the
+embedded gateway's serving config is controlled separately by
+`GatewayRef.providerHopEndpoints`.
 
 ## GridSite
 
@@ -554,14 +636,79 @@ spec:
     matchLabels: {}
 ```
 
-This external API example intentionally omits `healthCheck`: AGN probes health
-with an unauthenticated HTTP `GET`, which is not the provider's authenticated
-inference API. It also omits metrics scraping because the external API does not
-provide the provider-pool metrics used by AGN scoring. The referenced
-`openai-token` Secret must exist in `praxis-system` before controller-managed
+This external API example intentionally omits `healthCheck` because the API
+does not expose a suitable `GET /health` endpoint. It also omits metrics
+scraping because the external API does not provide the provider-pool metrics
+used by AGN scoring. The referenced `openai-token` Secret must exist in
+`praxis-system` before controller-managed
 credential projection can become available.
 
+To probe the provider's default `{spec.endpoint}/health` URL, add this to the
+provider spec:
+
+```yaml
+healthCheck: {}
+```
+
+When `spec.auth` declares a controller-managed bearer token, the operator
+automatically sends it on same-origin HTTPS health probes. If the endpoint
+uses a private CA, also configure `healthCheck.tls.caSecretRef`:
+
+```yaml
+healthCheck:
+  tls:
+    caSecretRef:
+      name: model-gateway-ca
+      namespace: praxis-system
+```
+
+The token comes from `spec.auth.secretRef` on each probe. The probe target must
+have the same scheme, host, and effective port as `spec.endpoint` to receive it.
+`healthCheck.path` changes the request path; `healthCheck.endpoint` can change
+the base URL within that origin. Probes to a different origin or over plain
+HTTP remain anonymous. Providers without controller-managed bearer auth also
+probe anonymously. Redirects are not followed; a 3xx response degrades health.
+
 **Phases**: Pending → Available → Degraded → Unavailable
+
+**Readiness**: `status.conditions` carries a `Ready` condition, written by the
+operator's signals loop from each scrape of the provider's metrics. Readiness is
+a condition, not a phase: `phase` follows the provider's configuration only, and
+says nothing about whether it serves now.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint. |
+| `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints, and the EPP recorded no engine answer in the last 30s. |
+| `Unknown` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). Readiness is unknown rather than false, so the provider is not excluded: a provider pointed at vLLM's own `/metrics` carries no such series. The message names what was missing. |
+| `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds`, and the latest timed out. |
+| `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |
+| `False` | `TLSHandshakeFailed` | As above, and the latest failed TLS, including the TLS material. |
+| `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `body_cap`, `parse`, or `config`. |
+| `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds`, and none failed. |
+| `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
+| `Unknown` | `AwaitingFirstScrape` | No scrape has succeeded yet, within the grace window. |
+| `Unknown` | `MetricsNotConfigured` | No `metricsConfig`, so readiness cannot be read. |
+
+The operator logs each change of reason once: at WARN when the provider turns not
+ready, at INFO when it returns to `Ready` or waits. Each scrape counts in
+`grid_provider_scrape_total{grid_provider,result}`, where `result` is `success`,
+`no_series`, or a failure class, and
+`grid_provider_last_scrape_success_timestamp_seconds{grid_provider}` holds the time
+of the last scrape with the ready-endpoint series.
+
+A provider whose `Ready` is `False` is excluded from routing: its site publishes
+`grid_provider_ready 0`, and its serving config entry carries `admission: none`.
+See [Polling Cross-Site Load Signals](polling-metrics.md#provider-readiness).
+
+The READY column reads the condition's status directly, so no status field
+repeats it. `-o wide` adds REASON, the condition's reason, and PHASE.
+
+```text
+NAME           PROVIDER      READY   AGE
+qwen3-site-a   self_hosted   True    3d
+qwen3-site-b   self_hosted   False   3d
+```
 
 `spec.capacityWeight` is an optional positive relative provider capacity from
 `1` through `1000`, used only with `GridNetwork.spec.selectionPolicy.mode:
@@ -651,6 +798,7 @@ routing architecture for full semantics.
 | `prefixCacheHitRatio` | Prefix-cache hit ratio from `0.0` to `1.0`. |
 | `errorRate` | Error rate from `0.0` to `1.0`. |
 | `healthy` | Health gauge interpreted by the metrics parser. |
+| `readyEndpoints` | Ready endpoints in the pool, read for the `Ready` condition. Defaults to `llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, filtered by `poolName`. |
 
 #### TLS and mTLS
 

@@ -746,6 +746,17 @@ pub struct GatewayRef {
     #[serde(default)]
     pub local_site_name: Option<String>,
 
+    /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
+    /// serving config. This allowlist is independent of `consumerConfig`, so a
+    /// missing or disabled generated Praxis config cannot alter embedded
+    /// serving behavior. Every entry must declare `mutual_tls` and a nonblank
+    /// SNI. The embedded gateway compares each declaration against the
+    /// loaded Praxis load-balancer's verified mTLS backend before it sends
+    /// provider-hop context. Changing Praxis backend transport requires a
+    /// gateway restart while `gridServing` is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_hop_endpoints: Vec<ProviderHopEndpointConfig>,
+
     /// Opt-in configuration for operator-managed consumer Praxis config generation.
     ///
     /// When absent or `enabled: false`, this gateway behaves exactly as before —
@@ -757,7 +768,9 @@ pub struct GatewayRef {
     /// entry per unique inference cluster. Other capability kinds remain in the
     /// routing overlay for dedicated data-plane pipelines.
     ///
-    /// The generated `ConfigMap` contains no token bytes.
+    /// The generated `ConfigMap` contains no token bytes. Credential-bearing
+    /// overlays are withheld until the consumer has explicitly declared that its
+    /// compatible filter config is already running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer_config: Option<ConsumerConfig>,
 }
@@ -782,6 +795,10 @@ pub struct GatewayRef {
 /// entries use a `file:` source under `credentialMountBase`; the mounted
 /// Kubernetes Secret provides the token at runtime.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "wire-compatible opt-in and attestation fields are separate"
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -790,10 +807,32 @@ pub struct ConsumerConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Generate the dynamic `credential_inject` filter and projected mount
+    /// root, including when the current overlay has no credentials. Enable this
+    /// first, then roll out the generated config before asserting readiness
+    /// with `supportsProjectedCredentials`.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enable_projected_credentials: bool,
+
+    /// Declare that the running consumer has the dynamic `credential_inject`
+    /// filter configured with the projected Secret mount root. This is a
+    /// fail-closed capability gate for credential-bearing overlay revisions.
+    /// Set it only after the consumer has loaded a config containing that
+    /// filter; the Grid operator does not own or roll out the consumer
+    /// Deployment.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub supports_projected_credentials: bool,
+
     /// Base directory for mounted credential Secret files inside the consumer pod.
     ///
-    /// Each credential Secret is expected to be mounted at
-    /// `{credentialMountBase}/{secret-name}/{secret-key}`.
+    /// In projected-credential mode, mount each Secret at
+    /// `{credentialMountBase}/{secret-namespace}/{secret-name}` with its data
+    /// keys as files. Static `file:` entries continue to use their explicit
+    /// paths and are not constrained by this directory layout.
     ///
     /// Default: `/run/secrets/grid-credentials`.
     #[serde(default = "default_credential_mount_base")]
@@ -836,6 +875,16 @@ pub struct ConsumerConfig {
     /// Default: `/etc/praxis/tls`.
     #[serde(default = "default_tls_cert_mount_path")]
     pub tls_cert_mount_path: String,
+
+    /// Opt in to validating Secret references and reconciling required mounts
+    /// into a specifically delegated gateway Deployment.
+    ///
+    /// Disabled by default. When enabled, the named Deployment must carry the
+    /// `grid.praxis-proxy.io/mount-reconciliation`, `.../network`, and
+    /// `.../gateway` annotations emitted by `charts/praxis-gateway` (or set
+    /// them explicitly on an externally managed Deployment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_reconciliation: Option<MountReconciliation>,
 
     /// HTTP port for the generated Praxis listener.
     ///
@@ -977,20 +1026,52 @@ impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            enable_projected_credentials: false,
+            supports_projected_credentials: false,
             credential_mount_base: default_credential_mount_base(),
             config_map_name: default_consumer_config_map_name(),
             cluster_endpoints: Vec::new(),
             tls_cert_mount_path: default_tls_cert_mount_path(),
+            mount_reconciliation: None,
             listener_port: default_listener_port(),
             telemetry: None,
         }
     }
 }
 
+/// Explicit delegation of a gateway Deployment's generated Secret mounts.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "!has(self.enabled) || !self.enabled || has(self.deploymentName)",
+    "message": "deploymentName is required when mount reconciliation is enabled"
+}]))]
+pub struct MountReconciliation {
+    /// Enable delegated mount reconciliation. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Name of the opted-in Deployment in the gateway namespace.
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_name: Option<String>,
+
+    /// Name of the Praxis container whose mounts Grid manages.
+    #[schemars(length(min = 1))]
+    #[serde(default = "default_praxis_container_name")]
+    pub container_name: String,
+}
+
+/// Default the delegated mount target to the chart's Praxis container name.
+fn default_praxis_container_name() -> String {
+    "praxis".to_owned()
+}
+
 /// Transport mode for a consumer load-balancer cluster endpoint.
 ///
 /// Determines whether the consumer connects to the provider gateway
-/// cluster over mutual TLS or plain HTTP.  This is an explicit security
+/// cluster over mutual TLS, server-authenticated TLS, or plain HTTP. This is an explicit security
 /// decision — the operator refuses to render a cluster entry without a
 /// declared transport mode, preventing accidental plaintext.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -998,28 +1079,71 @@ impl Default for ConsumerConfig {
 pub enum TransportMode {
     /// Mutual TLS with CA verification and client certificate.
     MutualTls,
+    /// Server-authenticated TLS without a client certificate.
+    Tls,
     /// Plain HTTP — no TLS.  Explicit insecure/dev-only mode.
     Plaintext,
 }
 
 /// Transport configuration for a cluster endpoint.
 ///
-/// Bundles the [`TransportMode`] with an optional SNI field.
-/// When `mode` is [`MutualTls`](TransportMode::MutualTls), `sni` is
-/// required and must match the Subject Alternative Name in the provider
-/// gateway's server certificate.  When `mode` is
-/// [`Plaintext`](TransportMode::Plaintext), `sni` must not be set —
-/// setting it is rejected as a likely misconfiguration.
+/// Bundles transport mode with SNI and an optional custom CA Secret.
+/// `sni` is required for both TLS modes and forbidden for plaintext.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": "self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null",
+    "message": "caSecretRef is only valid for tls transport"
+}, {
+    "rule": "self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0",
+    "message": "an explicitly empty sni is only valid for plaintext transport"
+}]))]
 pub struct EndpointTransport {
-    /// Transport mode: `mutual_tls` or `plaintext`.
+    /// Transport mode: `mutual_tls`, `tls`, or explicit `plaintext`.
     pub mode: TransportMode,
 
-    /// TLS Server Name Indication (required when mode is `mutual_tls`;
-    /// must not be set when mode is `plaintext`).
+    /// TLS Server Name Indication, required when mode is `mutual_tls` or `tls`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
+
+    /// Optional gateway-namespace Secret supplying a custom CA bundle for `tls` transport.
+    /// Specify only its name and optional key; the Secret must be in the namespace
+    /// named by the containing `GatewayRef`. The mounted path is
+    /// `/run/secrets/grid-backend-ca/{secret-name}/{key}`; the key defaults to
+    /// `ca.crt`. Omitted uses the process trust store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_secret_ref: Option<EndpointCaSecretRef>,
+}
+
+/// Gateway-namespace Secret reference for a consumer backend CA bundle.
+///
+/// Unlike [`SecretRef`], this reference has no namespace field: the Secret is
+/// resolved in the target gateway's namespace.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointCaSecretRef {
+    /// Secret name in the target gateway namespace.
+    #[schemars(length(min = 1))]
+    pub name: String,
+
+    /// Optional key containing the CA bundle. Defaults to `ca.crt`.
+    #[schemars(length(min = 1))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// Explicit verified-mTLS endpoint identity trusted for embedded provider-hop
+/// context. This does not configure the gateway's upstream TLS connection; the
+/// embedded gateway must separately use verified TLS with this SNI; the
+/// gateway checks the two configurations before serving hop traffic.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderHopEndpointConfig {
+    /// Cluster name used by the embedded gateway's `load_balancer` filter.
+    pub cluster: String,
+
+    /// TLS mode and SNI configured for that embedded gateway upstream.
+    pub transport: EndpointTransport,
 }
 
 /// Endpoint configuration for one consumer `load_balancer` cluster.
@@ -1032,9 +1156,8 @@ pub struct EndpointTransport {
 ///
 /// The `transport` field is required.  Missing transport fails closed
 /// during config rendering with status reason `MissingTransport`.
-/// When `transport.mode` is `mutual_tls`, `transport.sni` must also
-/// be present and non-blank; otherwise rendering fails with status
-/// reason `MissingSni`.
+/// Both TLS modes require nonblank `transport.sni`; otherwise rendering fails
+/// with status reason `MissingSni`. `tls` can declare a custom CA Secret.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterEndpointConfig {
@@ -1112,7 +1235,7 @@ pub struct TlsConfig {
 }
 
 /// Reference to a Kubernetes Secret.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct SecretRef {
     /// Secret name.
     #[schemars(length(min = 1))]
@@ -1173,6 +1296,13 @@ pub struct GridNetworkStatus {
     /// consumer `ConfigMap` for each opted-in gateway.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumer_config_status: Vec<ConsumerConfigStatus>,
+
+    /// Per-gateway Secret requirements and optional mount reconciliation status.
+    ///
+    /// Populated for every gateway with `consumerConfig.enabled: true`. Without
+    /// explicit mount reconciliation, the phase remains `RequirementsRendered`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mount_reconciliation_status: Vec<MountReconciliationStatus>,
 
     /// Per-gateway overlay revision status.
     ///
@@ -1275,6 +1405,57 @@ pub struct ConsumerConfigStatus {
     /// `GridNetwork` generation when this entry was last updated.
     #[serde(default)]
     pub observed_generation: i64,
+}
+
+/// Lifecycle phase for delegated gateway mount reconciliation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum MountReconciliationPhase {
+    /// The reference-only requirements document has been generated.
+    RequirementsRendered,
+    /// A referenced Secret or required key is absent or invalid.
+    WaitingForSecret,
+    /// Grid is applying the required pod volumes and mounts.
+    MountsReconciling,
+    /// The Deployment is rolling out a matching configuration revision.
+    WaitingForRollout,
+    /// Required files are mounted in available pods with matching config.
+    Ready,
+    /// Delegation, path, ownership, or API reconciliation failed.
+    #[default]
+    Error,
+}
+
+/// Per-gateway progress for Secret mount reconciliation and gateway readiness.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MountReconciliationStatus {
+    /// Gateway reference name.
+    pub gateway_name: String,
+    /// Namespace containing the Deployment and Secret references.
+    pub namespace: String,
+    /// Delegated Deployment name. Absent when Grid only publishes requirements.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_name: Option<String>,
+    /// Current mount lifecycle phase.
+    pub phase: MountReconciliationPhase,
+    /// Digest of canonical requirements, containing no Secret bytes.
+    #[serde(default)]
+    pub requirements_revision: String,
+    /// Digest last mounted and rolled out by Grid.
+    #[serde(default)]
+    pub applied_revision: String,
+    /// Stable machine-readable cause; empty on `Ready`.
+    #[serde(default)]
+    pub reason: String,
+    /// Human-readable diagnostic containing identifiers and paths only.
+    #[serde(default)]
+    pub message: String,
+    /// Observed `GridNetwork` generation.
+    #[serde(default)]
+    pub observed_generation: i64,
+    /// Observed Deployment generation, or zero before it is observed.
+    #[serde(default)]
+    pub deployment_generation: i64,
 }
 
 /// Lifecycle phase of a [`GridNetwork`].
@@ -1627,6 +1808,8 @@ mod tests {
             "namespace": "ns",
             "consumerConfig": {
                 "enabled": true,
+                "enableProjectedCredentials": true,
+                "supportsProjectedCredentials": true,
                 "credentialMountBase": "/run/secrets/grid",
                 "configMapName": "my-consumer-config",
                 "tlsCertMountPath": "/etc/custom-tls",
@@ -1648,6 +1831,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(cc.enabled, "enabled must round-trip");
+        assert!(
+            cc.enable_projected_credentials,
+            "projected filter opt-in must round-trip"
+        );
+        assert!(
+            cc.supports_projected_credentials,
+            "projected credential readiness must round-trip"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid",
             "credentialMountBase must round-trip"
@@ -1716,6 +1907,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts every ConsumerConfig default as one contract"
+    )]
     fn consumer_config_defaults_when_subfields_absent() {
         let json = serde_json::json!({
             "name": "gw",
@@ -1725,6 +1920,14 @@ mod tests {
         let gw: GatewayRef = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let cc = gw.consumer_config.unwrap_or_else(|| std::process::abort());
         assert!(!cc.enabled, "enabled must default to false");
+        assert!(
+            !cc.enable_projected_credentials,
+            "projected filter opt-in must default off"
+        );
+        assert!(
+            !cc.supports_projected_credentials,
+            "projected credentials must default closed"
+        );
         assert_eq!(
             cc.credential_mount_base, "/run/secrets/grid-credentials",
             "credentialMountBase must use default"
@@ -1859,6 +2062,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             local_site_name: None,
+            provider_hop_endpoints: Vec::new(),
             consumer_config: None,
         };
         let json = serde_json::to_value(&gw).unwrap_or_else(|_| std::process::abort());
@@ -1882,6 +2086,10 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("consumerConfig"),
             "CRD schema must include consumerConfig field on GatewayRef"
+        );
+        assert!(
+            gateway_ref_properties.contains_key("providerHopEndpoints"),
+            "CRD schema must include independent providerHopEndpoints on GatewayRef"
         );
         let consumer_config_properties = gateway_ref_properties
             .get("consumerConfig")
@@ -1940,6 +2148,56 @@ mod tests {
     }
 
     #[test]
+    fn delegated_deployment_name_is_optional_but_nonempty_when_set() {
+        let crd = crd_json();
+        let mount_properties = crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
+                 /gatewayRefs/items/properties/consumerConfig/properties\
+                 /mountReconciliation/properties",
+            )
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        let deployment_name = mount_properties
+            .get("deploymentName")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            deployment_name.get("minLength").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "a supplied delegated Deployment name must be nonempty"
+        );
+        assert!(
+            deployment_name.get("default").is_none(),
+            "the optional Deployment name must not default to an empty string"
+        );
+        assert_eq!(
+            mount_properties
+                .get("enabled")
+                .and_then(|enabled| enabled.get("default"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "mount reconciliation must remain opt in"
+        );
+    }
+
+    #[test]
+    fn enabled_mount_reconciliation_requires_deployment_name_at_admission() {
+        let crd = crd_json();
+        let rule = crd.pointer(
+            "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties\
+             /gatewayRefs/items/properties/consumerConfig/properties/mountReconciliation\
+             /x-kubernetes-validations/0/rule",
+        );
+        assert_eq!(
+            rule,
+            Some(&serde_json::json!(
+                "!has(self.enabled) || !self.enabled || has(self.deploymentName)"
+            )),
+            "enabled delegation must require a Deployment name at admission"
+        );
+    }
+
+    #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "CRD schema test covers transport type, mode enum values, and sni field"
@@ -1991,10 +2249,87 @@ mod tests {
             mode_values.contains(&"plaintext"),
             "transport.mode enum must include plaintext: {mode_values:?}"
         );
+        assert!(
+            mode_values.contains(&"tls"),
+            "transport.mode enum must include server-authenticated tls: {mode_values:?}"
+        );
         assert_eq!(
             mode_values.len(),
-            2,
-            "transport.mode enum must have exactly 2 values: {mode_values:?}"
+            3,
+            "transport.mode enum must have exactly 3 values: {mode_values:?}"
+        );
+        assert!(
+            transport_properties.contains_key("caSecretRef"),
+            "CRD schema must include optional custom CA Secret reference"
+        );
+        assert!(
+            transport_properties
+                .get("sni")
+                .and_then(|sni| sni.get("minLength"))
+                .is_none(),
+            "plaintext transport must admit an explicitly empty SNI"
+        );
+        assert_eq!(
+            endpoint_properties
+                .get("transport")
+                .and_then(|transport| transport.pointer("/x-kubernetes-validations/0/rule")),
+            Some(&serde_json::json!(
+                "self.mode == 'tls' || !has(self.caSecretRef) || self.caSecretRef == null"
+            )),
+            "custom CA references must be admitted only for tls transport"
+        );
+        assert_eq!(
+            endpoint_properties
+                .get("transport")
+                .and_then(|transport| transport.pointer("/x-kubernetes-validations/1/rule")),
+            Some(&serde_json::json!(
+                "self.mode == 'plaintext' || !has(self.sni) || self.sni.size() > 0"
+            )),
+            "explicitly empty SNI must be admitted only for plaintext transport"
+        );
+
+        let ca_ref = transport_properties
+            .get("caSecretRef")
+            .unwrap_or_else(|| std::process::abort());
+        let ca_ref_properties = ca_ref
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            ca_ref_properties.contains_key("name"),
+            "transport CA reference must expose name"
+        );
+        assert!(
+            ca_ref_properties.contains_key("key"),
+            "transport CA reference must expose optional key"
+        );
+        assert!(
+            !ca_ref_properties.contains_key("namespace"),
+            "transport CA reference must resolve in the gateway namespace"
+        );
+        assert_eq!(
+            ca_ref.pointer("/required"),
+            Some(&serde_json::json!(["name"])),
+            "only the transport CA Secret name is required"
+        );
+
+        let grid_ca_ref = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/tls/properties/caSecretRef")
+            .unwrap_or_else(|| std::process::abort());
+        let grid_ca_properties = grid_ca_ref
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            grid_ca_properties.contains_key("namespace"),
+            "spec.tls.caSecretRef must retain its explicit namespace"
+        );
+        assert!(
+            grid_ca_ref
+                .pointer("/required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| required.iter().any(|field| field == "namespace")),
+            "spec.tls.caSecretRef must continue requiring namespace"
         );
     }
 

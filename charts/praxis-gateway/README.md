@@ -245,8 +245,18 @@ Praxis AI image; these values may advance independently.
 | `gatewayConfig.auth.validateUrl` | string | **required** for `api-key` | https validate endpoint. |
 | `gatewayConfig.auth.allowPrivateEndpoint` | bool | `false` | Sets `allow_private_idp`, which is engine-wide: every policy callout in this gateway, not only `validateUrl`, may then reach private, loopback, link-local, and cloud metadata addresses. Turn it on only when every policy in the gateway is yours. |
 | `gatewayConfig.auth.validateCA` | object | empty | CA for the validate call (`configMap` or `secret`, `key`). Set as `SSL_CERT_FILE`, which replaces the platform trust store for the validate call and https backends without a per-backend CA or `upstreamCA`. mutual_tls backends and `upstreamCA` are unaffected. See the recipe below. |
+| `mountReconciliation.enabled` | bool | `false` | Explicitly delegate generated consumer Secret mounts and rollouts to the AGN Operator. Requires `mountReconciliation.network` and `config.existingConfigMap` matching `consumerConfig.configMapName`; supported for the consumer role. |
+| `mountReconciliation.network` | string | `""` | GridNetwork name. Required when delegation is enabled. |
+| `mountReconciliation.gatewayRef` | string | release fullname | `GatewayRef.name` to bind the Deployment opt-in to. |
+| `mountReconciliation.releaseHelmMounts` | bool | `false` | Second handoff phase. After Grid reports `Ready`, set this true to release selected Helm credential mounts and, without Grid serving, the chart TLS mount. |
+| `mountReconciliation.managedCredentialNames` | list | `[]` | Credential Secret names to release from Helm in the second handoff phase. Other entries in `credentials` remain Helm-managed. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
+| `metricsListener.enabled` | bool | `false` | Serve `GET /metrics` over TLS on its own port and ClusterIP Service, for an in-cluster Prometheus. The admin listener refuses a non-loopback Host, so Prometheus cannot scrape it. Needs the grid-gateway image, `existingSecret`, `fromNamespaces`, and `networkPolicy.enabled`. The port answers only `/metrics` but has no authentication, so the NetworkPolicy is its access control, and that holds only where the CNI enforces NetworkPolicy. |
+| `metricsListener.existingSecret` | string | `""` | Secret with `tls.crt` and `tls.key`. On OpenShift, request it with `metricsListener.service.annotations` `service.beta.openshift.io/serving-cert-secret-name`. The listener reloads the cert when the Secret changes. |
+| `metricsListener.fromNamespaces` | list | `[]` | Namespace names allowed to reach the metrics port, for example `openshift-user-workload-monitoring`. |
+| `metricsListener.serviceMonitor.enabled` | bool | `false` | Render a ServiceMonitor that verifies the cert against `caConfigMap` (for example `openshift-service-ca.crt`, key `service-ca.crt`) and renames Praxis's `cluster` label to `backend`, since ACM uses `cluster` for the managed cluster. |
+| `metricsListener.serviceMonitor.scrapeTimeout` | string | `""` | Scrape timeout. Unset leaves Prometheus's default of 10s, which Prometheus refuses when it exceeds the interval, so an interval under 10s needs this set to at most the interval. |
 | `gatewayConfig.upstreamCA.secretName` | string | `""` | CA bundle for backend TLS without a per-cluster CA (`upstream_ca_file`). |
 | `gatewayConfig.listenerTls.enabled` | bool | `false` | Terminate TLS at the listener from `existingSecret`, in render consumer or BYO mode. Render providers reject this setting and use `tls.existingSecret` for listener TLS. Names the port `https`. The cert mounts at `listenerTls.mountPath` (`/etc/praxis/listener-tls`), so a BYO config moving off `tls.enabled` must point its listener `cert_path`/`key_path` there. On OpenShift, annotate the Service with `service.beta.openshift.io/serving-cert-secret-name`. |
 | `port.containerPort` | int | `8080` | Container port. |
@@ -265,7 +275,7 @@ Praxis AI image; these values may advance independently.
 | `overlay.items` | list | routing-config.json, routing-overlay.json | Items to project. |
 | `overlay.sidecar.enabled` | bool | `false` | Deliver validated overlays through an API-watch sidecar instead of kubelet ConfigMap projection. |
 | `overlay.sidecar.image.repository` | string | `grid-overlay-sync` | Overlay-sync image repository. Use a published or locally built image appropriate to the deployment. |
-| `overlay.sidecar.image.tag` | string | `v0.1.4` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
+| `overlay.sidecar.image.tag` | string | `v0.2.0` | Overlay-sync image tag. Use an immutable published tag for reproducible deployments. |
 | `overlay.sidecar.image.pullPolicy` | string | `IfNotPresent` | Overlay-sync image pull policy. |
 | `overlay.sidecar.dataKey` | string | `routing-overlay.json` | Content-addressed envelope key in the overlay ConfigMap. |
 | `overlay.sidecar.expectedNetwork` | string | `""` | Required GridNetwork scope when the sidecar is enabled. |
@@ -276,6 +286,8 @@ Praxis AI image; these values may advance independently.
 | `gridServing.gatewayRef` | string | release fullname | This gateway's gatewayRef name in the GridNetwork. |
 | `gridServing.configMap` | string | `""` | Overrides the derived `grid-serving-<network>-<gatewayRef>`. Needed when that name passes 63 characters. |
 | `gridServing.mountPath` | string | `/etc/praxis/grid-serving` | Mount directory for the ConfigMap. |
+| `gridServing.siteRoute.availability` | object | `{}` | Site availability, rendered into the `grid_site_route` filter block with keys snake_case as the filter reads them (`shedding`, `smoothing`, `ceiling_half_life_ms`, `ceiling_floor`, `explore_floor`, `full_after_ms`, `room_after_ms`, `queue_full`). Every field defaults and `shedding` is the one switch. See `examples/gateway/grid-site-route.yaml`. |
+| `gridServing.siteRoute.prefixAffinity` | object | `{}` | Prefix affinity tuning rendered as the filter's `prefix_affinity` (`enabled`, `threshold`, `exploration`, `prefill_tokens_per_second`, `queued_request_seconds`, `tag_key_path`). |
 | `tls.enabled` | bool | `false` | Mount a TLS Secret. |
 | `tls.existingSecret` | string | `grid-site-identity` | Name of the TLS Secret, the site identity the grid operator writes. |
 | `tls.caSecret` | string | `""` | Secret holding the Grid CA (`ca.crt`), projected beside `existingSecret`. A provider defaults to `grid-ca`. |
@@ -292,6 +304,25 @@ Praxis AI image; these values may advance independently.
 | `tolerations` | list | `[]` | Pod tolerations. |
 | `topologySpreadConstraints` | list | `[]` | Topology spread constraints. |
 | `priorityClassName` | string | `""` | Pod priority class. |
+
+## Metrics
+
+The metrics listener serves the Praxis registry, including the grid gateway's own series. With the ServiceMonitor, Praxis's `cluster` label arrives as `backend`.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `grid_route_decisions_total` | `site`, `reason` | Requests `grid_site_route` decided. `site` is a site name from the serving config, or empty for a refusal. No label comes from the request. |
+| `grid_route_site_score` | `site`, `cluster` | The queue depth the last route order used for each candidate, lower first. `inf` when unmeasured, `NaN` when excluded or demoted, or when the pair left the topology. |
+
+`reason` is one of five values, and adding one is a deliberate change:
+
+| `reason` | `site` | Response |
+|----------|--------|----------|
+| `routed` | chosen site | Sent to a healthy site. How it ranked is in `grid_route_site_score`. |
+| `fallback` | chosen site | Sent to a demoted site because no healthy one was left. |
+| `not_ready` | empty | 503: every candidate was excluded. |
+| `no_route` | empty | 503: an admitted candidate had no route from this gateway. |
+| `bad_request` | empty | 400 or 404: no model, or a model no candidate serves. |
 
 ## Security
 
@@ -366,6 +397,22 @@ balancing and includes Basic Auth. It does not include the optional
 qualification. That qualification is not supported by this default image; AGN
 does not publish a replacement AI rollup.
 
+The default image predates empty versioned routing snapshots and is not
+compatible with Grid's authoritative no-route publication. The paired Praxis AI
+change must be released, and this chart's default image must be updated to that
+compatible release, before the next Grid release. Upgrade and roll every
+consumer of a Grid-managed overlay before deploying that Grid version.
+
+Generated consumer credentials use a separate two-step opt-in: set
+`consumerConfig.enableProjectedCredentials: true`, let Grid render the filter,
+and roll out the consumer with the read-only Secret mounts. In this mode, mount
+each Secret at `{credentialMountBase}/{secret-namespace}/{secret-name}`, with
+its data keys as files (for example,
+`/run/secrets/grid-credentials/grid-system/provider-key/token`). Static `file:`
+entries continue to use their explicitly configured paths. Only then set
+`consumerConfig.supportsProjectedCredentials: true`; Grid retains credential-
+bearing overlays until that readiness attestation is present.
+
 ### Edge and provider gateways in AGN
 
 AGN runs this chart in two roles with different values:
@@ -401,6 +448,84 @@ The AGN Operator's `gateway.serviceName` must match the provider
 gateway's Service name. When using `fullnameOverride`, set
 `gateway.serviceName` to the same value in the operator Helm values.
 
+### Delegated consumer Secret mounts
+
+Consumer config and Secret mount reconciliation is opt-in on both the
+`GridNetwork` and this chart. The `GatewayRef.name`, chart
+`mountReconciliation.gatewayRef`, chart Deployment name, and
+`consumerConfig.mountReconciliation.deploymentName` must agree. The operator
+patches its reserved volumes, the delegated Praxis config volume source, the
+named container's mounts, and rollout annotations. It preserves other
+Deployment fields and Helm resources.
+
+Configure the gateway chart to mount the operator-generated Praxis config.
+Keep the old Helm mounts during the first phase, then release them only after
+Grid reports `mountReconciliationStatus: Ready`:
+
+```yaml
+config:
+  existingConfigMap: praxis-consumer-config
+  key: praxis.yaml
+gatewayConfig:
+  render: false
+mountReconciliation:
+  enabled: true
+  network: production
+  gatewayRef: consumer-gateway
+  managedCredentialNames: [backend-api-token]
+  releaseHelmMounts: false
+credentials:
+  - name: backend-api-token
+    mountPath: /run/secrets/backend-api-token # retained during preparation
+  - name: monitoring-token
+    mountPath: /run/secrets/monitoring-token # stays Helm-managed
+```
+
+Before enabling delegation on an existing release, set
+`consumerConfig.credentialMountBase` and (when consumer mTLS is used without
+Grid serving) `consumerConfig.tlsCertMountPath` to paths that do not overlap
+the current chart mounts. The operator stages its new mounts at those paths,
+switches to a matching generated config in the same Pod-template update, and
+leaves the old Helm mounts in place. Older generated configs embedded
+`admission_state` and `selection_group` in inline candidates, which the
+previously supported Praxis AI image rejected. Populated routes require a
+Praxis AI image that accepts Grid's versioned-overlay config. Wait for [Grid #270](https://github.com/praxis-proxy/grid/pull/270),
+a compatible image containing [Praxis AI #1539](https://github.com/praxis-proxy/ai/pull/1539),
+and qualification of the unmodified generated config before enabling this
+handoff for populated routes. A `Ready` mount status alone does not prove that
+Praxis is serving the generated route.
+
+After those prerequisites are met and the status is `Ready`, set
+`mountReconciliation.releaseHelmMounts: true` and run
+the Helm upgrade. Helm then removes only the selected old mounts; other
+credential mounts remain Helm-managed. Keep this value false until the Ready
+status and a Praxis request confirm that the generated config is active.
+
+For a new install, create `praxis-consumer-config` with a valid bootstrap
+`praxis.yaml` before installing the gateway. After the bootstrap Deployment is
+ready, Grid stages a generated config in an inactive ConfigMap slot and rolls
+it out with the required Secret mounts. Old pods keep their bootstrap config
+and mounts until the new rollout completes.
+
+Set `consumerConfig.mountReconciliation.enabled`, `deploymentName`, and
+`containerName` on the matching `GridNetwork.spec.gatewayRefs[]` entry. Keep
+all referenced credential, Grid CA, site identity, and backend CA Secrets in
+the gateway namespace. Grid checks required Secret keys without copying their
+contents into config, status, or logs. It publishes reference-only mount
+requirements, applies the matching config and mounts in one Pod revision,
+waits for the old replicas to leave, and then removes obsolete Grid-owned
+mounts. Secret rotation triggers a rollout based on resource versions.
+`consumerConfigStatus: Rendered` means the config map was
+applied; check `mountReconciliationStatus: Ready` before treating the gateway
+as ready.
+
+When `gridServing.enabled` is set, Helm keeps its read-only TLS projection at
+`/etc/praxis/tls` through both handoff phases because the peer pollers read
+those files. The GridNetwork's `tls.caSecretRef` and `tls.siteSecretRef` must
+match the chart's `tls.caSecret` and `tls.existingSecret`; Grid validates the
+mounted Secret keys and rolls the gateway when their resource versions change.
+The chart rejects a different `tls.mountPath` for Grid serving.
+
 ### Cross-site routing in AGN
 
 With `gridServing.enabled`, the consumer gateway reads the serving config the
@@ -429,8 +554,11 @@ Known limits:
 
 - `grid_site_route` does not check provider health, so it can pick a site whose
   provider gateway is down. That request fails rather than failing over.
-- The gateway matches a candidate's cluster to `gatewayConfig.backends` by name only.
-  Nothing checks that the backend serves the candidate's site.
+- Ordinary routing matches a candidate's cluster to `gatewayConfig.backends` by
+  name; it does not attest which models that backend serves. Provider-hop
+  headers are allowed only when the declared cluster has a unique verified
+  mutual-TLS backend with the matching SNI. Same-named plaintext or mismatched
+  backends fail startup.
 - The serving watcher does not add load-balancer clusters to `praxis.yaml`.
   Add each new candidate's backend there too. Listener changes and serving
   `window_secs` changes require a restart.

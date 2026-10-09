@@ -5,8 +5,12 @@
 //! Data model only. Selection and ordering live in the `route` and `snapshot`
 //! siblings.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
+use praxis_core::connectivity::Upstream;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -50,7 +54,8 @@ impl CapabilityKind {
 ///
 /// Controls whether a candidate accepts new sessions, existing sessions only,
 /// or is excluded from routing entirely.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum AdmissionState {
     /// Accepts both new and existing sessions.
     #[default]
@@ -59,7 +64,8 @@ pub enum AdmissionState {
     /// Accepts only existing sessions (bound via session affinity).
     ExistingOnly,
 
-    /// Excluded from routing entirely.
+    /// Excluded from routing entirely. `none` on the wire, as the operator writes it.
+    #[serde(rename = "none")]
     Excluded,
 }
 
@@ -86,6 +92,10 @@ impl AdmissionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfig {
+    /// Whether it takes new requests, as the operator resolved it. Absent means it does.
+    #[serde(default)]
+    pub admission: AdmissionState,
+
     /// Cluster name to select when this candidate is chosen.
     pub cluster: String,
 
@@ -105,6 +115,11 @@ pub struct CandidateConfig {
 
     /// Site that owns this capability.
     pub site: String,
+
+    /// Stable Grid overlay identity, used by authenticated provider-hop
+    /// gateways. Older/static configs may omit it and retain the derived ID.
+    #[serde(default)]
+    pub stable_id: Option<String>,
 }
 
 /// Default freshness state for candidates.
@@ -118,12 +133,33 @@ fn default_fresh() -> bool {
 /// fields are bounded and non-blank. The Grid-owned fields (`admission_state`,
 /// `rank`, `selection_tier`) are populated after validation from live signals.
 ///
-/// `Clone` is cheap: every owned field is an `Arc<str>`. The refresh step clones
+/// `Clone` is cheap: every owned field is reference counted. The refresh step clones
 /// the base set each poll cycle to re-order it by live load.
 #[derive(Clone, Debug)]
 pub struct RouteCandidate {
     /// Grid-operator admission state.
     pub admission_state: AdmissionState,
+
+    /// Requests this candidate runs at once without engine queueing, as its operator publishes
+    /// it; `None` when unpublished, which leaves its load unknown.
+    pub capacity: Option<f64>,
+
+    /// Requests held over capacity, as its operator publishes it; `None` when unpublished or
+    /// stale. Resolved when the snapshot is built, never per request.
+    pub rho: Option<f64>,
+
+    /// Whether the site as a whole has work waiting: its average queue at `availability.queue_full`
+    /// or any work held before scheduling. `None` when it publishes no queue, and such a
+    /// site never counts as full.
+    pub backlog: Option<bool>,
+
+    /// Whether the site has been at its ceiling with work waiting for `full_after_ms`.
+    /// `None` when unmeasured. Resolved with `rho`.
+    pub full: Option<bool>,
+
+    /// Whether the site has room again: its queue emptied, or it has been below its ceiling
+    /// for `room_after_ms`. `None` when unmeasured. Resolved with `rho`.
+    pub relieved: Option<bool>,
 
     /// Cluster name to select.
     pub cluster: Arc<str>,
@@ -152,6 +188,9 @@ pub struct RouteCandidate {
 
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
+
+    /// Remote site's gateway, dialed directly instead of a `load_balancer` cluster.
+    pub upstream: Option<Upstream>,
 }
 
 /// Build a deterministic stable ID from candidate identity fields.
@@ -167,11 +206,30 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 /// [`FilterError`] if the list exceeds [`MAX_CANDIDATES`], any
 /// name/site/cluster field is blank or oversized, or a duplicate
 /// (kind, name, site, cluster) tuple exists.
+#[cfg(test)]
+pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+    validate_candidates_with_empty(raw, false)
+}
+
+/// Validate candidates rendered from the operator's versioned serving
+/// snapshot, where an empty list is an authoritative no-route revision.
+pub(crate) fn validate_serving_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+    validate_candidates_with_empty(raw, true)
+}
+
+/// Validate candidate fields while allowing emptiness only for versioned
+/// serving snapshots.
 #[expect(
     clippy::too_many_lines,
-    reason = "single validation loop, splitting hurts readability"
+    reason = "one validation pass keeps all candidate invariants adjacent"
 )]
-pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<RouteCandidate>, FilterError> {
+fn validate_candidates_with_empty(
+    raw: Vec<CandidateConfig>,
+    allow_empty: bool,
+) -> Result<Vec<RouteCandidate>, FilterError> {
+    if raw.is_empty() && !allow_empty {
+        return Err("grid: candidates must not be empty outside a versioned serving config".into());
+    }
     if raw.len() > MAX_CANDIDATES {
         return Err(format!("grid: candidates exceeds maximum of {MAX_CANDIDATES}").into());
     }
@@ -196,9 +254,20 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             .into());
         }
 
-        let stable_id = default_stable_id(cand.kind, &cand.name, &cand.site, &cand.cluster);
+        if let Some(stable_id) = cand.stable_id.as_deref() {
+            validate_stable_id(index, stable_id)?;
+        }
+        let stable_id = cand.stable_id.as_deref().map_or_else(
+            || default_stable_id(cand.kind, &cand.name, &cand.site, &cand.cluster),
+            Arc::from,
+        );
         candidates.push(RouteCandidate {
-            admission_state: AdmissionState::default(),
+            admission_state: cand.admission,
+            capacity: None,
+            rho: None,
+            backlog: None,
+            full: None,
+            relieved: None,
             cluster: Arc::from(cand.cluster.as_str()),
             credential: cand.credential,
             fresh: cand.fresh,
@@ -208,10 +277,33 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             selection_tier: None,
             site: Arc::from(cand.site.as_str()),
             stable_id,
+            upstream: None,
         });
     }
 
     Ok(candidates)
+}
+
+/// Validate the explicit provider-gateway hop allowlist in a serving snapshot.
+pub(crate) fn validate_provider_hop_clusters(raw: Vec<String>) -> Result<BTreeSet<String>, FilterError> {
+    let mut clusters = BTreeSet::new();
+    for (index, cluster) in raw.into_iter().enumerate() {
+        validate_name(&format!("provider_hop_clusters[{index}]"), &cluster)?;
+        if !clusters.insert(cluster) {
+            return Err("grid: duplicate provider_hop_clusters entry".into());
+        }
+    }
+    Ok(clusters)
+}
+
+/// Validate an overlay identity before it can be sent as an internal header.
+fn validate_stable_id(index: usize, stable_id: &str) -> Result<(), FilterError> {
+    if stable_id.trim().is_empty() || stable_id.len() > MAX_NAME_LEN {
+        return Err(format!("grid: candidates[{index}].stable_id must be 1-{MAX_NAME_LEN} non-blank bytes").into());
+    }
+    http::header::HeaderValue::from_str(stable_id)
+        .map(|_| ())
+        .map_err(|error| format!("grid: candidates[{index}].stable_id is not a valid header value: {error}").into())
 }
 
 /// Validate credential reference fields on a candidate entry.
@@ -314,12 +406,14 @@ mod tests {
     fn candidate(kind_str: &str, name: &str, site: &str, cluster: &str) -> CandidateConfig {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();
         CandidateConfig {
+            admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
             fresh: true,
             kind,
             name: name.to_owned(),
             site: site.to_owned(),
+            stable_id: None,
         }
     }
 
@@ -345,8 +439,8 @@ mod tests {
 
     #[test]
     fn empty_candidates_are_an_authoritative_no_route_snapshot() {
-        let candidates = validate_candidates(vec![]).unwrap_or_else(|_| std::process::abort());
-        assert!(candidates.is_empty());
+        let candidates = validate_serving_candidates(vec![]).expect("versioned serving can withdraw every candidate");
+        assert!(candidates.is_empty(), "the empty serving revision is authoritative");
     }
 
     #[test]
@@ -370,6 +464,19 @@ mod tests {
         ])
         .expect_err("should fail");
         assert!(err.to_string().contains("duplicate candidate"), "{err}");
+    }
+
+    #[test]
+    fn explicit_stable_id_is_preserved_and_header_safe() {
+        let mut candidate = candidate("inference_model", "llama", "site-a", "gateway-a");
+        candidate.stable_id = Some("257a9450".to_owned());
+        let validated = validate_candidates(vec![candidate.clone()]).expect("valid stable ID");
+        assert_eq!(&*validated[0].stable_id, "257a9450");
+
+        candidate.stable_id = Some("\nspoof".to_owned());
+        validate_candidates(vec![candidate.clone()]).expect_err("newline stable ID is rejected");
+        candidate.stable_id = Some(" ".to_owned());
+        validate_candidates(vec![candidate]).expect_err("blank stable ID is rejected");
     }
 
     #[test]
@@ -423,5 +530,21 @@ mod tests {
     fn blank_local_site_rejected() {
         let err = validate_local_site("").expect_err("should fail");
         assert!(err.to_string().contains("local_site must be"), "{err}");
+    }
+
+    #[test]
+    fn admission_parses_as_the_operator_writes_it_and_defaults_to_admitted() {
+        let parse = |json: &str| serde_yaml::from_str::<CandidateConfig>(json).map(|c| c.admission);
+        let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
+        assert_eq!(parse(&format!("{{{base}}}")).unwrap(), AdmissionState::NewAndExisting);
+        assert_eq!(
+            parse(&format!(r#"{{{base},"admission":"none"}}"#)).unwrap(),
+            AdmissionState::Excluded
+        );
+        assert_eq!(
+            parse(&format!(r#"{{{base},"admission":"existing_only"}}"#)).unwrap(),
+            AdmissionState::ExistingOnly
+        );
+        parse(&format!(r#"{{{base},"admission":"maybe"}}"#)).expect_err("an unknown admission is refused");
     }
 }
