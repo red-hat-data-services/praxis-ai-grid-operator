@@ -3,16 +3,27 @@
 {{- include "praxis-gateway.validateConfig" . }}
 {{- include "praxis-gateway.validateMounts" . }}
 {{- include "praxis-gateway.validateProbes" . }}
+{{- include "praxis-gateway.validateMetricsListener" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "praxis-gateway.fullname" . }}
   labels:
     {{- include "praxis-gateway.labels" . | nindent 4 }}
-  {{- if (.Values.gridServing).enabled }}
+  {{- if or (.Values.gridServing).enabled .Values.mountReconciliation.enabled }}
   annotations:
+    {{- if (.Values.gridServing).enabled }}
     {{- /* The operator writes the serving ConfigMap only after the grid CRs (wave 1) exist. */}}
     argocd.argoproj.io/sync-wave: "2"
+    {{- end }}
+    {{- if .Values.mountReconciliation.enabled }}
+    grid.praxis-proxy.io/mount-reconciliation: "enabled"
+    grid.praxis-proxy.io/network: {{ .Values.mountReconciliation.network | quote }}
+    grid.praxis-proxy.io/gateway: {{ (.Values.mountReconciliation.gatewayRef | default (include "praxis-gateway.fullname" .)) | quote }}
+    {{- if .Values.gridServing.enabled }}
+    grid.praxis-proxy.io/grid-serving-tls: "chart-managed"
+    {{- end }}
+    {{- end }}
   {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
@@ -196,7 +207,7 @@ spec:
           {{- $userLog := false }}
           {{- range .Values.env }}{{- if eq .name "RUST_LOG" }}{{- $userLog = true }}{{- end }}{{- end }}
           {{- $rustLog := and (not $userLog) (include "praxis-gateway.rustLog" .) }}
-          {{- if or $rustLog .Values.env (.Values.gridServing).enabled $withCA }}
+          {{- if or $rustLog .Values.env (.Values.gridServing).enabled $withCA (.Values.metricsListener).enabled }}
           env:
             {{- if $rustLog }}
             - name: RUST_LOG
@@ -212,6 +223,16 @@ spec:
             {{- if $withCA }}
             - name: SSL_CERT_FILE
               value: {{ printf "%s/%s" $validateCA.mountPath $validateCA.key | quote }}
+            {{- end }}
+            {{- with .Values.metricsListener }}
+            {{- if .enabled }}
+            - name: GRID_METRICS_ADDR
+              value: {{ printf "0.0.0.0:%d" (int .port) | quote }}
+            - name: GRID_METRICS_TLS_CERT
+              value: {{ printf "%s/tls.crt" .mountPath | quote }}
+            - name: GRID_METRICS_TLS_KEY
+              value: {{ printf "%s/tls.key" .mountPath | quote }}
+            {{- end }}
             {{- end }}
           {{- end }}
           securityContext:
@@ -231,6 +252,11 @@ spec:
             - name: {{ include "praxis-gateway.portName" . }}
               containerPort: {{ .Values.port.containerPort }}
               protocol: {{ .Values.port.protocol | quote }}
+            {{- if .Values.metricsListener.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metricsListener.port }}
+              protocol: TCP
+            {{- end }}
           {{- with .Values.health.readiness }}
           readinessProbe:
             {{- /* /ready fails while any backend cluster is down. */}}
@@ -261,7 +287,7 @@ spec:
               mountPath: {{ .Values.overlay.mountPath | quote }}
               readOnly: true
             {{- end }}
-            {{- if .Values.tls.enabled }}
+            {{- if and .Values.tls.enabled (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.gridServing.enabled) }}
             - name: tls
               mountPath: {{ .Values.tls.mountPath | quote }}
               readOnly: true
@@ -290,15 +316,22 @@ spec:
               mountPath: {{ .Values.gatewayConfig.listenerTls.mountPath | quote }}
               readOnly: true
             {{- end }}
+            {{- if .Values.metricsListener.enabled }}
+            - name: metrics-tls
+              mountPath: {{ .Values.metricsListener.mountPath | quote }}
+              readOnly: true
+            {{- end }}
             {{- if $withCA }}
             - name: validate-ca
               mountPath: {{ $validateCA.mountPath | quote }}
               readOnly: true
             {{- end }}
             {{- range .Values.credentials }}
+            {{- if or (not $.Values.mountReconciliation.enabled) (not $.Values.mountReconciliation.releaseHelmMounts) (not (has .name $.Values.mountReconciliation.managedCredentialNames)) }}
             - name: credential-{{ .name }}
               mountPath: {{ .mountPath | quote }}
               readOnly: true
+            {{- end }}
             {{- end }}
       volumes:
         - name: config
@@ -354,7 +387,7 @@ spec:
             {{- end }}
         {{- end }}
         {{- end }}
-        {{- if .Values.tls.enabled }}
+        {{- if and .Values.tls.enabled (or (not .Values.mountReconciliation.enabled) (not .Values.mountReconciliation.releaseHelmMounts) .Values.gridServing.enabled) }}
         - name: tls
           {{- if include "praxis-gateway.caSecret" . }}
           projected:
@@ -411,11 +444,18 @@ spec:
           secret:
             secretName: {{ .Values.gatewayConfig.listenerTls.existingSecret | quote }}
         {{- end }}
+        {{- if .Values.metricsListener.enabled }}
+        - name: metrics-tls
+          secret:
+            secretName: {{ .Values.metricsListener.existingSecret | quote }}
+        {{- end }}
         {{- range .Values.credentials }}
+        {{- if or (not $.Values.mountReconciliation.enabled) (not $.Values.mountReconciliation.releaseHelmMounts) (not (has .name $.Values.mountReconciliation.managedCredentialNames)) }}
         - name: credential-{{ .name }}
           secret:
             secretName: {{ .name | quote }}
             optional: {{ .optional | default false }}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

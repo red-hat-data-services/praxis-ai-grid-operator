@@ -25,11 +25,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::api::core::v1::ConfigMap;
+use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use crate::crd::grid_network::SelectionMode;
 use crate::{
-    crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, SelectionMode, TransportMode},
+    crd::grid_network::{ClusterEndpointConfig, GatewayTelemetryConfig, TlsConfig, TransportMode},
     resources::routing_overlay::{RoutingCandidate, RoutingOverlay},
 };
+
+/// Path at which a consumer gateway must mount the operator-published overlay.
+pub(crate) const CONSUMER_OVERLAY_FILE: &str = "/etc/praxis/routing/routing-overlay.json";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -54,6 +60,35 @@ pub enum ConsumerConfigError {
     #[error("credential_mount_base must not be blank")]
     BlankMountBase,
 
+    /// A required Grid CA Secret reference was not configured.
+    #[error("mutual TLS requires tls.caSecretRef")]
+    MissingGridCaSecretRef,
+
+    /// A required site identity Secret reference was not configured.
+    #[error("mutual TLS requires tls.siteSecretRef")]
+    MissingSiteSecretRef,
+
+    /// A generated file path is not absolute and normalized.
+    #[error("mount path is not an absolute normalized path: {path:?}")]
+    InvalidMountPath {
+        /// Invalid absolute file path.
+        path: String,
+    },
+
+    /// A Secret reference required by a generated CA mount is incomplete.
+    #[error("incomplete Secret reference for generated file path {path:?}")]
+    InvalidSecretReference {
+        /// File path whose Secret reference was incomplete.
+        path: String,
+    },
+
+    /// Two different Secret keys would be projected to one file path.
+    #[error("mount path {path:?} is required by multiple Secret keys")]
+    MountPathConflict {
+        /// File path requested by different Secret keys.
+        path: String,
+    },
+
     /// A candidate has a blank cluster name.
     #[error("candidate {kind:?}/{name:?} has a blank cluster")]
     BlankCluster {
@@ -77,12 +112,27 @@ pub enum ConsumerConfigError {
         cluster: String,
     },
 
+    /// Multiple entries use the same backend cluster name.
+    #[error("duplicate cluster endpoint for {cluster:?}")]
+    DuplicateClusterEndpoint {
+        /// Duplicated cluster name.
+        cluster: String,
+    },
+
+    /// A reloadable gateway needs an endpoint inventory for later restoration.
+    #[error("gateway has no cluster endpoints")]
+    NoClusterEndpoints,
+
+    /// The selected Praxis image does not support projected credentials.
+    #[error("projected credentials require supportsProjectedCredentials=true on a compatible Praxis AI image")]
+    ProjectedCredentialsUnsupported,
+
     /// The overlay contains no inference candidates for this pipeline.
     #[error("overlay has no inference_model candidates for the consumer pipeline")]
     NoInferenceCandidates,
 
-    /// A `mutual_tls` cluster endpoint has no SNI (or blank SNI).
-    #[error("mutual_tls transport for cluster {cluster:?} requires a non-blank sni")]
+    /// A TLS cluster endpoint has no SNI (or blank SNI).
+    #[error("TLS transport for cluster {cluster:?} requires a non-blank sni")]
     MissingSni {
         /// Cluster name with missing SNI.
         cluster: String,
@@ -105,10 +155,107 @@ pub enum ConsumerConfigError {
     #[error("invalid telemetry configuration: {0}")]
     InvalidTelemetry(String),
 
+    /// A plaintext endpoint declares a custom CA Secret.
+    #[error("plaintext transport for cluster {cluster:?} must not set caSecretRef")]
+    PlaintextWithCa {
+        /// Cluster name with the conflicting CA reference.
+        cluster: String,
+    },
+
+    /// Mutual TLS uses the Grid CA and cannot override it per cluster.
+    #[error("mutual_tls transport for cluster {cluster:?} must use the Grid CA")]
+    MutualTlsCustomCa {
+        /// Cluster name with the conflicting CA reference.
+        cluster: String,
+    },
+
     /// JSON serialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
+
+/// Purpose of one Secret projection required by a generated gateway config.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum MountPurpose {
+    /// Backend authentication credential used at the final provider hop.
+    BackendCredential,
+    /// Custom CA bundle for a server-authenticated backend TLS connection.
+    BackendCa,
+    /// Public Grid CA file used to verify a peer gateway.
+    GridPeerCa,
+    /// Site certificate and private key presented to a peer gateway.
+    GridSiteIdentity,
+    /// Grid-serving TLS files projected by the gateway chart.
+    GridServingTls,
+}
+
+/// Secret identifier included in a reference-only requirements document.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub(crate) struct RequirementSecret {
+    /// Kubernetes namespace.
+    pub namespace: String,
+    /// Kubernetes Secret name.
+    pub name: String,
+}
+
+/// One Secret key and its absolute in-container path.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub(crate) struct RequirementItem {
+    /// Secret data key.
+    pub key: String,
+    /// Absolute, normalized file path used by Praxis.
+    pub path: String,
+}
+
+/// One Secret and the paths at which its required keys are projected.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MountRequirement {
+    /// Why this Secret is needed.
+    pub purpose: MountPurpose,
+    /// Gateway that performs the final backend call or peer connection.
+    pub final_hop: String,
+    /// Secret reference; no Secret bytes are included.
+    pub secret: RequirementSecret,
+    /// Required key-to-path mappings.
+    pub items: Vec<RequirementItem>,
+}
+
+/// Stable, versioned requirements output for one generated gateway config.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MountRequirementsDocument {
+    /// Requirements schema version.
+    pub schema_version: String,
+    /// `GridNetwork` name.
+    pub network: String,
+    /// Final-hop gateway identity.
+    pub gateway: RequirementGateway,
+    /// Sorted and deduplicated Secret file requirements.
+    pub requirements: Vec<MountRequirement>,
+}
+
+/// Name and namespace of the gateway owning the requirements.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct RequirementGateway {
+    /// Gateway reference name.
+    pub name: String,
+    /// Gateway namespace.
+    pub namespace: String,
+}
+
+/// The YAML and file requirements derived from one immutable overlay input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConsumerRenderResult {
+    /// Generated Praxis configuration.
+    pub config_yaml: String,
+    /// Secret references needed by that exact configuration.
+    pub requirements: Vec<MountRequirement>,
+}
+
+/// Default base directory for custom backend CA Secret files.
+pub(crate) const BACKEND_CA_MOUNT_BASE: &str = "/run/secrets/grid-backend-ca";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -178,6 +325,7 @@ pub(crate) fn generate_consumer_praxis_config(
     clippy::too_many_arguments,
     reason = "preserves the renderer's established inputs and adds optional telemetry"
 )]
+#[cfg(test)]
 pub(crate) fn generate_consumer_praxis_config_with_telemetry(
     overlay: &RoutingOverlay,
     credential_mount_base: &str,
@@ -213,8 +361,9 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         telemetry.validate().map_err(ConsumerConfigError::InvalidTelemetry)?;
     }
 
-    let candidates_yaml = render_candidates(&inference_candidates);
+    let candidates_yaml = render_candidates(&inference_candidates, &overlay.local_site);
     let selection_policy_yaml = render_selection_policy(overlay.selection_policy.as_ref());
+    let provider_hop_clusters_yaml = render_provider_hop_clusters(cluster_endpoints)?;
     let local_site = yaml_scalar(&overlay.local_site)?;
     let trace_context_filter = if telemetry.is_some() {
         "     - filter: trace_context\n"
@@ -222,7 +371,8 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
         ""
     };
 
-    let credential_inject_section = render_credential_inject(&inference_candidates, credential_mount_base);
+    let credential_inject_section =
+        render_credential_inject(&inference_candidates, credential_mount_base, &overlay.local_site, false);
     let load_balancer_section = render_load_balancer(&inference_candidates, cluster_endpoints, tls_cert_mount_path)?;
 
     // Listeners section: one public listener referencing the consumer filter chain.
@@ -242,14 +392,13 @@ pub(crate) fn generate_consumer_praxis_config_with_telemetry(
          \x20     - filter: intelligent_route\n\
          \x20       local_site: {local_site}\n\
          \x20       model_header: \"X-Model\"\n\
+         {provider_hop_clusters_yaml}\
          {selection_policy_yaml}\
          \x20       candidates:\n\
          {candidates_yaml}"
     );
 
-    if let Some(inject) = credential_inject_section {
-        config.push_str(&inject);
-    }
+    config.push_str(&credential_inject_section);
 
     config.push_str(&load_balancer_section);
 
@@ -320,6 +469,440 @@ fn render_telemetry(telemetry: &GatewayTelemetryConfig) -> Result<String, Consum
     Ok(output)
 }
 
+/// Render a valid startup configuration while no inference route is eligible.
+/// Render a reloadable consumer pipeline with the full endpoint inventory.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "gateway scope and transport inputs are independent"
+)]
+fn generate_consumer_praxis_config_for_gateway_with_telemetry(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
+    listener_port: u16,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    projected_credentials: bool,
+    telemetry: Option<&GatewayTelemetryConfig>,
+) -> Result<String, ConsumerConfigError> {
+    if overlay.local_site.trim().is_empty() {
+        return Err(ConsumerConfigError::BlankLocalSite);
+    }
+    if cluster_endpoints.is_empty() {
+        return Err(ConsumerConfigError::NoClusterEndpoints);
+    }
+    let hop_clusters = render_provider_hop_clusters(cluster_endpoints)?;
+    let endpoint_map: BTreeMap<&str, &ClusterEndpointConfig> =
+        cluster_endpoints.iter().map(|ep| (ep.cluster.as_str(), ep)).collect();
+    for candidate in overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == INFERENCE_MODEL)
+    {
+        if !endpoint_map.contains_key(candidate.cluster.as_str()) {
+            return Err(ConsumerConfigError::MissingClusterEndpoint {
+                cluster: candidate.cluster.clone(),
+            });
+        }
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.validate().map_err(ConsumerConfigError::InvalidTelemetry)?;
+    }
+    let mut endpoints = cluster_endpoints.iter().collect::<Vec<_>>();
+    endpoints.sort_by(|left, right| left.cluster.cmp(&right.cluster));
+    let clusters = endpoints
+        .into_iter()
+        .map(|endpoint| {
+            let quoted = yaml_scalar(&endpoint.cluster)?;
+            render_cluster_entry(&quoted, endpoint, tls_cert_mount_path)
+        })
+        .collect::<Result<Vec<_>, ConsumerConfigError>>()?
+        .join("\n");
+    let network = yaml_scalar(&overlay.network)?;
+    let gateway = yaml_scalar(gateway_name)?;
+    let namespace = yaml_scalar(gateway_namespace)?;
+    let local_site = yaml_scalar(&overlay.local_site)?;
+    let trace_context_filter = if telemetry.is_some() {
+        "      - filter: trace_context\n"
+    } else {
+        ""
+    };
+    let mut config = format!(
+        concat!(
+            "listeners:\n",
+            "  - name: public\n",
+            "    address: \"0.0.0.0:{listener_port}\"\n",
+            "    filter_chains: [consumer-chain]\n",
+            "filter_chains:\n",
+            "  - name: consumer-chain\n",
+            "    filters:\n",
+            "{trace_context_filter}",
+            "      - filter: json_body_field\n",
+            "        field: model\n",
+            "        header: X-Model\n",
+            "      - filter: intelligent_route\n",
+            "        local_site: {local_site}\n",
+            "        model_header: X-Model\n",
+            "        overlay_file: {overlay_file}\n",
+            "        expected_overlay_scope:\n",
+            "          network: {network}\n",
+            "          gateway: {gateway}\n",
+            "          namespace: {namespace}\n",
+            "          local_site: {local_site}\n",
+            "        reload:\n",
+            "          enabled: true\n",
+            "{hop_clusters}",
+        ),
+        listener_port = listener_port,
+        trace_context_filter = trace_context_filter,
+        local_site = local_site,
+        overlay_file = CONSUMER_OVERLAY_FILE,
+        network = network,
+        gateway = gateway,
+        namespace = namespace,
+        hop_clusters = hop_clusters,
+    );
+    let candidates: Vec<_> = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == INFERENCE_MODEL)
+        .collect();
+    let inject = if projected_credentials {
+        render_credential_inject(&[], credential_mount_base, &overlay.local_site, true)
+    } else {
+        render_credential_inject(&candidates, credential_mount_base, &overlay.local_site, false)
+    };
+    config.push_str(&inject);
+    config.push_str("\n      - filter: load_balancer\n        clusters:\n");
+    config.push_str(&clusters);
+    if let Some(telemetry) = telemetry {
+        config.push_str(&render_telemetry(telemetry)?);
+    }
+    config.push_str("\nadmin:\n  address: \"127.0.0.1:9901\"\nshutdown_timeout_secs: 5\n");
+    Ok(config)
+}
+
+/// Test-facing wrapper for the production gateway config renderer.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "matches the gateway renderer inputs")]
+fn generate_consumer_praxis_config_for_gateway(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
+    listener_port: u16,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    projected_credentials: bool,
+) -> Result<String, ConsumerConfigError> {
+    generate_consumer_praxis_config_for_gateway_with_telemetry(
+        overlay,
+        credential_mount_base,
+        cluster_endpoints,
+        tls_cert_mount_path,
+        listener_port,
+        gateway_name,
+        gateway_namespace,
+        projected_credentials,
+        None,
+    )
+}
+
+/// Render Praxis YAML and its Secret-file requirements from the same inputs.
+///
+/// Only credential-bearing candidates whose site is this gateway's local site
+/// produce backend credential requirements. Mutual TLS requirements are added
+/// only for candidate clusters that the generated load balancer actually uses.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "render inputs include the delegated-mount ownership decision"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "configuration and mount requirements are derived from one candidate pass"
+)]
+pub(crate) fn render_consumer_config_with_projected(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
+    listener_port: u16,
+    tls: &TlsConfig,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    telemetry: Option<&GatewayTelemetryConfig>,
+    projected_credentials: bool,
+    delegated_mounts: bool,
+) -> Result<ConsumerRenderResult, ConsumerConfigError> {
+    let inference_candidates: Vec<&RoutingCandidate> = overlay
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == INFERENCE_MODEL)
+        .collect();
+    let config_yaml = generate_consumer_praxis_config_for_gateway_with_telemetry(
+        overlay,
+        credential_mount_base,
+        cluster_endpoints,
+        tls_cert_mount_path,
+        listener_port,
+        gateway_name,
+        gateway_namespace,
+        projected_credentials,
+        telemetry,
+    )?;
+    let mut requirements = BTreeMap::<(MountPurpose, String, String, String), BTreeSet<RequirementItem>>::new();
+
+    for candidate in &inference_candidates {
+        if candidate.site != overlay.local_site {
+            continue;
+        }
+        let Some(credential) = candidate.credential.as_ref() else {
+            continue;
+        };
+        let path = if projected_credentials {
+            format!(
+                "{credential_mount_base}/{}/{}/{}",
+                credential.secret_ref.namespace, credential.secret_ref.name, credential.secret_ref.key
+            )
+        } else {
+            credential_file_path(
+                credential_mount_base,
+                &credential.secret_ref.name,
+                &credential.secret_ref.key,
+            )
+        };
+        add_requirement(
+            &mut requirements,
+            MountPurpose::BackendCredential,
+            gateway_name,
+            &credential.secret_ref.namespace,
+            &credential.secret_ref.name,
+            &credential.secret_ref.key,
+            &path,
+        )?;
+    }
+
+    let used_clusters: BTreeSet<&str> = cluster_endpoints
+        .iter()
+        .map(|endpoint| endpoint.cluster.as_str())
+        .collect();
+    let needs_mutual_tls = cluster_endpoints.iter().any(|endpoint| {
+        used_clusters.contains(endpoint.cluster.as_str())
+            && endpoint
+                .transport
+                .as_ref()
+                .is_some_and(|transport| transport.mode == TransportMode::MutualTls)
+    });
+    if needs_mutual_tls {
+        validate_absolute_normalized_path(&tls_file_path(tls_cert_mount_path, "ca.crt"))?;
+    }
+    if needs_mutual_tls && delegated_mounts {
+        let ca_ref = tls
+            .ca_secret_ref
+            .as_ref()
+            .ok_or(ConsumerConfigError::MissingGridCaSecretRef)?;
+        let site_ref = tls
+            .site_secret_ref
+            .as_ref()
+            .ok_or(ConsumerConfigError::MissingSiteSecretRef)?;
+        add_requirement(
+            &mut requirements,
+            MountPurpose::GridPeerCa,
+            gateway_name,
+            &ca_ref.namespace,
+            &ca_ref.name,
+            "ca.crt",
+            &tls_file_path(tls_cert_mount_path, "ca.crt"),
+        )?;
+        for key in ["tls.crt", "tls.key"] {
+            add_requirement(
+                &mut requirements,
+                MountPurpose::GridSiteIdentity,
+                gateway_name,
+                &site_ref.namespace,
+                &site_ref.name,
+                key,
+                &tls_file_path(tls_cert_mount_path, key),
+            )?;
+        }
+    }
+
+    for endpoint in cluster_endpoints
+        .iter()
+        .filter(|endpoint| used_clusters.contains(endpoint.cluster.as_str()))
+    {
+        let Some(transport) = endpoint.transport.as_ref() else {
+            continue;
+        };
+        if transport.mode != TransportMode::Tls {
+            continue;
+        }
+        let Some(ca_ref) = transport.ca_secret_ref.as_ref() else {
+            continue;
+        };
+        let key = ca_ref.key.as_deref().unwrap_or("ca.crt");
+        let path = backend_ca_file_path(&ca_ref.name, key);
+        add_requirement(
+            &mut requirements,
+            MountPurpose::BackendCa,
+            gateway_name,
+            gateway_namespace,
+            &ca_ref.name,
+            key,
+            &path,
+        )?;
+    }
+
+    let requirements = requirements
+        .into_iter()
+        .map(|((purpose, final_hop, namespace, name), items)| MountRequirement {
+            purpose,
+            final_hop,
+            secret: RequirementSecret { namespace, name },
+            items: items.into_iter().collect(),
+        })
+        .collect();
+
+    Ok(ConsumerRenderResult {
+        config_yaml,
+        requirements,
+    })
+}
+
+/// Exercise the default renderer contract in local tests.
+#[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "matches the production renderer inputs")]
+fn render_consumer_config(
+    overlay: &RoutingOverlay,
+    credential_mount_base: &str,
+    cluster_endpoints: &[ClusterEndpointConfig],
+    tls_cert_mount_path: &str,
+    listener_port: u16,
+    tls: &TlsConfig,
+    gateway_name: &str,
+    gateway_namespace: &str,
+    telemetry: Option<&GatewayTelemetryConfig>,
+    delegated_mounts: bool,
+) -> Result<ConsumerRenderResult, ConsumerConfigError> {
+    render_consumer_config_with_projected(
+        overlay,
+        credential_mount_base,
+        cluster_endpoints,
+        tls_cert_mount_path,
+        listener_port,
+        tls,
+        gateway_name,
+        gateway_namespace,
+        telemetry,
+        false,
+        delegated_mounts,
+    )
+}
+
+/// Add one validated file reference to the grouped requirements map.
+#[expect(
+    clippy::type_complexity,
+    reason = "the tuple provides deterministic grouping by purpose and Secret identity"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument identifies one projected Secret key and destination"
+)]
+fn add_requirement(
+    requirements: &mut BTreeMap<(MountPurpose, String, String, String), BTreeSet<RequirementItem>>,
+    purpose: MountPurpose,
+    final_hop: &str,
+    namespace: &str,
+    name: &str,
+    key: &str,
+    path: &str,
+) -> Result<(), ConsumerConfigError> {
+    if namespace.trim().is_empty()
+        || name.trim().is_empty()
+        || key.trim().is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(ConsumerConfigError::InvalidSecretReference { path: path.to_owned() });
+    }
+    validate_absolute_normalized_path(path)?;
+    let key_tuple = (namespace, name, key);
+    for ((_, _, other_namespace, other_name), items) in requirements.iter() {
+        for item in items {
+            if item.path == path && (other_namespace.as_str(), other_name.as_str(), item.key.as_str()) != key_tuple {
+                return Err(ConsumerConfigError::MountPathConflict { path: path.to_owned() });
+            }
+        }
+    }
+    requirements
+        .entry((purpose, final_hop.to_owned(), namespace.to_owned(), name.to_owned()))
+        .or_default()
+        .insert(RequirementItem {
+            key: key.to_owned(),
+            path: path.to_owned(),
+        });
+    Ok(())
+}
+
+/// Reject relative, traversal, non-normalized, and root-level projected paths.
+fn validate_absolute_normalized_path(path: &str) -> Result<(), ConsumerConfigError> {
+    let parsed = std::path::Path::new(path);
+    let normalized = parsed.components().collect::<std::path::PathBuf>();
+    if !parsed.is_absolute()
+        || parsed
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        || normalized.to_str() != Some(path)
+        || path == "/"
+        || parsed
+            .parent()
+            .is_some_and(|parent| parent == std::path::Path::new("/"))
+    {
+        return Err(ConsumerConfigError::InvalidMountPath { path: path.to_owned() });
+    }
+    Ok(())
+}
+
+/// Keep rendered TLS paths identical to projected mount paths when the directory has a trailing slash.
+fn tls_file_path(mount_dir: &str, key: &str) -> String {
+    format!("{}/{key}", mount_dir.trim_end_matches('/'))
+}
+
+/// Build the stable in-container path for a custom backend CA Secret key.
+fn backend_ca_file_path(secret_name: &str, key: &str) -> String {
+    format!("{BACKEND_CA_MOUNT_BASE}/{}/{key}", dns_safe(secret_name))
+}
+
+/// Serialize a reference-only requirements document into a `ConfigMap`.
+pub(crate) fn build_mount_requirements_config_map(
+    document: &MountRequirementsDocument,
+    config_map_name: &str,
+    namespace: &str,
+    network_name: &str,
+    gateway_name: &str,
+) -> Result<ConfigMap, ConsumerConfigError> {
+    let encoded = serde_json::to_string(document)?;
+    let mut data = BTreeMap::new();
+    data.insert("mount-requirements.json".to_owned(), encoded);
+    let mut labels = BTreeMap::new();
+    labels.insert("app.kubernetes.io/managed-by".to_owned(), "grid-operator".to_owned());
+    labels.insert("grid.praxis-proxy.io/gateway".to_owned(), gateway_name.to_owned());
+    labels.insert("grid.praxis-proxy.io/network".to_owned(), network_name.to_owned());
+    Ok(ConfigMap {
+        metadata: kube::api::ObjectMeta {
+            labels: Some(labels),
+            name: Some(config_map_name.to_owned()),
+            namespace: Some(namespace.to_owned()),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    })
+}
+
 /// Build the Kubernetes `ConfigMap` for the generated consumer Praxis config.
 ///
 /// The `ConfigMap` contains a single `praxis.yaml` key with the rendered YAML.
@@ -359,16 +942,17 @@ pub(crate) fn build_consumer_config_map(
 ///
 /// Each candidate is indented and includes `credential.secretRef` when present.
 /// Token values are never included.
-fn render_candidates(candidates: &[&RoutingCandidate]) -> String {
+#[cfg(test)]
+fn render_candidates(candidates: &[&RoutingCandidate], local_site: &str) -> String {
     candidates
         .iter()
-        .copied()
-        .map(render_candidate)
+        .map(|candidate| render_candidate(candidate, candidate.site == local_site))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 /// Render the explicit Grid-owned request-selection policy.
+#[cfg(test)]
 fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPolicyConfig>) -> String {
     let Some(policy) = policy else {
         return String::new();
@@ -382,12 +966,80 @@ fn render_selection_policy(policy: Option<&crate::crd::grid_network::SelectionPo
     format!("        selection_policy:\n          mode: {mode}\n")
 }
 
+/// Render provider-hop context-header configuration for mTLS endpoints.
+///
+/// `clusterEndpoints` describes consumer-to-provider-gateway endpoints. An
+/// explicit mTLS transport identifies the authenticated provider-gateway hop;
+/// those cluster names need the routing-context headers consumed by the
+/// provider's `provider_route` filter. Plaintext endpoints remain direct/local
+/// backends and do not receive provider-hop headers.
+fn render_provider_hop_clusters(cluster_endpoints: &[ClusterEndpointConfig]) -> Result<String, ConsumerConfigError> {
+    let clusters = provider_hop_clusters(cluster_endpoints)?;
+    if clusters.is_empty() {
+        return Ok(String::new());
+    }
+    let values = clusters
+        .into_iter()
+        .map(|cluster| yaml_scalar(&cluster).unwrap_or_else(|_| "\"\"".to_owned()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("        provider_hop_clusters: [{values}]\n"))
+}
+
+/// The explicit mTLS endpoint names allowed to receive provider-hop context in
+/// generated consumer Praxis config. The embedded Grid gateway uses its
+/// independent `GatewayRef.providerHopEndpoints` contract.
+#[expect(
+    clippy::too_many_lines,
+    reason = "this validation keeps the mTLS provider-hop boundary explicit"
+)]
+pub(crate) fn provider_hop_clusters(
+    cluster_endpoints: &[ClusterEndpointConfig],
+) -> Result<BTreeSet<String>, ConsumerConfigError> {
+    let mut seen = BTreeSet::new();
+    let mut hops = BTreeSet::new();
+    for endpoint in cluster_endpoints {
+        if endpoint.cluster.trim().is_empty() {
+            return Err(ConsumerConfigError::BlankCluster {
+                kind: "cluster_endpoint".to_owned(),
+                name: endpoint.cluster.clone(),
+            });
+        }
+        if !seen.insert(endpoint.cluster.as_str()) {
+            return Err(ConsumerConfigError::DuplicateClusterEndpoint {
+                cluster: endpoint.cluster.clone(),
+            });
+        }
+        match endpoint.transport.as_ref() {
+            Some(transport) if transport.mode == TransportMode::MutualTls => {
+                if transport.sni.as_deref().is_none_or(|sni| sni.trim().is_empty()) {
+                    return Err(ConsumerConfigError::MissingSni {
+                        cluster: endpoint.cluster.clone(),
+                    });
+                }
+                hops.insert(endpoint.cluster.clone());
+            },
+            Some(transport)
+                if transport.mode == TransportMode::Plaintext
+                    && transport.sni.as_deref().is_some_and(|sni| !sni.trim().is_empty()) =>
+            {
+                return Err(ConsumerConfigError::PlaintextWithSni {
+                    cluster: endpoint.cluster.clone(),
+                });
+            },
+            Some(_) | None => {},
+        }
+    }
+    Ok(hops)
+}
+
 /// Render one `intelligent_route` candidate.
 #[expect(
     clippy::too_many_lines,
     reason = "Candidate YAML fields are kept together to mirror the wire contract."
 )]
-fn render_candidate(c: &RoutingCandidate) -> String {
+#[cfg(test)]
+fn render_candidate(c: &RoutingCandidate, include_credential: bool) -> String {
     let mut lines = vec![
         format!(
             "         - kind: {}",
@@ -419,13 +1071,14 @@ fn render_candidate(c: &RoutingCandidate) -> String {
     if let Some(weight) = c.traffic_weight {
         lines.push(format!("           traffic_weight: {weight}"));
     }
-    if let Some(cred) = &c.credential {
+    if include_credential && let Some(cred) = &c.credential {
         lines.extend(render_credential_reference(cred));
     }
     lines.join("\n")
 }
 
 /// Render the `credential.secretRef` block for one candidate.
+#[cfg(test)]
 fn render_credential_reference(cred: &crate::resources::routing_overlay::ProjectedCredential) -> Vec<String> {
     vec![
         "           credential:".to_owned(),
@@ -449,21 +1102,28 @@ fn render_credential_reference(cred: &crate::resources::routing_overlay::Project
     ]
 }
 
-/// Render the `credential_inject` filter section.
-///
-/// Returns `None` when no credential-bearing candidates exist.
-/// Each unique `(strategy, name, namespace, key)` tuple produces one entry.
-/// Entries use `file:` sources; no `value:` is ever emitted.
+/// Render `credential_inject` for current credential-bearing candidates, or
+/// unconditionally in explicit projected-credential mode. The latter keeps a
+/// filter present at empty-overlay startup so a later credential-bearing
+/// revision cannot bypass injection. Missing projected files fail closed.
 #[expect(
     clippy::too_many_lines,
     reason = "BTreeMap collection + format strings for each credential field"
 )]
-fn render_credential_inject(candidates: &[&RoutingCandidate], credential_mount_base: &str) -> Option<String> {
+fn render_credential_inject(
+    candidates: &[&RoutingCandidate],
+    credential_mount_base: &str,
+    local_site: &str,
+    enable_projected_credentials: bool,
+) -> String {
     // Collect unique (strategy, name, namespace, key) → rendered entry.
     // BTreeMap provides deterministic sorted order by key.
     let mut entries: BTreeMap<(String, String, String, String), String> = BTreeMap::new();
 
     for c in candidates {
+        if c.site != local_site {
+            continue;
+        }
         let Some(cred) = &c.credential else {
             continue;
         };
@@ -493,17 +1153,31 @@ fn render_credential_inject(candidates: &[&RoutingCandidate], credential_mount_b
         entries.insert(map_key, entry);
     }
 
-    if entries.is_empty() {
-        return None;
+    if entries.is_empty() && !enable_projected_credentials {
+        return String::new();
     }
-
-    Some(format!(
+    let credentials = if entries.is_empty() {
+        "        credentials: []\n".to_owned()
+    } else {
+        format!(
+            "        credentials:\n{}\n",
+            entries.into_values().collect::<Vec<_>>().join("\n")
+        )
+    };
+    let projected_base = if enable_projected_credentials {
+        format!(
+            "        projected_credential_mount_base: {}\n",
+            yaml_scalar(credential_mount_base).unwrap_or_else(|_| "\"\"".to_owned())
+        )
+    } else {
+        String::new()
+    };
+    format!(
         "\n\
          \x20     - filter: credential_inject\n\
-         \x20       credentials:\n\
-         {}",
-        entries.into_values().collect::<Vec<_>>().join("\n")
-    ))
+         {credentials}\
+         {projected_base}"
+    )
 }
 
 /// Render the `load_balancer` filter section.
@@ -512,6 +1186,7 @@ fn render_credential_inject(candidates: &[&RoutingCandidate], credential_mount_b
 /// deterministically.  Every cluster must have a matching entry in
 /// `cluster_endpoints` with explicit transport configuration; missing
 /// endpoint, missing transport, or missing SNI on mTLS all fail closed.
+#[cfg(test)]
 fn render_load_balancer(
     candidates: &[&RoutingCandidate],
     cluster_endpoints: &[ClusterEndpointConfig],
@@ -569,6 +1244,11 @@ fn render_cluster_entry(
 
     match transport.mode {
         TransportMode::MutualTls => {
+            if transport.ca_secret_ref.is_some() {
+                return Err(ConsumerConfigError::MutualTlsCustomCa {
+                    cluster: ep.cluster.clone(),
+                });
+            }
             let raw_sni = transport
                 .sni
                 .as_deref()
@@ -578,14 +1258,45 @@ fn render_cluster_entry(
                 })?;
             let trimmed_sni = raw_sni.trim();
             let quoted_sni = yaml_scalar(trimmed_sni).unwrap_or_else(|_| "\"\"".to_owned());
+            let ca_path =
+                yaml_scalar(&tls_file_path(tls_cert_mount_path, "ca.crt")).unwrap_or_else(|_| "\"\"".to_owned());
+            let cert_path =
+                yaml_scalar(&tls_file_path(tls_cert_mount_path, "tls.crt")).unwrap_or_else(|_| "\"\"".to_owned());
+            let key_path =
+                yaml_scalar(&tls_file_path(tls_cert_mount_path, "tls.key")).unwrap_or_else(|_| "\"\"".to_owned());
             Ok(format!(
                 "          - name: {quoted_name}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  tls:\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    ca:\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      ca_path: {tls_cert_mount_path}/ca.crt\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      ca_path: {ca_path}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    client_cert:\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      cert_path: {tls_cert_mount_path}/tls.crt\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      key_path: {tls_cert_mount_path}/tls.key\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      cert_path: {cert_path}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20      key_path: {key_path}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
+                \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    - {quoted_addr}"
+            ))
+        },
+        TransportMode::Tls => {
+            let raw_sni = transport
+                .sni
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| ConsumerConfigError::MissingSni {
+                    cluster: ep.cluster.clone(),
+                })?;
+            let quoted_sni = yaml_scalar(raw_sni.trim()).unwrap_or_else(|_| "\"\"".to_owned());
+            let ca_config = transport.ca_secret_ref.as_ref().map_or_else(String::new, |ca_ref| {
+                let key = ca_ref.key.as_deref().unwrap_or("ca.crt");
+                let path = backend_ca_file_path(&ca_ref.name, key);
+                let quoted_path = yaml_scalar(&path).unwrap_or_else(|_| "\"\"".to_owned());
+                format!("              ca:\n                ca_path: {quoted_path}\n")
+            });
+            Ok(format!(
+                "          - name: {quoted_name}\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  tls:\n\
+                 {ca_config}\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    sni: {quoted_sni}\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20    verify: true\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20  endpoints:\n\
@@ -595,6 +1306,11 @@ fn render_cluster_entry(
         TransportMode::Plaintext => {
             if transport.sni.as_deref().is_some_and(|s| !s.trim().is_empty()) {
                 return Err(ConsumerConfigError::PlaintextWithSni {
+                    cluster: ep.cluster.clone(),
+                });
+            }
+            if transport.ca_secret_ref.is_some() {
+                return Err(ConsumerConfigError::PlaintextWithCa {
                     cluster: ep.cluster.clone(),
                 });
             }
@@ -668,7 +1384,7 @@ fn dns_safe(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        crd::grid_network::EndpointTransport,
+        crd::grid_network::{EndpointCaSecretRef, EndpointTransport, SecretRef},
         resources::{
             geography::{AdmissionState, LocalityTier},
             routing_overlay::{ProjectedCredential, ProjectedCredentialRef},
@@ -739,6 +1455,7 @@ mod tests {
             network: "test-net".to_owned(),
             local_site: "site-a".to_owned(),
             candidates,
+            excluded: Vec::new(),
             selection_policy: None,
             generated_at: None,
         }
@@ -746,6 +1463,323 @@ mod tests {
 
     const MOUNT_BASE: &str = "/run/secrets/grid-credentials";
     const SENTINEL_TOKEN: &str = "sk-super-secret-bearer-token-do-not-emit";
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers local and remote candidates in one final-hop regression"
+    )]
+    fn requirements_keep_backend_credentials_at_the_final_local_hop() {
+        let overlay = simple_overlay(vec![
+            credential_candidate(
+                "inference_model",
+                "local-model",
+                "site-a",
+                "local-provider",
+                "model-a-credential",
+                "gateway-ns",
+                "token",
+            ),
+            credential_candidate(
+                "inference_model",
+                "local-model-copy",
+                "site-a",
+                "local-provider",
+                "model-a-credential",
+                "gateway-ns",
+                "token",
+            ),
+            credential_candidate(
+                "inference_model",
+                "remote-model",
+                "site-b",
+                "remote-provider",
+                "remote-credential",
+                "remote-ns",
+                "token",
+            ),
+        ]);
+        let rendered = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "grid-a",
+            "gateway-ns",
+            None,
+            false,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            rendered.requirements.len(),
+            1,
+            "duplicates produce one local requirement"
+        );
+        assert_eq!(rendered.requirements[0].purpose, MountPurpose::BackendCredential);
+        assert_eq!(rendered.requirements[0].final_hop, "grid-a");
+        assert_eq!(rendered.requirements[0].secret.name, "model-a-credential");
+        assert_eq!(rendered.requirements[0].items.len(), 1);
+        assert!(rendered.config_yaml.contains("model-a-credential"));
+        assert!(!rendered.config_yaml.contains("remote-credential"));
+        assert!(!rendered.config_yaml.contains(SENTINEL_TOKEN));
+    }
+
+    #[test]
+    fn empty_candidate_config_requires_endpoint_inventory_for_restoration() {
+        let overlay = simple_overlay(Vec::new());
+        let error = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &[],
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "gateway",
+            "gateway-ns",
+            None,
+            false,
+        )
+        .expect_err("restoration needs an endpoint inventory");
+        assert!(
+            matches!(error, ConsumerConfigError::NoClusterEndpoints),
+            "missing inventory must fail closed"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts both required Grid TLS Secret projections and file paths"
+    )]
+    fn mutual_tls_requirements_project_grid_ca_and_site_identity_together() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model",
+            "site-a",
+            "peer",
+            true,
+        )]);
+        let endpoint = ClusterEndpointConfig {
+            cluster: "peer".to_owned(),
+            address: "peer.example:8443".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::MutualTls,
+                sni: Some("peer.grid.internal".to_owned()),
+                ca_secret_ref: None,
+            }),
+        };
+        let tls = TlsConfig {
+            ca_secret_ref: Some(SecretRef {
+                name: "grid-ca".to_owned(),
+                namespace: "gateway-ns".to_owned(),
+                key: None,
+            }),
+            site_secret_ref: Some(SecretRef {
+                name: "site-identity".to_owned(),
+                namespace: "gateway-ns".to_owned(),
+                key: None,
+            }),
+            swim_key_ref: None,
+        };
+        let rendered = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &[endpoint],
+            "/tls/",
+            8080,
+            &tls,
+            "gateway",
+            "gateway-ns",
+            None,
+            true,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(rendered.requirements.len(), 2);
+        assert!(rendered.config_yaml.contains("/tls/ca.crt"));
+        assert!(rendered.config_yaml.contains("/tls/tls.key"));
+        let document = MountRequirementsDocument {
+            schema_version: "v1".to_owned(),
+            network: "grid-a".to_owned(),
+            gateway: RequirementGateway {
+                name: "gateway".to_owned(),
+                namespace: "gateway-ns".to_owned(),
+            },
+            requirements: rendered.requirements,
+        };
+        let mounts =
+            crate::resources::gateway_mounts::desired_mounts(&document).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            mounts.len(),
+            1,
+            "Grid CA and site identity share the Praxis TLS directory"
+        );
+        let projected_sources = mounts[0]
+            .volume
+            .pointer("/projected/sources")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            projected_sources.len(),
+            2,
+            "both source Secrets project into one stable volume"
+        );
+    }
+
+    #[test]
+    fn owner_managed_mutual_tls_mounts_do_not_require_grid_secret_references() {
+        let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "site-a", "peer", true)]);
+        let endpoint = mtls_ep("peer", "peer.example:8443", "peer.grid.internal");
+        let rendered = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &[endpoint],
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "gateway",
+            "gateway-ns",
+            None,
+            false,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        assert!(
+            rendered.requirements.is_empty(),
+            "owner-managed mTLS mounts must not require Grid Secret references"
+        );
+        assert!(
+            rendered.config_yaml.contains("/etc/praxis/tls/ca.crt"),
+            "owner-managed mTLS must still render the CA certificate path"
+        );
+        assert!(
+            rendered.config_yaml.contains("/etc/praxis/tls/tls.key"),
+            "owner-managed mTLS must still render the client key path"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts generated TLS config and its matching projected CA requirement"
+    )]
+    fn server_tls_backend_ca_is_rendered_and_reported_as_a_file_requirement() -> Result<(), serde_yaml::Error> {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model",
+            "site-a",
+            "backend",
+            true,
+        )]);
+        let endpoint = ClusterEndpointConfig {
+            cluster: "backend".to_owned(),
+            address: "model.example:443".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Tls,
+                sni: Some("model.example".to_owned()),
+                ca_secret_ref: Some(EndpointCaSecretRef {
+                    name: "model-ca".to_owned(),
+                    key: None,
+                }),
+            }),
+        };
+        let rendered = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &[endpoint],
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "gateway",
+            "gateway-ns",
+            None,
+            false,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered.config_yaml)?;
+        let filters = parsed["filter_chains"][0]["filters"]
+            .as_sequence()
+            .unwrap_or_else(|| std::process::abort());
+        let load_balancer = filters
+            .iter()
+            .find(|filter| filter["filter"].as_str() == Some("load_balancer"))
+            .unwrap_or_else(|| std::process::abort());
+        let clusters = load_balancer["clusters"]
+            .as_sequence()
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(clusters.len(), 1, "the TLS backend must render one cluster");
+        assert_eq!(
+            clusters[0]["name"].as_str(),
+            Some("backend"),
+            "the rendered TLS cluster must be the selected backend"
+        );
+        assert_eq!(
+            clusters[0]["tls"]["ca"]["ca_path"].as_str(),
+            Some("/run/secrets/grid-backend-ca/model-ca/ca.crt"),
+            "backend CA path must be nested under tls.ca"
+        );
+        assert_eq!(
+            clusters[0]["tls"]["sni"].as_str(),
+            Some("model.example"),
+            "backend SNI must be nested under tls"
+        );
+        assert_eq!(rendered.requirements.len(), 1);
+        assert_eq!(rendered.requirements[0].purpose, MountPurpose::BackendCa);
+        assert_eq!(rendered.requirements[0].secret.namespace, "gateway-ns");
+        assert_eq!(rendered.requirements[0].secret.name, "model-ca");
+        assert_eq!(rendered.requirements[0].items[0].key, "ca.crt");
+        assert_eq!(
+            rendered.requirements[0].items[0].path,
+            "/run/secrets/grid-backend-ca/model-ca/ca.crt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sanitized_credential_paths_that_collide_fail_closed() {
+        let overlay = simple_overlay(vec![
+            credential_candidate("inference_model", "a", "site-a", "a", "model.a", "gateway-ns", "token"),
+            credential_candidate("inference_model", "b", "site-a", "b", "model-a", "gateway-ns", "token"),
+        ]);
+        let result = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "gateway",
+            "gateway-ns",
+            None,
+            false,
+        );
+        assert!(matches!(result, Err(ConsumerConfigError::MountPathConflict { .. })));
+    }
+
+    #[test]
+    fn same_secret_name_from_two_namespaces_cannot_alias_one_mount_path() {
+        let overlay = simple_overlay(vec![
+            credential_candidate("inference_model", "a", "site-a", "a", "shared", "namespace-a", "token"),
+            credential_candidate("inference_model", "b", "site-a", "b", "shared", "namespace-b", "token"),
+        ]);
+        let result = render_consumer_config(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+            &TlsConfig::default(),
+            "gateway",
+            "gateway-ns",
+            None,
+            false,
+        );
+        assert!(matches!(result, Err(ConsumerConfigError::MountPathConflict { .. })));
+    }
 
     fn endpoint_coverage(overlay: &RoutingOverlay) -> Vec<ClusterEndpointConfig> {
         overlay
@@ -761,9 +1795,223 @@ mod tests {
                 transport: Some(EndpointTransport {
                     mode: TransportMode::Plaintext,
                     sni: None,
+                    ca_secret_ref: None,
                 }),
             })
             .collect()
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts the generated filter chain and complete restoration endpoint inventory"
+    )]
+    fn production_consumer_config_uses_scoped_reloadable_overlay_and_complete_endpoint_inventory() {
+        let overlay = simple_overlay(vec![credential_candidate(
+            "inference_model",
+            "model-a",
+            "site-a",
+            "provider-a",
+            "provider-a-secret",
+            "grid-system",
+            "token",
+        )]);
+        let mut endpoints = endpoint_coverage(&overlay);
+        endpoints[0].transport = Some(EndpointTransport {
+            mode: TransportMode::MutualTls,
+            sni: Some("provider-a.grid.internal".to_owned()),
+            ca_secret_ref: None,
+        });
+        endpoints.push(ClusterEndpointConfig {
+            cluster: "provider-b".to_owned(),
+            address: "127.0.0.1:30002".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+                ca_secret_ref: None,
+            }),
+        });
+
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            false,
+        )
+        .expect("dynamic consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let route = filters
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("route filter");
+        assert_eq!(route["overlay_file"], CONSUMER_OVERLAY_FILE);
+        assert_eq!(route["expected_overlay_scope"]["network"], "test-net");
+        assert_eq!(route["expected_overlay_scope"]["gateway"], "consumer-gateway");
+        assert_eq!(route["expected_overlay_scope"]["namespace"], "consumer-ns");
+        assert_eq!(route["expected_overlay_scope"]["local_site"], "site-a");
+        assert_eq!(route["reload"]["enabled"], true);
+        assert_eq!(route["provider_hop_clusters"][0], "provider-a");
+        assert!(route.get("candidates").is_none(), "candidate state is overlay-owned");
+        assert!(
+            route.get("selection_policy").is_none(),
+            "selection mode is overlay-owned"
+        );
+
+        let load_balancer = filters
+            .iter()
+            .find(|filter| filter["filter"] == "load_balancer")
+            .expect("load balancer");
+        let clusters = load_balancer["clusters"].as_sequence().expect("clusters");
+        assert_eq!(clusters.len(), 2, "inactive endpoint remains available for restoration");
+        assert!(clusters.iter().any(|cluster| cluster["name"] == "provider-b"));
+        assert!(
+            filters.iter().any(|filter| filter["filter"] == "credential_inject"),
+            "the active overlay credential remains configured"
+        );
+        assert!(!yaml.contains(SENTINEL_TOKEN));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks the cold-start empty overlay contract with a configured endpoint"
+    )]
+    fn empty_uncredentialed_consumer_config_does_not_require_new_praxis_filter() {
+        let overlay = simple_overlay(Vec::new());
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "provider-a".to_owned(),
+            address: "127.0.0.1:30001".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+                ca_secret_ref: None,
+            }),
+        }];
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            false,
+        )
+        .expect("valid empty overlay config");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let route = filters
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("route filter");
+        assert!(route.get("candidates").is_none());
+        assert_eq!(route["overlay_file"], CONSUMER_OVERLAY_FILE);
+        assert!(
+            filters.iter().all(|filter| filter["filter"] != "credential_inject"),
+            "old consumer images remain compatible when projected credentials are not opted in"
+        );
+        assert_eq!(
+            filters
+                .iter()
+                .filter(|filter| filter["filter"] == "load_balancer")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn projected_credential_opt_in_keeps_inject_filter_for_empty_startup_overlay() {
+        let overlay = simple_overlay(Vec::new());
+        let endpoints = [ClusterEndpointConfig {
+            cluster: "provider-a".to_owned(),
+            address: "127.0.0.1:30001".to_owned(),
+            transport: Some(EndpointTransport {
+                mode: TransportMode::Plaintext,
+                sni: None,
+                ca_secret_ref: None,
+            }),
+        }];
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoints,
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            true,
+        )
+        .expect("compatible consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let inject = filters
+            .iter()
+            .find(|filter| filter["filter"] == "credential_inject")
+            .expect("projected credential capability installs filter at cold start");
+        assert_eq!(inject["credentials"], serde_yaml::Value::Sequence(Vec::new()));
+        assert_eq!(inject["projected_credential_mount_base"], MOUNT_BASE);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks that projected credential references stay dynamic in rendered YAML"
+    )]
+    fn projected_credential_mode_keeps_reference_dynamic_for_credential_route() {
+        let overlay = simple_overlay(vec![credential_candidate(
+            "inference_model",
+            "model-with-secret",
+            "site-a",
+            "provider-a",
+            "provider-secret",
+            "consumer-ns",
+            "token",
+        )]);
+        let yaml = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &endpoint_coverage(&overlay),
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            true,
+        )
+        .expect("projected consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let filters = config["filter_chains"][0]["filters"].as_sequence().expect("filters");
+        let inject = filters
+            .iter()
+            .find(|filter| filter["filter"] == "credential_inject")
+            .expect("dynamic filter is present");
+        assert_eq!(inject["credentials"], serde_yaml::Value::Sequence(Vec::new()));
+        assert_eq!(inject["projected_credential_mount_base"], MOUNT_BASE);
+        assert!(
+            !yaml.contains("provider-secret"),
+            "reference identity remains only in the dynamic overlay"
+        );
+    }
+
+    #[test]
+    fn dynamic_consumer_config_requires_endpoint_inventory() {
+        let overlay = simple_overlay(Vec::new());
+        let error = generate_consumer_praxis_config_for_gateway(
+            &overlay,
+            MOUNT_BASE,
+            &[],
+            "/etc/praxis/tls",
+            8080,
+            "consumer-gateway",
+            "consumer-ns",
+            false,
+        )
+        .expect_err("restoration needs at least one configured endpoint");
+        assert!(matches!(error, ConsumerConfigError::NoClusterEndpoints));
     }
 
     fn selection_policy_mode(config: &str) -> Option<String> {
@@ -1113,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    fn no_credential_candidates_produces_no_credential_inject() {
+    fn uncredentialed_static_config_does_not_emit_unneeded_inject_filter() {
         let overlay = simple_overlay(vec![plain_candidate(
             "inference_model",
             "model-x",
@@ -1129,10 +2377,11 @@ mod tests {
             8080,
         )
         .unwrap();
-        assert!(
-            !yaml.contains("credential_inject"),
-            "no credential candidates must produce no credential_inject"
-        );
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated Praxis YAML parses");
+        let filters = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filter chain");
+        assert!(filters.iter().all(|filter| filter["filter"] != "credential_inject"));
     }
 
     #[test]
@@ -1140,7 +2389,7 @@ mod tests {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
             "model-z",
-            "api-site",
+            "site-a",
             "api-cluster",
             "my-secret",
             "default",
@@ -1175,7 +2424,7 @@ mod tests {
             credential_candidate(
                 "inference_model",
                 "model-z1",
-                "site-b",
+                "site-a",
                 "cluster-b",
                 "shared-creds",
                 "ns",
@@ -1184,7 +2433,7 @@ mod tests {
             credential_candidate(
                 "inference_model",
                 "model-z2",
-                "site-b",
+                "site-a",
                 "cluster-b",
                 "shared-creds",
                 "ns",
@@ -1225,7 +2474,7 @@ mod tests {
             credential_candidate(
                 "inference_model",
                 "model-b",
-                "site-b",
+                "site-a",
                 "cluster-b",
                 "creds-b",
                 "ns",
@@ -1257,7 +2506,7 @@ mod tests {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
             "model-z",
-            "api",
+            "site-a",
             "api-cluster",
             "my-creds",
             "default",
@@ -1282,7 +2531,7 @@ mod tests {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
             "model-z",
-            "api",
+            "site-a",
             "api-cluster",
             "creds",
             "ns",
@@ -1305,7 +2554,7 @@ mod tests {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
             "model-z",
-            "api",
+            "site-a",
             "cluster",
             "creds",
             "ns",
@@ -1331,7 +2580,7 @@ mod tests {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
             "model-z",
-            "api",
+            "site-a",
             "cluster",
             "my-api-creds",
             "grid-system",
@@ -1390,6 +2639,7 @@ mod tests {
             network: "n".to_owned(),
             local_site: String::new(),
             candidates: vec![],
+            excluded: Vec::new(),
             selection_policy: None,
             generated_at: None,
         };
@@ -1416,6 +2666,14 @@ mod tests {
     }
 
     #[test]
+    fn root_level_secret_file_path_is_rejected() {
+        assert!(matches!(
+            validate_absolute_normalized_path("/ca.crt"),
+            Err(ConsumerConfigError::InvalidMountPath { .. })
+        ));
+    }
+
+    #[test]
     fn blank_candidate_cluster_returns_error() {
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "", true)]);
         assert!(
@@ -1438,8 +2696,8 @@ mod tests {
     #[test]
     fn output_is_deterministic_for_same_input() {
         let overlay = simple_overlay(vec![
-            credential_candidate("inference_model", "m1", "s1", "c1", "creds-b", "ns", "tok"),
-            credential_candidate("inference_model", "m2", "s2", "c2", "creds-a", "ns", "tok"),
+            credential_candidate("inference_model", "m1", "site-a", "c1", "creds-b", "ns", "tok"),
+            credential_candidate("inference_model", "m2", "site-a", "c2", "creds-a", "ns", "tok"),
         ]);
         let yaml1 = generate_consumer_praxis_config(
             &overlay,
@@ -1463,8 +2721,8 @@ mod tests {
     #[test]
     fn credential_entries_ordered_deterministically() {
         let overlay = simple_overlay(vec![
-            credential_candidate("inference_model", "m1", "s1", "c1", "zzz-creds", "ns", "tok"),
-            credential_candidate("inference_model", "m2", "s2", "c2", "aaa-creds", "ns", "tok"),
+            credential_candidate("inference_model", "m1", "site-a", "c1", "zzz-creds", "ns", "tok"),
+            credential_candidate("inference_model", "m2", "site-a", "c2", "aaa-creds", "ns", "tok"),
         ]);
         let yaml = generate_consumer_praxis_config(
             &overlay,
@@ -1526,15 +2784,15 @@ mod tests {
         let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
         assert!(yaml.contains("tls:"), "mTLS endpoint must render TLS config");
         assert!(
-            yaml.contains("ca_path: /etc/praxis/tls/ca.crt"),
+            yaml.contains("ca_path: \"/etc/praxis/tls/ca.crt\""),
             "TLS config must reference CA path"
         );
         assert!(
-            yaml.contains("cert_path: /etc/praxis/tls/tls.crt"),
+            yaml.contains("cert_path: \"/etc/praxis/tls/tls.crt\""),
             "TLS config must reference client cert path"
         );
         assert!(
-            yaml.contains("key_path: /etc/praxis/tls/tls.key"),
+            yaml.contains("key_path: \"/etc/praxis/tls/tls.key\""),
             "TLS config must reference client key path"
         );
         assert!(
@@ -1593,7 +2851,7 @@ mod tests {
         let overlay = simple_overlay(vec![credential_candidate(
             "inference_model",
             "model-z",
-            "api",
+            "site-a",
             "api-cluster",
             "my-creds",
             "ns",
@@ -1698,6 +2956,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: Some(sni.to_owned()),
+                ca_secret_ref: None,
             }),
         }
     }
@@ -1709,11 +2968,13 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: None,
+                ca_secret_ref: None,
             }),
         }
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "checks every rendered mTLS property")]
     fn cluster_with_mtls_transport_renders_mtls_entry() {
         let endpoints = [mtls_ep("site-a", "172.18.0.4:30080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate(
@@ -1726,16 +2987,77 @@ mod tests {
         let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080).unwrap();
         assert!(yaml.contains("172.18.0.4:30080"), "endpoint address must appear");
         assert!(yaml.contains("site-a.grid.internal"), "SNI must appear");
-        assert!(yaml.contains("ca_path: /etc/praxis/tls/ca.crt"), "CA path must appear");
         assert!(
-            yaml.contains("cert_path: /etc/praxis/tls/tls.crt"),
+            yaml.contains("ca_path: \"/etc/praxis/tls/ca.crt\""),
+            "CA path must appear"
+        );
+        assert!(
+            yaml.contains("cert_path: \"/etc/praxis/tls/tls.crt\""),
             "cert path must appear"
         );
         assert!(
-            yaml.contains("key_path: /etc/praxis/tls/tls.key"),
+            yaml.contains("key_path: \"/etc/praxis/tls/tls.key\""),
             "key path must appear"
         );
         assert!(yaml.contains("verify: true"), "verify flag must appear");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let route = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filters")
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("intelligent route");
+        assert_eq!(route["provider_hop_clusters"][0], "site-a");
+    }
+
+    #[test]
+    fn provider_hop_clusters_include_only_explicit_mtls_endpoints() {
+        let overlay = simple_overlay(vec![
+            plain_candidate("inference_model", "model-a", "site-a", "remote-a", true),
+            plain_candidate("inference_model", "model-b", "site-b", "local-b", true),
+        ]);
+        let endpoints = [
+            mtls_ep("remote-a", "provider-a.example:8443", "provider-a.example"),
+            plain_ep("local-b", "local-backend.default.svc:8080"),
+        ];
+        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/etc/praxis/tls", 8080)
+            .expect("mixed-transport consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let route = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filters")
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("intelligent route");
+        assert_eq!(route["provider_hop_clusters"].as_sequence().expect("hop list").len(), 1);
+        assert_eq!(route["provider_hop_clusters"][0], "remote-a");
+    }
+
+    #[test]
+    fn plaintext_only_consumer_has_no_provider_hop_cluster_list() {
+        let overlay = simple_overlay(vec![plain_candidate(
+            "inference_model",
+            "model-a",
+            "site-a",
+            "local-a",
+            true,
+        )]);
+        let yaml = generate_consumer_praxis_config(
+            &overlay,
+            MOUNT_BASE,
+            &[plain_ep("local-a", "backend.default.svc:8080")],
+            "/etc/praxis/tls",
+            8080,
+        )
+        .expect("plaintext consumer config renders");
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("generated YAML parses");
+        let route = config["filter_chains"][0]["filters"]
+            .as_sequence()
+            .expect("filters")
+            .iter()
+            .find(|filter| filter["filter"] == "intelligent_route")
+            .expect("intelligent route");
+        assert!(route.get("provider_hop_clusters").is_none());
     }
 
     #[test]
@@ -1811,6 +3133,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: None,
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "mtls-no-sni", true)]);
@@ -1833,6 +3156,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: Some("  ".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate(
@@ -1861,6 +3185,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: Some("unexpected.grid.internal".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate(
@@ -1889,6 +3214,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::Plaintext,
                 sni: Some("  ".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate(
@@ -1913,6 +3239,7 @@ mod tests {
             transport: Some(EndpointTransport {
                 mode: TransportMode::MutualTls,
                 sni: Some("  site-a.grid.internal  ".to_owned()),
+                ca_secret_ref: None,
             }),
         }];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "trim-test", true)]);
@@ -1977,11 +3304,17 @@ mod tests {
     fn custom_tls_cert_mount_path_used_in_cluster_entry() {
         let endpoints = [mtls_ep("site-a", "10.0.0.1:8080", "site-a.grid.internal")];
         let overlay = simple_overlay(vec![plain_candidate("inference_model", "m", "s", "site-a", true)]);
-        let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, "/custom/tls/path", 8080).unwrap();
-        assert!(
-            yaml.contains("ca_path: /custom/tls/path/ca.crt"),
-            "custom TLS path must be used"
-        );
+        for (mount_dir, ca_path) in [
+            ("/custom/tls/path", "/custom/tls/path/ca.crt"),
+            ("/tls", "/tls/ca.crt"),
+            ("/etc/praxis/tls/", "/etc/praxis/tls/ca.crt"),
+        ] {
+            let yaml = generate_consumer_praxis_config(&overlay, MOUNT_BASE, &endpoints, mount_dir, 8080).unwrap();
+            assert!(
+                yaml.contains(&format!("ca_path: \"{ca_path}\"")),
+                "TLS directory {mount_dir} must render CA path {ca_path}"
+            );
+        }
     }
 
     #[test]

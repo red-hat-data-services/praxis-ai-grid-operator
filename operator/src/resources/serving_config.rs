@@ -35,14 +35,23 @@ pub(crate) const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(30);
 /// Store retention per series, seconds.
 const WINDOW_SECS: u64 = 60;
 
-/// Freshness window the gateway orders over, milliseconds.
-const LOAD_WINDOW_MS: i64 = 30_000;
-
 /// Peer poll interval, the operator's default local scrape interval.
 const PEER_INTERVAL_MS: u64 = 5_000;
 
 /// Peer connect and request timeout, milliseconds.
 const PEER_TIMEOUT_MS: u64 = 2_000;
+
+/// The freshness window the gateway reads load over, milliseconds: the oldest a sample can
+/// be when it arrives (a scrape, a poll, and a poll timeout) plus one poll of slack, so one
+/// late poll does not turn a healthy site unknown. 17s at a 5s scrape.
+fn load_window_ms(scrape: Duration) -> i64 {
+    let scrape_ms = u64::try_from(scrape.as_millis()).unwrap_or(u64::MAX);
+    let window = PEER_INTERVAL_MS
+        .saturating_add(scrape_ms)
+        .saturating_add(PEER_TIMEOUT_MS)
+        .saturating_add(PEER_INTERVAL_MS);
+    i64::try_from(window).unwrap_or(i64::MAX)
+}
 
 /// Gateway-side cap on candidates (`validate_candidates`).
 const MAX_CANDIDATES: usize = 1024;
@@ -64,6 +73,12 @@ pub(crate) struct ServingConfig {
     pub(crate) load_window_ms: i64,
     /// Local site first, then by site, name, cluster.
     pub(crate) candidates: Vec<ServingCandidate>,
+    /// Explicit mTLS provider gateways authorized to receive hop context.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) provider_hop_clusters: Vec<String>,
+    /// Expected verified TLS SNI for each provider-hop cluster.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) provider_hop_sni: BTreeMap<String, String>,
     /// Sorted by site.
     pub(crate) peers: Vec<ServingPeer>,
 }
@@ -71,6 +86,9 @@ pub(crate) struct ServingConfig {
 /// One routable `(model, site, cluster)`, `cluster` naming a `load_balancer` cluster.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ServingCandidate {
+    /// Overlay-assigned stable identity used by authenticated provider hops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stable_id: Option<String>,
     /// Always `inference_model`.
     pub(crate) kind: &'static str,
     /// Model name.
@@ -81,6 +99,16 @@ pub(crate) struct ServingCandidate {
     pub(crate) cluster: String,
     /// Freshness carried from the overlay.
     pub(crate) fresh: bool,
+    /// Whether it takes new requests. Omitted when it does, so such a config
+    /// still loads on a gateway that predates the field.
+    #[serde(skip_serializing_if = "admits_new")]
+    pub(crate) admission: AdmissionState,
+}
+
+/// Whether `admission` is the default, which the gateway assumes when absent.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde skip_serializing_if signature")]
+fn admits_new(admission: &AdmissionState) -> bool {
+    *admission == AdmissionState::NewAndExisting
 }
 
 /// One peer signals endpoint and the local identity material to reach it.
@@ -116,12 +144,18 @@ pub(crate) struct ServingPeer {
 /// Per-gateway inputs that are not in the overlay.
 #[derive(Clone, Debug)]
 pub(crate) struct ServingInputs<'input> {
+    /// Verified gateway clusters allowed to carry provider-hop context.
+    pub(crate) provider_hop_clusters: &'input BTreeSet<String>,
+    /// Declared TLS identity for each provider-hop cluster.
+    pub(crate) provider_hop_sni: &'input BTreeMap<String, String>,
     /// Directory holding this site's `ca.crt`, `tls.crt`, `tls.key` in the gateway pod.
     pub(crate) tls_mount: &'input str,
     /// Operator-configured address of this site's own signals endpoint.
     pub(crate) local_signals_addr: Option<&'input str>,
     /// Declared leaf digests per remote site, empty outside pin trust.
     pub(crate) pins: &'input BTreeMap<String, Vec<String>>,
+    /// How often operators scrape their providers, taken as every site's.
+    pub(crate) scrape_interval: Duration,
 }
 
 /// Render from `(site, signals endpoint)` members.
@@ -136,11 +170,10 @@ pub(crate) fn render<'member, Members>(
 where
     Members: IntoIterator<Item = (&'member str, &'member str)>,
 {
-    let candidates = candidates(&overlay.candidates, &overlay.local_site);
+    let candidates = candidates(overlay);
     let sites: BTreeSet<&str> = candidates.iter().map(|candidate| candidate.site.as_str()).collect();
-    let mut addrs = remote_addrs(members, &sites, &overlay.local_site);
+    let mut addrs = remote_addrs(members, &sites, &overlay.local_site, overlay.candidates.is_empty());
     if let Some(addr) = inputs.local_signals_addr
-        && sites.contains(overlay.local_site.as_str())
         && certs::validate_site_name(&overlay.local_site).is_ok()
     {
         addrs.insert(overlay.local_site.clone(), addr.to_owned());
@@ -155,8 +188,10 @@ where
     ServingConfig {
         local_site: overlay.local_site.clone(),
         window_secs: WINDOW_SECS,
-        load_window_ms: LOAD_WINDOW_MS,
+        load_window_ms: load_window_ms(inputs.scrape_interval),
         candidates,
+        provider_hop_clusters: inputs.provider_hop_clusters.iter().cloned().collect(),
+        provider_hop_sni: inputs.provider_hop_sni.clone(),
         peers,
     }
 }
@@ -188,51 +223,112 @@ pub(crate) fn dialable_members<'snap>(
         .collect()
 }
 
-/// Admitted inference candidates within gateway limits, deduplicated and ordered.
-fn candidates(overlay: &[RoutingCandidate], local_site: &str) -> Vec<ServingCandidate> {
-    // Local first so cold start, before any signal, prefers this site.
-    let mut unique: BTreeMap<(bool, &str, &str, &str), bool> = BTreeMap::new();
-    for candidate in overlay.iter().filter(|candidate| routable(candidate)) {
+/// A candidate's identity: remote after local, then site, name, cluster.
+type CandidateKey<'overlay> = (bool, &'overlay str, &'overlay str, &'overlay str);
+
+/// Each routable candidate once, with its freshness and admission.
+///
+/// Any stale or more restricted duplicate marks the tuple, whatever the order.
+fn dedup<'overlay>(
+    overlay: impl Iterator<Item = &'overlay RoutingCandidate>,
+    local_site: &str,
+) -> BTreeMap<CandidateKey<'overlay>, (bool, AdmissionState, Option<String>)> {
+    let mut unique = BTreeMap::new();
+    for candidate in overlay.filter(|candidate| routable(candidate)) {
         let key = (
             candidate.site != local_site,
             candidate.site.as_str(),
             candidate.name.as_str(),
             candidate.cluster.as_str(),
         );
-        // Any stale duplicate marks the tuple stale, whatever the order.
-        unique
+        let admission = candidate.admission_state.unwrap_or(AdmissionState::NewAndExisting);
+        // Seeded with the identities of both folds, so the first candidate and every
+        // duplicate after it take the same path: fresh only if all are, admission as
+        // restricted as the most restricted.
+        let (fresh, held, stable_id) = unique
             .entry(key)
-            .and_modify(|fresh| *fresh &= candidate.fresh)
-            .or_insert(candidate.fresh);
-    }
-    if unique.len() > MAX_CANDIDATES {
-        tracing::warn!(
-            candidates = unique.len(),
-            "serving config: dropping candidates past the gateway cap"
-        );
+            .or_insert_with(|| (true, AdmissionState::NewAndExisting, candidate.stable_id.clone()));
+        *fresh &= candidate.fresh;
+        *held = (*held).max(admission);
+        if stable_id.is_none() {
+            stable_id.clone_from(&candidate.stable_id);
+        }
     }
     unique
-        .into_iter()
-        .take(MAX_CANDIDATES)
-        .map(|((_, site, name, cluster), fresh)| ServingCandidate {
-            kind: INFERENCE_MODEL,
-            name: name.to_owned(),
-            site: site.to_owned(),
-            cluster: cluster.to_owned(),
-            fresh,
-        })
+}
+
+/// Inference candidates within gateway limits, deduplicated and ordered.
+///
+/// Past the cap, candidates taking new requests are kept before the rest.
+fn candidates(overlay: &RoutingOverlay) -> Vec<ServingCandidate> {
+    if overlay.candidates.is_empty() {
+        return Vec::new();
+    }
+    // Local first so cold start, before any signal, prefers this site.
+    let unique = dedup(overlay.candidates.iter().chain(&overlay.excluded), &overlay.local_site);
+    let mut kept: Vec<_> = unique.into_iter().collect();
+    if kept.len() > MAX_CANDIDATES {
+        tracing::warn!(
+            candidates = kept.len(),
+            "serving config: dropping candidates past the gateway cap"
+        );
+        kept.sort_by_key(|(key, (_, admission, _))| (*admission != AdmissionState::NewAndExisting, *key));
+        kept.truncate(MAX_CANDIDATES);
+        kept.sort_by_key(|(key, _)| *key);
+    }
+    kept.into_iter()
+        .map(
+            |((_, site, name, cluster), (fresh, admission, stable_id))| ServingCandidate {
+                stable_id,
+                kind: INFERENCE_MODEL,
+                name: name.to_owned(),
+                site: site.to_owned(),
+                cluster: cluster.to_owned(),
+                fresh,
+                admission,
+            },
+        )
         .collect()
 }
 
-/// An inference candidate admitting new requests that the gateway will accept.
+/// An inference candidate the gateway will accept, whatever its admission.
+///
+/// A candidate not taking new requests stays in, so the gateway can tell a known
+/// down model, answered with 503, from an unknown one. Its site must be a DNS-1123
+/// label, as enrolled site names are: the gateway carries it in headers and ids.
 fn routable(candidate: &RoutingCandidate) -> bool {
     candidate.kind == INFERENCE_MODEL
-        && candidate
-            .admission_state
-            .is_none_or(|state| state == AdmissionState::NewAndExisting)
         && [&candidate.name, &candidate.site, &candidate.cluster]
             .into_iter()
             .all(|id| valid_id(id))
+        && certs::validate_site_name(&candidate.site).is_ok()
+}
+
+/// The candidate sites the serving config refuses for not being DNS-1123 labels.
+fn refused_sites(overlay: &RoutingOverlay) -> BTreeSet<String> {
+    overlay
+        .candidates
+        .iter()
+        .chain(&overlay.excluded)
+        .filter(|candidate| certs::validate_site_name(&candidate.site).is_err())
+        .map(|candidate| candidate.site.clone())
+        .collect()
+}
+
+/// The refused sites last seen per `GridNetwork`, keyed by network name.
+pub(crate) type RefusedSites = Mutex<HashMap<String, BTreeSet<String>>>;
+
+/// Warn when `network`'s set of refused sites changes, so an operator sees why a site never
+/// routes. Kept per network, so two networks do not flip each other's warning.
+pub(crate) fn warn_refused_sites(overlay: &RoutingOverlay, network: &str, last: &RefusedSites) {
+    let refused = refused_sites(overlay);
+    let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
+    if last.get(network) != Some(&refused) {
+        if !refused.is_empty() {
+            tracing::warn!(network, sites = ?refused, "serving config: refusing candidates whose site is not a DNS-1123 label");
+        }
+        last.insert(network.to_owned(), refused);
+    }
 }
 
 /// Non-blank and within the gateway's identifier bound.
@@ -245,13 +341,16 @@ fn remote_addrs<'member, Members>(
     members: Members,
     sites: &BTreeSet<&str>,
     local_site: &str,
+    include_all: bool,
 ) -> BTreeMap<String, String>
 where
     Members: IntoIterator<Item = (&'member str, &'member str)>,
 {
     members
         .into_iter()
-        .filter(|(site, _)| *site != local_site && sites.contains(site) && certs::validate_site_name(site).is_ok())
+        .filter(|(site, _)| {
+            *site != local_site && (include_all || sites.contains(site)) && certs::validate_site_name(site).is_ok()
+        })
         .filter_map(|(site, endpoint)| {
             let Some(parsed) = SignalsEndpoint::parse(endpoint).filter(SignalsEndpoint::is_dialable) else {
                 tracing::warn!(site, endpoint, "serving config: refusing advertised peer address");
@@ -347,6 +446,15 @@ pub(crate) fn decide_write(
     }
 }
 
+/// Withdrawals are safety-critical: do not let the ordinary write interval
+/// leave an older serving route active after Grid has computed no candidates.
+pub(crate) fn decide_empty_withdrawal(existing: Option<&str>, desired: &str) -> WriteDecision {
+    match existing {
+        Some(stored) if stored == desired => WriteDecision::Unchanged,
+        _ => WriteDecision::Write,
+    }
+}
+
 /// Last write time per `namespace/name`, for [`decide_write`].
 #[derive(Debug, Default)]
 pub(crate) struct WriteGate {
@@ -381,11 +489,18 @@ mod tests {
 
     /// No pins, as under SPIFFE trust.
     static NO_PINS: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    /// No authenticated provider gateway in this fixture.
+    static NO_PROVIDER_HOPS: BTreeSet<String> = BTreeSet::new();
+    /// No declared provider-hop identities in the default fixture.
+    static NO_PROVIDER_HOP_SNI: BTreeMap<String, String> = BTreeMap::new();
 
     const INPUTS: ServingInputs<'static> = ServingInputs {
+        provider_hop_clusters: &NO_PROVIDER_HOPS,
+        provider_hop_sni: &NO_PROVIDER_HOP_SNI,
         tls_mount: "/etc/praxis/tls",
         local_signals_addr: None,
         pins: &NO_PINS,
+        scrape_interval: Duration::from_secs(5),
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {
@@ -403,6 +518,7 @@ mod tests {
             network: "grid".to_owned(),
             local_site: "site-a".to_owned(),
             candidates,
+            excluded: Vec::new(),
             selection_policy: None,
             generated_at: None,
         }
@@ -424,6 +540,21 @@ mod tests {
     }
 
     #[test]
+    fn the_load_window_covers_the_oldest_a_sample_can_arrive_plus_a_poll() {
+        assert_eq!(
+            load_window_ms(Duration::from_secs(5)),
+            17_000,
+            "5s poll + 5s scrape + 2s timeout + 5s"
+        );
+        assert_eq!(load_window_ms(Duration::from_secs(1)), 13_000);
+        let oldest_arrival = PEER_INTERVAL_MS + 5_000 + PEER_TIMEOUT_MS;
+        assert!(
+            i64::try_from(oldest_arrival).unwrap_or(i64::MAX) < load_window_ms(Duration::from_secs(5)),
+            "a sample at the worst-case age is still fresh"
+        );
+    }
+
+    #[test]
     fn renders_the_contract_the_gateway_parses() {
         let members = [("site-b", "203.0.113.7:9091"), ("site-a", "198.51.100.1:9091")];
         let config = render(&two_site(), members, &INPUTS);
@@ -433,9 +564,16 @@ mod tests {
     #[test]
     fn empty_overlay_renders_authoritative_no_route_config() {
         let config = render(&overlay(Vec::new()), [("site-b", "203.0.113.7:9091")], &INPUTS);
-        assert!(config.candidates.is_empty());
-        assert!(config.peers.is_empty());
-        assert!(to_text(&config).expect("json").contains("\"candidates\": []"));
+        assert!(config.candidates.is_empty(), "the empty overlay withdraws every route");
+        assert_eq!(
+            peer_sites(&config),
+            [("site-b", "203.0.113.7:9091")],
+            "signals pollers remain ready for restoration"
+        );
+        assert!(
+            to_text(&config).expect("json").contains("\"candidates\": []"),
+            "the serialized revision carries an empty candidate list"
+        );
     }
 
     #[test]
@@ -461,18 +599,42 @@ mod tests {
     }
 
     #[test]
-    fn candidates_the_gateway_would_reject_or_never_admit_are_dropped() {
+    fn refused_sites_name_only_the_invalid_ones() {
+        let sites = refused_sites(&overlay(vec![
+            cand("llama", "site-a", "pool-a", None),
+            cand("llama", "site.b", "pool-b", None),
+        ]));
+        assert_eq!(sites, BTreeSet::from(["site.b".to_owned()]));
+    }
+
+    #[test]
+    fn refused_sites_are_kept_per_network() {
+        let last = RefusedSites::default();
+        let bad = overlay(vec![cand("llama", "site.b", "pool-b", None)]);
+        let good = overlay(vec![cand("llama", "site-a", "pool-a", None)]);
+        warn_refused_sites(&bad, "east", &last);
+        warn_refused_sites(&good, "west", &last);
+        let held = last.into_inner().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(held.get("east"), Some(&BTreeSet::from(["site.b".to_owned()])));
+        assert_eq!(
+            held.get("west"),
+            Some(&BTreeSet::new()),
+            "another network does not clear it"
+        );
+    }
+
+    #[test]
+    fn candidates_the_gateway_would_reject_are_dropped() {
         let cases = [
-            ("excluded", cand("llama", "site-b", "pool-b", Some("none"))),
-            (
-                "existing only",
-                cand("llama", "site-b", "pool-b", Some("existing_only")),
-            ),
             ("blank cluster", cand("llama", "site-b", " ", None)),
             (
                 "oversized name",
                 cand(&"m".repeat(MAX_NAME_LEN + 1), "site-b", "pool-b", None),
             ),
+            ("site with a dot", cand("llama", "site.b", "pool-b", None)),
+            ("site with a slash", cand("llama", "site/b", "pool-b", None)),
+            ("site with a quote", cand("llama", "site\"b", "pool-b", None)),
+            ("uppercase site", cand("llama", "Site-B", "pool-b", None)),
         ];
         for (label, bad) in cases {
             assert!(
@@ -485,6 +647,67 @@ mod tests {
         assert!(
             render(&overlay(vec![mcp]), [], &INPUTS).candidates.is_empty(),
             "mcp_tool"
+        );
+    }
+
+    #[test]
+    fn an_excluded_candidate_reaches_the_serving_config_but_not_the_overlay_wire() {
+        let mut source = overlay(vec![cand("llama", "site-a", "pool-a", None)]);
+        source.excluded = vec![cand("llama", "site-b", "pool-b", Some("none"))];
+        let rendered = render(&source, [], &INPUTS);
+        let config: serde_json::Value = serde_json::from_str(&to_text(&rendered).expect("text")).expect("json");
+        let pool_b = config["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .find(|c| c["cluster"] == "pool-b")
+            .expect("the excluded candidate is listed");
+        assert_eq!(pool_b["admission"], "none");
+        let wire = serde_json::to_string(&source).expect("overlay json");
+        assert!(!wire.contains("pool-b"), "the overlay wire is unchanged: {wire}");
+    }
+
+    #[test]
+    fn past_the_cap_candidates_taking_new_requests_are_kept_first() {
+        let excluded: Vec<_> = (0..MAX_CANDIDATES)
+            .map(|i| cand("llama", "site-a", &format!("down-{i:04}"), Some("none")))
+            .collect();
+        let mut source = overlay(vec![cand("llama", "site-z", "up", None)]);
+        source.excluded = excluded;
+        let rendered = render(&source, [], &INPUTS);
+        assert_eq!(rendered.candidates.len(), MAX_CANDIDATES);
+        assert!(
+            rendered.candidates.iter().any(|c| c.cluster == "up"),
+            "the one admitted candidate survives the cap"
+        );
+    }
+
+    #[test]
+    fn a_candidate_not_taking_new_requests_stays_in_with_its_admission() {
+        let rendered = render(
+            &overlay(vec![
+                cand("llama", "site-a", "pool-a", None),
+                cand("llama", "site-b", "pool-b", Some("none")),
+                cand("llama", "site-d", "pool-d", Some("existing_only")),
+            ]),
+            [],
+            &INPUTS,
+        );
+        let config: serde_json::Value = serde_json::from_str(&to_text(&rendered).expect("text")).expect("json");
+        let admission: Vec<(&str, Option<&str>)> = config["candidates"]
+            .as_array()
+            .expect("candidates")
+            .iter()
+            .map(|c| (c["site"].as_str().unwrap_or(""), c["admission"].as_str()))
+            .collect();
+        assert_eq!(
+            admission,
+            [
+                ("site-a", None),
+                ("site-b", Some("none")),
+                ("site-d", Some("existing_only"))
+            ],
+            "the default is omitted, so an older gateway still loads an all-admitted config"
         );
     }
 
@@ -516,8 +739,8 @@ mod tests {
         let bad_name = overlay(vec![cand("llama", "Site_B", "pool-b", None)]);
         let config = render(&bad_name, [("Site_B", "203.0.113.7:9091")], &INPUTS);
         assert!(
-            config.peers.is_empty(),
-            "a non-DNS site name would fail the gateway's SNI"
+            config.candidates.is_empty() && config.peers.is_empty(),
+            "a non-DNS site name is neither a candidate nor a peer"
         );
     }
 
@@ -548,6 +771,57 @@ mod tests {
     }
 
     #[test]
+    fn empty_candidate_revision_keeps_peer_pollers_for_restoration() {
+        let inputs = ServingInputs {
+            local_signals_addr: Some("grid-operator-signals.grid.svc:9091"),
+            ..INPUTS
+        };
+        let empty = render(&overlay(Vec::new()), [("site-b", "203.0.113.7:9091")], &inputs);
+        assert!(empty.candidates.is_empty());
+        assert_eq!(
+            peer_sites(&empty),
+            [
+                ("site-a", "grid-operator-signals.grid.svc:9091"),
+                ("site-b", "203.0.113.7:9091"),
+            ],
+            "no-route config retains metrics connections for route restoration"
+        );
+    }
+
+    #[test]
+    fn excluded_history_cannot_restore_an_authoritative_empty_revision() {
+        let mut withdrawn = overlay(Vec::new());
+        withdrawn
+            .excluded
+            .push(cand("llama", "site-b", "provider-b", Some("none")));
+        let config = render(&withdrawn, [], &INPUTS);
+        assert!(
+            config.candidates.is_empty(),
+            "an empty active overlay withdraws prior excluded history"
+        );
+    }
+
+    #[test]
+    fn authenticated_gateway_candidates_carry_overlay_id_and_mtls_allowlist() {
+        let mut candidate = cand("llama", "site-b", "provider-b", None);
+        candidate.stable_id = Some("257a9450".to_owned());
+        let hops = BTreeSet::from(["provider-b".to_owned()]);
+        let hop_sni = BTreeMap::from([("provider-b".to_owned(), "provider-b.example".to_owned())]);
+        let inputs = ServingInputs {
+            provider_hop_clusters: &hops,
+            provider_hop_sni: &hop_sni,
+            ..INPUTS
+        };
+        let config = render(&overlay(vec![candidate]), [], &inputs);
+        assert_eq!(config.provider_hop_clusters, ["provider-b"]);
+        assert_eq!(config.provider_hop_sni, hop_sni);
+        assert_eq!(config.candidates[0].stable_id.as_deref(), Some("257a9450"));
+        let json = to_text(&config).expect("JSON");
+        assert!(json.contains("\"provider_hop_clusters\": [\n    \"provider-b\""));
+        assert!(json.contains("\"stable_id\": \"257a9450\""));
+    }
+
+    #[test]
     fn a_stale_duplicate_wins_in_either_order() {
         let mut stale = cand("llama", "site-b", "pool-b", None);
         stale.fresh = false;
@@ -559,6 +833,24 @@ mod tests {
             let config = render(&overlay(pair.to_vec()), [], &INPUTS);
             assert_eq!(config.candidates.len(), 1, "{label}: one entry");
             assert!(!config.candidates[0].fresh, "{label}: stale");
+        }
+    }
+
+    #[test]
+    fn the_most_restricted_duplicate_wins_in_either_order() {
+        let excluded = cand("llama", "site-b", "pool-b", Some("none"));
+        let admitted = cand("llama", "site-b", "pool-b", Some("new_and_existing"));
+        for (label, pair) in [
+            ("excluded first", [excluded.clone(), admitted.clone()]),
+            ("excluded last", [admitted, excluded]),
+        ] {
+            let config = render(&overlay(pair.to_vec()), [], &INPUTS);
+            assert_eq!(config.candidates.len(), 1, "{label}: one entry");
+            assert_eq!(
+                config.candidates[0].admission,
+                AdmissionState::Excluded,
+                "{label}: one cluster, so a duplicate calling it unservable closes it"
+            );
         }
     }
 
@@ -705,6 +997,19 @@ mod tests {
         for (label, existing, last, want) in cases {
             assert_eq!(decide_write(existing, "a", last, now), want, "{label}");
         }
+    }
+
+    #[test]
+    fn empty_withdrawal_bypasses_write_spacing_but_not_content_equality() {
+        assert_eq!(
+            decide_empty_withdrawal(Some("empty"), "empty"),
+            WriteDecision::Unchanged
+        );
+        assert_eq!(
+            decide_empty_withdrawal(Some("old-route"), "empty"),
+            WriteDecision::Write
+        );
+        assert_eq!(decide_empty_withdrawal(None, "empty"), WriteDecision::Write);
     }
 
     #[test]
