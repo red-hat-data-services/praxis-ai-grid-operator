@@ -30,10 +30,6 @@ spec:
     value: deploy/gateway/Dockerfile.konflux
   - name: path-context
     value: .
-  - name: hermetic
-    value: "true"
-  - name: prefetch-input
-    value: '[{"type": "rpm", "path": "."}, {"type": "cargo", "path": "gateway"}]'
   - name: image-expires-after
     value: 30d
   - name: enable-slack-failure-notification
@@ -46,6 +42,8 @@ spec:
     value: "3.6.0"
   - name: hermetic
     value: true
+  - name: prefetch-input
+    value: '[{"type":"cargo","path":"gateway"},{"type":"rpm","path":"."}]'
 
   pipelineRef:
     params:
