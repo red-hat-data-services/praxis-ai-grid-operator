@@ -1,29 +1,30 @@
 # Konflux build for the AI Grid data-plane gateway (RHOAI onboarding, RHOAIENG-95092).
-# Mirrors deploy/gateway/Containerfile.ubi9. FROM images pinned to @sha256 for renovate.
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07ca5963a7 AS build
+# The single UBI build file for both ODH and RHOAI Konflux. FROM images pinned to
+# @sha256 inline, which is the only form renovate's dockerfile manager tracks.
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:866c52a4f649b2e027e0eafeede5f37dd13ac58ab63bbe2950d7928334312a4c AS build
 
-# openssl-devel/pkgconf: praxis-proxy (Pingora) links OpenSSL.
-RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        gcc gcc-c++ make cmake openssl-devel pkgconf-pkg-config \
+# openssl-devel/pkgconf: praxis-proxy (Pingora) links OpenSSL. rust/cargo come as RPMs
+# because rustup cannot be prefetched under hermetic mode. The prefetched repo exists
+# only there, so a build without it uses the system repos.
+RUN REPOS=/cachi2/output/deps/rpm/$(uname -m)/repos.d; \
+    [ -d "$REPOS" ] && SETOPT="--setopt=reposdir=$REPOS" || SETOPT=""; \
+    dnf install -y --nodocs --setopt=install_weak_deps=0 $SETOPT \
+        gcc gcc-c++ make cmake openssl-devel pkgconf-pkg-config rust cargo \
     && dnf clean all
-
-# Grid pins the toolchain in rust-toolchain.toml; --default-toolchain none lets the
-# first cargo invocation install exactly that pin. curl-minimal is already present.
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
 
 WORKDIR /src
 COPY . .
-# The gateway is its own workspace (gateway/Cargo.toml), not a root member.
-RUN cargo build --release --manifest-path gateway/Cargo.toml --bin grid-gateway \
-    && cp gateway/target/release/grid-gateway /usr/local/bin/grid-gateway
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:db10c80537d786068c7c911d7ef6ea103315d0615fa4b39b5946f7976563a8d7
+# The gateway is its own workspace, and its prefetched .cargo/config.toml holds the git
+# source replacement. Cargo finds that file from the working directory, not from
+# --manifest-path, so the build has to run from here or the git dependency is unresolvable.
+WORKDIR /src/gateway
+# --locked: under prefetch a build free to re-resolve can drift from what was fetched.
+# --ignore-rust-version: UBI ships 1.92, the manifests declare 1.96.
+RUN cargo build --release --locked --ignore-rust-version --bin grid-gateway \
+    && cp target/release/grid-gateway /usr/local/bin/grid-gateway
 
-RUN microdnf install -y --nodocs ca-certificates \
-    && microdnf clean all
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:d34666200b64d5a183c867487fd2f48ee8547eb18134e5647099970e26f08af9
 
 COPY --from=build --chmod=0555 /usr/local/bin/grid-gateway /usr/local/bin/grid-gateway
 
