@@ -25,5 +25,6 @@ trap 'rm -f -- "$LOCKFILE_TMP"' EXIT
 rpm-lockfile-prototype \
     --outfile "$LOCKFILE_TMP" \
     rpms.in.yaml
+sed -i '1i# Regenerate with ./scripts/generate-rpm-lockfile.sh.' "$LOCKFILE_TMP"
 chmod 0644 "$LOCKFILE_TMP"
 mv -- "$LOCKFILE_TMP" rpms.lock.yaml
