@@ -304,7 +304,9 @@ private_doc_tests = "allow"
 [package]
 name = "gateway"
 description = "Praxis-based grid data-plane gateway"
-version.workspace = true
+# Hermeto 0.62.0 cannot resolve an inherited version for the workspace root package.
+# Keep this in sync with workspace.package.version above until that is supported.
+version = "0.1.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

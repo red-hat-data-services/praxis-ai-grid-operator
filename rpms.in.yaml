@@ -1,0 +1,21 @@
+# Regenerate with ./scripts/generate-rpm-lockfile.sh.
+context:
+  containerfile:
+    file: deploy/gateway/Dockerfile.konflux
+    stageName: build
+packages:
+  - gcc
+  - gcc-c++
+  - make
+  - cmake
+  - openssl-devel
+  - pkgconf-pkg-config
+  - rust
+  - cargo
+installWeakDeps: false
+contentOrigin:
+  repofiles:
+    - ./ubi.repo
+arches:
+  - x86_64
+  - aarch64
