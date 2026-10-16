@@ -142,7 +142,7 @@ static RUN_CLUSTER_PREFIX: OnceLock<String> = OnceLock::new();
 /// combined-site demo. Both require the `peer_identity_trust`,
 /// `provider_route`, `credential_inject`, and `intelligent_route` filters
 /// which are built into the published Grid AI rollup.
-const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.6.0";
+const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/praxis-proxy/ai:0.7.0";
 
 /// Default local Grid Gateway image used by the full cross-site signal proof.
 const DEFAULT_GRID_GATEWAY_IMAGE: &str = "grid-gateway:llmd-pool-metrics-demo";
@@ -3107,7 +3107,7 @@ fn run_forge_stack(context: &DemoContext, cluster: &str, stack: &str) -> Result<
 /// In mTLS mode, additionally:
 /// - Swaps EPP deployment paths to the `-mtls` variants (with nginx sidecar)
 /// - Adds the metrics TLS proxy ConfigMap manifest step
-/// - Changes the metricsEndpoint to HTTPS :9443
+/// - Changes the metricsConfig.endpoint to HTTPS :9443
 /// - Adds the TLS Secret references to the InferenceProvider metricsConfig
 ///
 /// When `scoring_flavor` is `KvCachePressure`, additionally swaps both
@@ -3299,7 +3299,7 @@ fn materialize_config_with_images(
         );
         result = checked_replace(&result, rbac_step, &rbac_with_proxy, 2, "epp-rbac anchor")?;
 
-        // Change metricsEndpoint from HTTP :9090 to HTTPS :9443
+        // Change metricsConfig.endpoint from HTTP :9090 to HTTPS :9443
         result = checked_replace(
             &result,
             "http://llmd-epp-metrics.grid-system.svc.cluster.local:9090",
@@ -5488,11 +5488,11 @@ inference_pool_average_kv_cache_utilization{name="pool-a"} 0.35
         - type: manifest
           path: resources/pool-b/epp-deployment.yaml
 
-                  metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
+                  endpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
                     healthy: llm_d_epp_ready_endpoints
 
-                  metricsEndpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
+                  endpoint: \"http://llmd-epp-metrics.grid-system.svc.cluster.local:9090\"
                   signalNames:
                     healthy: llm_d_epp_ready_endpoints
 
