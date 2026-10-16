@@ -54,6 +54,8 @@ optional operational view. Neither component is required to understand the
 basic routing path. See the [architecture overview](docs/architecture/overview.md) for the
 controllers, trust lifecycle, signals, and deployment layouts.
 
+Konflux builds the RHOAI 3.6 operator, gateway, and enrollment images.
+
 ## Choose a starting point
 
 | Goal | Start here | What it creates or requires |
