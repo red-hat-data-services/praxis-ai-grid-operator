@@ -461,6 +461,35 @@ The operator's serving config ConfigMap for this gateway: grid-serving-<network>
 {{- end -}}
 {{- end }}
 
+{{/* Service annotations, the platform's merged under the Service's own. Only a LoadBalancer gets the platform's. */}}
+{{- define "praxis-gateway.serviceAnnotations" -}}
+{{- $svc := .Values.service -}}
+{{- $own := $svc.annotations | default dict -}}
+{{- $platform := dict -}}
+{{- $cloud := .Values.platform | default "" -}}
+{{- $internal := eq (.Values.loadBalancerScope | default "internal") "internal" -}}
+{{- if eq $svc.type "LoadBalancer" -}}
+{{- /* Each cloud reads only its own keys, so "any" carries all of them. */ -}}
+{{- if has $cloud (list "aws" "any") -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/aws-load-balancer-type" "nlb" -}}
+{{- /* Explicit false: the AWS Load Balancer Controller treats an absent annotation as internal. */ -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/aws-load-balancer-internal" (toString $internal) -}}
+{{- end -}}
+{{- if and $internal (has $cloud (list "azure" "any")) -}}
+{{- $_ := set $platform "service.beta.kubernetes.io/azure-load-balancer-internal" "true" -}}
+{{- end -}}
+{{- if and $internal (has $cloud (list "gcp" "any")) -}}
+{{- $_ := set $platform "networking.gke.io/load-balancer-type" "Internal" -}}
+{{- /* Sites sit in different regions, and a GCP internal load balancer serves only its own without this. */ -}}
+{{- $_ := set $platform "networking.gke.io/internal-load-balancer-allow-global-access" "true" -}}
+{{- end -}}
+{{- end -}}
+{{- $merged := merge (deepCopy $own) $platform -}}
+{{- if $merged }}
+{{- toYaml $merged }}
+{{- end }}
+{{- end -}}
+
 {{/*
 Listener port name: port.name when set, else https when the listener terminates TLS.
 */}}
