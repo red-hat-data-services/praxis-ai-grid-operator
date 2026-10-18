@@ -6,3 +6,6 @@ metrics:
     source: serviceCA
 networkPolicy:
   enabled: true
+# Every cloud's load balancer settings on every OpenShift install: each cloud reads only its
+# own keys, so no cloud detection is needed.
+platform: any
