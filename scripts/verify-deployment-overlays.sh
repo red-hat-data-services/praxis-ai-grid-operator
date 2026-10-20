@@ -38,4 +38,25 @@ for service in "grid-operator-swim UDP 7946" "grid-operator-signals TCP 9091"; d
   fi
 done
 
+# The namespace in params.env alone moves every namespaced object, every ServiceAccount
+# subject, and the ServiceMonitor's selector and TLS server name.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+cp -r deploy/overlays/openshift "$WORK/moved"
+# Written from the pristine source into the copy: BSD sed -i needs a suffix argument.
+sed 's/^namespace=.*/namespace=moved-ns/' deploy/overlays/openshift/params.env \
+  > "$WORK/moved/params.env"
+if ! kustomize build "$WORK/moved" | yq eval-all -o=json '[.]' | jq -e '
+  all(.[]; .metadata.namespace == null or .metadata.namespace == "moved-ns") and
+  all(.[] | (.subjects // [])[] | select(.kind == "ServiceAccount"); .namespace == "moved-ns") and
+  ([.[] | select(.kind == "ServiceMonitor")] | length == 1 and
+    (.[0] | .metadata.namespace == "moved-ns" and
+      .spec.namespaceSelector.matchNames == ["moved-ns"] and
+      .spec.endpoints[0].tlsConfig.serverName == "grid-operator-metrics.moved-ns.svc"))
+' > /dev/null; then
+  echo "FAIL: the namespace in params.env must move every object in the OpenShift render" >&2
+  exit 1
+fi
+
 echo "PASS: OpenShift Services request internal load balancers on AWS, Azure and GCP with separate UDP/TCP ports"
+echo "PASS: the namespace in params.env moves every object in the OpenShift render"

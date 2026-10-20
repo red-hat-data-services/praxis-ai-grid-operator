@@ -251,7 +251,36 @@ enrollment: {enabled: true, url: https://enroll.example.com}
 ```
 
 `grid.id` renders the GridNetwork, with site discovery on and its TLS Secrets pointed at
-the site identity, the grid CA, and `grid.swimKeySecretName`, plus this site's GridSite.
+the site identity, the grid CA, and `grid.swimKeySecretName`, plus this site's GridSite,
+labelled `grid.praxis.fast/provider-site`.
+
+Without `grid.id` or `enrollment.enabled`, the operator creates these records once the site
+has an identity. It names the site from its SPIFFE ID and creates its GridNetwork
+(`GRID_NETWORK`, default `grid`) and labelled GridSite, each once, only when missing, and
+never edits them. A release with `grid.id` or `enrollment.enabled` turns this off from its
+first install, so Helm never meets an operator-created record. Without an identity or
+`site.name` the operator idles, and a `site.name` that disagrees with the identity stops it.
+The GridNetwork's `LocalSiteDeclared` condition reports a missing local GridSite.
+
+Enabling `grid.id` or `enrollment.enabled` on a release that ran without either needs one
+step first. The operator already created the GridNetwork and GridSite, and they carry its
+`grid.praxis.fast/created-by` label rather than Helm's ownership metadata. Turning the
+operator's creation off does not transfer them, so the upgrade that starts rendering them
+fails on ownership. Adopt them before it, naming the release and the namespace it installs
+into:
+
+```bash
+for record in gridnetwork/<grid.network> gridsite/<site.name>; do
+  kubectl label "${record}" app.kubernetes.io/managed-by=Helm --overwrite
+  kubectl annotate "${record}" \
+    meta.helm.sh/release-name=<release> \
+    meta.helm.sh/release-namespace=<namespace> --overwrite
+done
+```
+
+The chart's upgrade test cannot cover this, because it pauses the operator and so never has
+an operator-created record to adopt.
+
 `site.name` and `grid.seeds` default `swim.siteName` and `swim.seeds`, which win when set,
 and `grid.signals: poll` serves signals on the SWIM Service. `grid.seeds` also takes one
 string separated by spaces or commas, as `swim.seeds` does. The CRs need the grid CRDs
