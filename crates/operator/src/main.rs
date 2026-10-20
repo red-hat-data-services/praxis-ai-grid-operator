@@ -102,7 +102,7 @@ async fn main() {
     // up front, before any reconciler builds a client.
     operator::init_process_crypto();
 
-    let config = Cli::parse();
+    let mut config = Cli::parse();
     version::get().log_startup("grid-operator");
 
     let client = match Client::try_default().await {
@@ -148,6 +148,32 @@ async fn main() {
             tracing::error!(%error, "site enrollment failed");
             std::process::exit(1);
         }
+    }
+    // The identity names the site, and without one the site idles.
+    let SiteIdentity {
+        at: identity,
+        present: has_identity,
+        name: site_name,
+    } = match site_from_identity(&client, &config).await {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::error!(%error, "invalid site identity or name");
+            std::process::exit(1);
+        },
+    };
+    config.swim.site_name = site_name;
+    let startup = SiteStartup::resolve(config.swim.site_name.is_some(), has_identity);
+    match startup {
+        SiteStartup::Idle => {
+            tracing::info!("no site identity or site name: idle until an admin creates or joins a grid");
+        },
+        SiteStartup::AwaitingIdentity => {
+            tracing::info!("site named but not yet identified: waiting for its identity");
+        },
+        SiteStartup::Identified => {},
+    }
+    if startup.creates_records() && config.grid.create_local_records {
+        Box::pin(create_local_records(&client, &config, identity)).await;
     }
     let GridModes {
         signal: signal_mode,
@@ -266,12 +292,26 @@ async fn main() {
         .map(|_joined| ())
     };
 
+    // Waiting exits once the identity appears, so the restart names the site from
+    // it and creates its records.
+    let identified = async {
+        if startup.waits_for_identity() {
+            identity_appears(&client, &config).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
     // Standing down wins, and dropping the work closes every connection pool
     // it owns. The listener drains while this waits, because both sides stay
     // polled until one of them finishes.
     let result = tokio::select! {
         biased;
         () = standing_down => Ok(()),
+        () = identified => {
+            // Exit 0 so the kubelet restarts the pod; its restart backoff still applies.
+            tracing::info!("restarting under the site identity's name");
+            return;
+        },
         result = serving => result,
     };
 
@@ -481,7 +521,9 @@ async fn maybe_start_swim(client: &Client, cli: &Cli) -> Result<Option<Arc<swim_
             return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
         },
     };
-    let site_name = swim_site_name(cli.swim.site_name.clone())?;
+    let Some(site_name) = cli.swim.site_name.clone() else {
+        return Ok(None);
+    };
     let (advertise_addr, lb_watch) = swim_advertise_addr(client, bind_addr).await?;
     if advertise_addr.unwrap_or(bind_addr).ip().is_unspecified() {
         return Err("refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR".to_owned());
@@ -1095,31 +1137,118 @@ fn parse_swim_key(hex: &str) -> Result<swim::crypto::SwimKey, &'static str> {
     Ok(key)
 }
 
-/// The SWIM site name, `configured` or else the hostname, refused unless it is a DNS label.
+/// What startup does about the site's name and its records.
 ///
-/// The name keys the revision-lease `ConfigMap` and the `GridSite`, so an empty or
-/// invalid one would leave SWIM off rather than fail.
-///
-/// # Errors
-///
-/// Returns the reason when the name is not a lowercase DNS label.
-fn swim_site_name(configured: Option<String>) -> Result<String, String> {
-    let name = configured.unwrap_or_else(hostname_or_default);
-    certs::validate_site_name(&name).map_err(|_invalid| {
-        format!(
-            "SWIM site name {name:?} is not a lowercase DNS label; set GRID_SWIM_SITE_NAME (swim.siteName or site.name)"
-        )
-    })?;
-    Ok(name)
+/// The identity names the site and the records need it, so a configured name
+/// alone is not enough to proceed: a named site still waits for its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiteStartup {
+    /// Neither a name nor an identity: nothing to do until an admin acts.
+    Idle,
+    /// Named, but the identity has not appeared yet.
+    AwaitingIdentity,
+    /// Identified, so the records this release owns can be created.
+    Identified,
 }
 
-/// Return the machine hostname or a safe fallback.
-fn hostname_or_default() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "grid-operator".to_owned())
+impl SiteStartup {
+    /// Decide from whether the site has a name and whether its identity is present.
+    const fn resolve(named: bool, has_identity: bool) -> Self {
+        match (named, has_identity) {
+            // The identity names the site, so being identified settles it either way.
+            (_, true) => Self::Identified,
+            (true, false) => Self::AwaitingIdentity,
+            (false, false) => Self::Idle,
+        }
+    }
+
+    /// Whether to poll for an identity and exit once one appears.
+    const fn waits_for_identity(self) -> bool {
+        !matches!(self, Self::Identified)
+    }
+
+    /// Whether the local records can be created now.
+    const fn creates_records(self) -> bool {
+        matches!(self, Self::Identified)
+    }
+}
+
+/// How often a site without an identity checks for one.
+const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Resolve once the site identity appears, warning once per distinct error.
+async fn identity_appears(client: &Client, config: &Cli) {
+    let mut last_error = None;
+    loop {
+        tokio::time::sleep(IDENTITY_POLL).await;
+        match site_from_identity(client, config).await {
+            Ok(SiteIdentity { present: true, .. }) => return,
+            Ok(_) => last_error = None,
+            Err(error) if last_error.as_ref() != Some(&error) => {
+                tracing::warn!(%error, "site identity present but unusable");
+                last_error = Some(error);
+            },
+            Err(_) => {},
+        }
+    }
+}
+
+/// Where the identity is, whether it exists, and the site name it gives.
+struct SiteIdentity {
+    /// The identity Secret.
+    at: operator::site_name::Identity,
+    /// Whether the Secret holds a certificate.
+    present: bool,
+    /// The site name, from the identity, else configured.
+    name: Option<String>,
+}
+
+/// Locate the identity and resolve the site name from it, else from configuration.
+async fn site_from_identity(client: &Client, config: &Cli) -> Result<SiteIdentity, String> {
+    let namespace = config
+        .grid
+        .identity_namespace
+        .clone()
+        .unwrap_or_else(|| client.default_namespace().to_owned());
+    let at = operator::site_name::locate(client, &namespace, &config.enrollment.identity_secret)
+        .await
+        .map_err(|e| e.to_string())?;
+    let pem = operator::site_name::identity_pem(client, &at)
+        .await
+        .map_err(|e| e.to_string())?;
+    let name = operator::site_name::resolve(pem.as_deref(), config.swim.site_name.as_deref())?;
+    Ok(SiteIdentity {
+        at,
+        present: pem.is_some(),
+        name,
+    })
+}
+
+/// Create this site's missing `GridNetwork` and `GridSite`, logging rather than failing startup.
+async fn create_local_records(client: &Client, config: &Cli, identity: operator::site_name::Identity) {
+    let Some(site) = config.swim.site_name.as_deref() else {
+        return;
+    };
+    let swim_key = operator::local_records::swim_key_beside(client, &identity, &config.grid.swim_key_secret)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "SWIM key Secret not readable; the GridNetwork names none");
+            None
+        });
+    let plan = operator::local_records::Plan {
+        network: config.grid.network.clone(),
+        site: site.to_owned(),
+        identity,
+        ca_secret: config.enrollment.ca_secret.clone(),
+        swim_key_secret: swim_key,
+        modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
+    };
+    match operator::local_records::ensure(client, client.default_namespace(), &plan).await {
+        Ok(outcome) => tracing::info!(?outcome, "local grid records checked"),
+        Err(error) => {
+            tracing::warn!(%error, "local grid records not created; retrying on the next start");
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2247,12 +2376,7 @@ async fn signals_identity(client: &Client) -> (Option<ServerTlsConfig>, Option<g
 
 /// The `GridNetwork` this operator serves, `None` when absent or unlistable.
 async fn sole_network(client: &Client) -> Option<GridNetwork> {
-    let networks: Api<GridNetwork> = Api::all(client.clone());
-    networks
-        .list(&kube::api::ListParams::default())
-        .await
-        .ok()
-        .and_then(|list| list.items.into_iter().next())
+    Box::pin(operator::site_name::sole_network(client)).await.ok().flatten()
 }
 
 /// TLS for the listener, or `None` when unconfigured or unreadable.
@@ -2855,14 +2979,6 @@ mod tests {
             0,
             "shutdown must not start a diagnostic request"
         );
-    }
-
-    #[test]
-    fn a_swim_site_name_must_be_a_dns_label() {
-        for bad in ["", " ", "East", "east_1", "-east"] {
-            assert!(swim_site_name(Some(bad.to_owned())).is_err(), "{bad:?} is refused");
-        }
-        assert_eq!(swim_site_name(Some("east-1".to_owned())), Ok("east-1".to_owned()));
     }
 
     /// A caller is scoped from its certificate, and nothing is trusted for
@@ -4264,6 +4380,73 @@ mod tests {
             }
         });
         Client::new(service, "default")
+    }
+
+    /// Startup's name and identity decision, over every combination.
+    mod site_startup {
+        use super::super::SiteStartup;
+
+        /// No name and no identity: idle, and still watching for an identity.
+        #[test]
+        fn unnamed_and_unidentified_idles_and_waits() {
+            let startup = SiteStartup::resolve(false, false);
+            assert_eq!(startup, SiteStartup::Idle);
+            assert!(
+                startup.waits_for_identity(),
+                "an idle site must notice an identity arriving"
+            );
+            assert!(!startup.creates_records(), "records need the identity");
+        }
+
+        /// Named but not yet identified: the gap that skipped both paths. The
+        /// records need the identity, so this site waits for it rather than
+        /// proceeding on the name alone.
+        #[test]
+        fn named_but_unidentified_waits_without_creating_records() {
+            let startup = SiteStartup::resolve(true, false);
+            assert_eq!(startup, SiteStartup::AwaitingIdentity);
+            assert!(
+                startup.waits_for_identity(),
+                "a named site must still wait for its identity"
+            );
+            assert!(!startup.creates_records(), "records need the identity");
+        }
+
+        /// Named and identified: create the records and stop watching.
+        #[test]
+        fn named_and_identified_creates_records_and_stops_waiting() {
+            let startup = SiteStartup::resolve(true, true);
+            assert_eq!(startup, SiteStartup::Identified);
+            assert!(
+                !startup.waits_for_identity(),
+                "an identified site has nothing to wait for"
+            );
+            assert!(startup.creates_records());
+        }
+
+        /// The identity names the site, so an identity without a configured name
+        /// is identified too.
+        #[test]
+        fn unnamed_but_identified_is_identified() {
+            let startup = SiteStartup::resolve(false, true);
+            assert_eq!(startup, SiteStartup::Identified);
+            assert!(!startup.waits_for_identity());
+            assert!(startup.creates_records());
+        }
+
+        /// Exactly one disposition creates records, and it is the only one that
+        /// stops waiting.
+        #[test]
+        fn creating_records_and_waiting_are_exclusive() {
+            for (named, has_identity) in [(false, false), (true, false), (true, true), (false, true)] {
+                let startup = SiteStartup::resolve(named, has_identity);
+                assert_ne!(
+                    startup.creates_records(),
+                    startup.waits_for_identity(),
+                    "named={named} has_identity={has_identity} must either create records or wait"
+                );
+            }
+        }
     }
 
     /// Real Kubernetes and mutual-TLS feedback proof for the isolated CI cluster.
