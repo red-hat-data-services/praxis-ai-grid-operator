@@ -2,7 +2,7 @@
 The data of the chart-rendered gateway ConfigMap, also hashed into checksum/config.
 */}}
 {{- define "praxis-gateway.gatewayConfigData" }}
-{{- $cfg := .Values.gatewayConfig }}
+{{- $cfg := .Values.praxisConfig.render }}
 {{- $provider := eq ($cfg.role | default "consumer") "provider" }}
 {{- $apiKey := and (not $provider) (eq ($cfg.auth.mode | default "none") "api-key") }}
 {{- $telemetry := $cfg.telemetry | default dict }}
@@ -11,9 +11,9 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
 {{- $hasBatchSize := and (hasKey $telemetry "batchSize") (ne $telemetry.batchSize nil) }}
 {{- $hasTelemetryValues := or $telemetry.otlpEndpoint $hasSamplingRate $telemetry.serviceName $telemetry.serviceVersion $telemetry.environment $hasBatchInterval $hasBatchSize }}
   praxis.yaml: |
-    {{- with $cfg.upstreamCA.secretName }}
+    {{- with $.Values.upstreamCA.secretName }}
     runtime:
-      upstream_ca_file: {{ printf "%s/%s" $cfg.upstreamCA.mountPath ($cfg.upstreamCA.key | default "ca.crt") | quote }}
+      upstream_ca_file: {{ printf "%s/%s" $.Values.upstreamCA.mountPath ($.Values.upstreamCA.key | default "ca.crt") | quote }}
     {{- end }}
     {{- if $telemetry.enabled }}
     telemetry:
@@ -51,10 +51,10 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
         {{- if $provider }}
         tls:
           certificates:
-            - cert_path: {{ printf "%s/tls.crt" .Values.tls.mountPath | quote }}
-              key_path: {{ printf "%s/tls.key" .Values.tls.mountPath | quote }}
+            - cert_path: {{ printf "%s/tls.crt" .Values.gridIdentity.mountPath | quote }}
+              key_path: {{ printf "%s/tls.key" .Values.gridIdentity.mountPath | quote }}
           client_ca:
-            ca_path: {{ printf "%s/ca.crt" .Values.tls.mountPath | quote }}
+            ca_path: {{ printf "%s/ca.crt" .Values.gridIdentity.mountPath | quote }}
           {{- if eq (($cfg.peerTrust).mode | default "pin") "spiffe" }}
           client_cert_mode: require_named
           {{- with ($cfg.peerTrust).spiffeIds }}
@@ -66,11 +66,11 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- else }}
           client_cert_mode: require
           {{- end }}
-        {{- else if $cfg.listenerTls.enabled }}
+        {{- else if $.Values.listenerTls.secretName }}
         tls:
           certificates:
-            - cert_path: {{ printf "%s/tls.crt" $cfg.listenerTls.mountPath | quote }}
-              key_path: {{ printf "%s/tls.key" $cfg.listenerTls.mountPath | quote }}
+            - cert_path: {{ printf "%s/tls.crt" $.Values.listenerTls.mountPath | quote }}
+              key_path: {{ printf "%s/tls.key" $.Values.listenerTls.mountPath | quote }}
         {{- end }}
         filter_chains: [main]
     {{- if $cfg.backends }}
@@ -124,7 +124,7 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           - filter: headers
             response_set:
               - name: X-Grid-Provider-Site
-                value: {{ $cfg.localSite | quote }}
+                value: {{ $.Values.grid.siteName | quote }}
           {{- else }}
           {{- if $apiKey }}
           - filter: policy
@@ -141,7 +141,7 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- end }}
           - filter: model_to_header
             header: X-Gateway-Model-Name
-          {{- if ($.Values.gridServing).enabled }}
+          {{- if ($.Values.praxisConfig.render.gridServing).enabled }}
           - filter: grid_site_route
             model_header: X-Gateway-Model-Name
             {{- with $cfg.backends }}
@@ -150,7 +150,7 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
               - {{ .cluster | quote }}
               {{- end }}
             {{- end }}
-            {{- with ($.Values.gridServing).siteRoute }}
+            {{- with ($.Values.praxisConfig.render.gridServing).siteRoute }}
             {{- with .availability }}
             availability:
               {{- toYaml . | nindent 14 }}
@@ -163,10 +163,10 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- else }}
           - filter: intelligent_route
             model_header: X-Gateway-Model-Name
-            local_site: {{ $cfg.localSite | quote }}
+            local_site: {{ $.Values.grid.siteName | quote }}
             candidates:
               {{- range $cfg.backends }}
-              - { kind: inference_model, name: {{ $cfg.model | quote }}, site: {{ .site | default $cfg.localSite | quote }}, cluster: {{ .cluster | quote }} }
+              - { kind: inference_model, name: {{ $cfg.model | quote }}, site: {{ .site | default $.Values.grid.siteName | quote }}, cluster: {{ .cluster | quote }} }
               {{- end }}
           {{- end }}
           {{- end }}
@@ -220,7 +220,7 @@ load_balancer, which selects by the same name and endpoint order.
 {{- $root := .root }}
 {{- $i := .i }}
 {{- $b := .b }}
-{{- $mode := ($b.transport).mode | default (ternary "mutual_tls" "plaintext" $root.Values.tls.enabled) }}
+{{- $mode := ($b.transport).mode | default (ternary "mutual_tls" "plaintext" (not (empty $root.Values.gridIdentity.tlsSecretName))) }}
 {{- $hc := $b.healthCheck | default dict }}
 {{- /* A mutual_tls backend is another site's gateway: bounded connects and a faster probe, since little traffic reaches it to trip the passive check. */}}
 {{- $peer := eq $mode "mutual_tls" }}
@@ -230,16 +230,16 @@ load_balancer, which selects by the same name and endpoint order.
 {{- $probeTimeout := $hc.timeoutMs | default 2000 | int }}
 {{- $probeInterval := $hc.intervalMs | default (max (ternary 3000 5000 $peer) (add $probeTimeout 1000)) | int }}
 {{- if ge $probeTimeout $probeInterval }}
-{{- fail (printf "gatewayConfig.backends: %s healthCheck.timeoutMs (%d) must be less than intervalMs (%d)" $b.cluster $probeTimeout $probeInterval) }}
+{{- fail (printf "praxisConfig.render.backends: %s healthCheck.timeoutMs (%d) must be less than intervalMs (%d)" $b.cluster $probeTimeout $probeInterval) }}
 {{- end }}
 - name: {{ $b.cluster | quote }}
   {{- if eq $mode "mutual_tls" }}
   tls:
     ca:
-      ca_path: {{ printf "%s/ca.crt" $root.Values.tls.mountPath | quote }}
+      ca_path: {{ printf "%s/ca.crt" $root.Values.gridIdentity.mountPath | quote }}
     client_cert:
-      cert_path: {{ printf "%s/tls.crt" $root.Values.tls.mountPath | quote }}
-      key_path: {{ printf "%s/tls.key" $root.Values.tls.mountPath | quote }}
+      cert_path: {{ printf "%s/tls.crt" $root.Values.gridIdentity.mountPath | quote }}
+      key_path: {{ printf "%s/tls.key" $root.Values.gridIdentity.mountPath | quote }}
     sni: {{ include "praxis-gateway.backendSni" $b | quote }}
     verify: true
   {{- else if eq $mode "tls" }}
