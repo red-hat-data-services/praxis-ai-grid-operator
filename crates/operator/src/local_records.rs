@@ -37,15 +37,15 @@ pub struct Plan {
     pub site: String,
     /// The identity Secret.
     pub identity: Identity,
-    /// The grid CA Secret beside it.
+    /// Name of the grid CA Secret in the identity's namespace.
     pub ca_secret: String,
-    /// The SWIM key Secret beside it, when it exists.
+    /// Name of the SWIM key Secret in the identity's namespace, when it exists.
     pub swim_key_secret: Option<String>,
     /// The modes the install starts in, declared so the network never contradicts them.
     pub modes: GridModes,
 }
 
-/// What [`ensure`] did.
+/// What [`create`] did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Outcome {
     /// The marker was already there, so nothing was checked.
@@ -105,22 +105,34 @@ pub fn grid_site(plan: &Plan, network: &str) -> GridSite {
 
 /// Create whichever of this site's records is missing, once.
 ///
-/// The marker goes first, so a crash leaves records missing rather than undoing an admin's
-/// delete. A failed create removes it again, so the next start retries.
+/// The SWIM key lookup precedes marker reservation. The marker precedes record creation,
+/// so a crash leaves records missing rather than undoing an admin's delete. A failed
+/// record create removes the marker again, so the next start retries.
 ///
 /// # Errors
 ///
 /// Returns the [`OperatorError`] of a read or create that fails other than by conflict.
-pub async fn ensure(client: &Client, namespace: &str, plan: &Plan) -> Result<Outcome, OperatorError> {
+pub async fn create(
+    client: &Client,
+    namespace: &str,
+    mut plan: Plan,
+    swim_key_secret_name: &str,
+) -> Result<Outcome, OperatorError> {
     let markers: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-    if !Box::pin(mark(&markers, plan)).await? {
+    if Box::pin(markers.get_opt(MARKER)).await?.is_some() {
         return Ok(Outcome::AlreadyCreated);
     }
-    let created = Box::pin(create_records(client, plan)).await;
-    if created.is_err()
-        && let Err(error) = Box::pin(markers.delete(MARKER, &DeleteParams::default())).await
-    {
-        tracing::warn!(%error, "local records marker not removed; delete {MARKER} to retry");
+    let swim_key_secret_future = swim_key_secret_for_identity(client, &plan.identity, swim_key_secret_name);
+    plan.swim_key_secret = Box::pin(swim_key_secret_future).await?;
+    if !Box::pin(mark(&markers, &plan)).await? {
+        return Ok(Outcome::AlreadyCreated);
+    }
+    let created = Box::pin(create_records(client, &plan)).await;
+    if created.is_err() {
+        let result = Box::pin(markers.delete(MARKER, &DeleteParams::default())).await;
+        if let Err(error) = result {
+            tracing::warn!(%error, "local records marker not removed; delete {MARKER} to retry");
+        }
     }
     created
 }
@@ -132,11 +144,11 @@ async fn create_records(client: &Client, plan: &Plan) -> Result<Outcome, Operato
         (found.metadata.name.unwrap_or_default(), false)
     } else {
         let api: Api<GridNetwork> = Api::all(client.clone());
-        let created = Box::pin(create(&api, &grid_network(plan)?)).await?;
+        let created = Box::pin(create_object(&api, &grid_network(plan)?)).await?;
         (plan.network.clone(), created)
     };
     let sites: Api<GridSite> = Api::all(client.clone());
-    let created_site = Box::pin(create(&sites, &grid_site(plan, &network))).await?;
+    let created_site = Box::pin(create_object(&sites, &grid_site(plan, &network))).await?;
     Ok(Outcome::Checked {
         network: created_network,
         site: created_site,
@@ -154,11 +166,11 @@ async fn mark(markers: &Api<ConfigMap>, plan: &Plan) -> Result<bool, OperatorErr
         data: Some(BTreeMap::from([("site".to_owned(), plan.site.clone())])),
         ..ConfigMap::default()
     };
-    create(markers, &marker).await
+    create_object(markers, &marker).await
 }
 
 /// Create `object`, `false` when one of its name already exists.
-async fn create<K>(api: &Api<K>, object: &K) -> Result<bool, OperatorError>
+async fn create_object<K>(api: &Api<K>, object: &K) -> Result<bool, OperatorError>
 where
     K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned + serde::Serialize + Send + Sync,
 {
@@ -176,12 +188,12 @@ fn created_by() -> BTreeMap<String, String> {
     BTreeMap::from([(CREATED_BY_LABEL.to_owned(), CREATED_BY.to_owned())])
 }
 
-/// The SWIM key Secret's name when it exists beside the identity.
+/// The SWIM key Secret's name when it exists in the identity's namespace.
 ///
 /// # Errors
 ///
 /// Returns [`OperatorError::Kube`] when reading the Secret fails.
-pub async fn swim_key_beside(
+pub async fn swim_key_secret_for_identity(
     client: &Client,
     identity: &Identity,
     name: &str,
@@ -195,76 +207,58 @@ pub async fn swim_key_beside(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::*;
-    use crate::crd::grid_network::{PeerTrustMode, SignalMode};
+    use kube::{Client, client::Body};
 
-    /// One scripted apiserver answer: method, path suffix, status code, body.
-    type Answer = (&'static str, &'static str, u16, serde_json::Value);
+    use crate::{
+        controller::grid_network::GridModes,
+        crd::grid_network::{PeerTrustMode, SignalMode},
+        local_records::{CREATED_BY_LABEL, MARKER, Outcome, Plan, create, grid_network, grid_site},
+        local_site::PROVIDER_SITE_LABEL,
+        site_name::Identity,
+    };
 
-    fn plan(swim_key: Option<&str>) -> Plan {
-        Plan {
-            network: "grid".to_owned(),
-            site: "hub".to_owned(),
-            identity: Identity {
-                namespace: "grid".to_owned(),
-                secret: "grid-site-identity".to_owned(),
-            },
-            ca_secret: "grid-ca".to_owned(),
-            swim_key_secret: swim_key.map(str::to_owned),
-            modes: GridModes::without_network(Some(SignalMode::Poll), Some(PeerTrustMode::Pin)),
-        }
+    #[tokio::test]
+    async fn a_failed_swim_key_read_reserves_no_marker_even_when_cleanup_is_unavailable() {
+        let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 500, status(500)),
+            ("DELETE", "/configmaps/grid-operator-local-records", 500, status(500)),
+        ]);
+        create(&client, "grid", plan(None), "grid-swim-key")
+            .await
+            .expect_err("a failed Secret read skips record creation");
+
+        let requests = seen.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 2, "only the marker and Secret are read");
+        assert!(
+            requests.get(1).is_some_and(|request| {
+                request.starts_with("GET ") && request.ends_with("/namespaces/grid/secrets/grid-swim-key")
+            }),
+            "the SWIM key Secret is read before reserving the marker"
+        );
+        assert!(!requested(&seen, "POST", "/configmaps"));
+        assert!(!requested(&seen, "DELETE", "/configmaps/grid-operator-local-records"));
+        assert!(!requested(&seen, "POST", "/gridnetworks"));
+        assert!(!requested(&seen, "POST", "/gridsites"));
     }
 
-    /// An apiserver answering from `script`, 404 otherwise, recording each request.
-    fn apiserver(script: Vec<Answer>) -> (Client, Arc<Mutex<Vec<String>>>) {
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let log = Arc::clone(&seen);
-        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
-            let (method, path) = (req.method().to_string(), req.uri().path().to_owned());
-            log.lock().expect("log").push(format!("{method} {path}"));
-            let (code, body) = script
-                .iter()
-                .find(|(m, suffix, ..)| *m == method && path.ends_with(suffix))
-                .map_or_else(|| (404, status(404)), |(.., code, body)| (*code, body.clone()));
-            async move {
-                Ok::<_, std::convert::Infallible>(
-                    http::Response::builder()
-                        .status(code)
-                        .body(kube::client::Body::from(serde_json::to_vec(&body).expect("body")))
-                        .expect("response"),
-                )
-            }
-        });
-        (Client::new(service, "grid"), seen)
-    }
+    #[tokio::test]
+    async fn a_missing_swim_key_still_creates_local_records() {
+        let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 404, status(404)),
+            ("POST", "/configmaps", 201, object("ConfigMap", MARKER)),
+            ("GET", "/gridnetworks", 200, networks(&serde_json::json!([]))),
+            ("POST", "/gridnetworks", 201, object("GridNetwork", "grid")),
+            ("POST", "/gridsites", 201, object("GridSite", "hub")),
+        ]);
+        create(&client, "grid", plan(None), "grid-swim-key")
+            .await
+            .expect("a missing Secret still allows record creation");
 
-    fn status(code: u16) -> serde_json::Value {
-        serde_json::json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": code })
-    }
-
-    fn networks(items: &serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetworkList", "metadata": {}, "items": items,
-        })
-    }
-
-    fn object(kind: &str, name: &str) -> serde_json::Value {
-        let api_version = if kind == "ConfigMap" {
-            "v1"
-        } else {
-            "grid.praxis.fast/v1alpha1"
-        };
-        serde_json::json!({
-            "apiVersion": api_version, "kind": kind, "metadata": { "name": name },
-            "spec": { "gridNetworkRef": "grid" },
-        })
-    }
-
-    fn requested(seen: &Arc<Mutex<Vec<String>>>, method: &str, suffix: &str) -> bool {
-        seen.lock()
-            .expect("log")
-            .iter()
-            .any(|r| r.starts_with(method) && r.ends_with(suffix))
+        assert!(requested(&seen, "POST", "/configmaps"));
+        assert!(requested(&seen, "POST", "/gridnetworks"));
+        assert!(requested(&seen, "POST", "/gridsites"));
     }
 
     #[test]
@@ -310,21 +304,68 @@ mod tests {
 
     #[tokio::test]
     async fn a_present_marker_writes_nothing_else() {
-        let (client, seen) = apiserver(vec![("POST", "/configmaps", 409, status(409))]);
-        let outcome = Box::pin(ensure(&client, "grid", &plan(None))).await.expect("ensure");
+        let (client, seen) = apiserver(vec![(
+            "GET",
+            "/configmaps/grid-operator-local-records",
+            200,
+            object("ConfigMap", MARKER),
+        )]);
+        let outcome = Box::pin(create(&client, "grid", plan(None), "grid-swim-key"))
+            .await
+            .expect("create");
         assert_eq!(outcome, Outcome::AlreadyCreated);
-        assert_eq!(seen.lock().expect("log").len(), 1, "only the marker write");
+        assert_eq!(seen.lock().expect("log").len(), 1, "only the existing marker is read");
+    }
+
+    #[tokio::test]
+    async fn a_failed_marker_read_creates_nothing() {
+        let (client, seen) = apiserver(vec![(
+            "GET",
+            "/configmaps/grid-operator-local-records",
+            500,
+            status(500),
+        )]);
+        create(&client, "grid", plan(None), "grid-swim-key")
+            .await
+            .expect_err("the marker read failed");
+        assert_eq!(seen.lock().expect("log").len(), 1, "only the marker read is attempted");
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_marker_reservation_skips_record_creation_and_cleanup() {
+        let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 404, status(404)),
+            ("POST", "/configmaps", 409, status(409)),
+        ]);
+        let outcome = create(&client, "grid", plan(None), "grid-swim-key")
+            .await
+            .expect("another instance reserved the marker");
+
+        assert_eq!(outcome, Outcome::AlreadyCreated);
+        assert_eq!(
+            seen.lock().expect("log").len(),
+            3,
+            "stop after the reservation conflict"
+        );
+        assert!(!requested(&seen, "DELETE", "/configmaps/grid-operator-local-records"));
+        assert!(!requested(&seen, "POST", "/gridnetworks"));
+        assert!(!requested(&seen, "POST", "/gridsites"));
     }
 
     #[tokio::test]
     async fn a_fresh_site_gets_both_records_after_the_marker() {
         let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 404, status(404)),
             ("POST", "/configmaps", 201, object("ConfigMap", MARKER)),
             ("GET", "/gridnetworks", 200, networks(&serde_json::json!([]))),
             ("POST", "/gridnetworks", 201, object("GridNetwork", "grid")),
             ("POST", "/gridsites", 201, object("GridSite", "hub")),
         ]);
-        let outcome = Box::pin(ensure(&client, "grid", &plan(None))).await.expect("ensure");
+        let outcome = Box::pin(create(&client, "grid", plan(None), "grid-swim-key"))
+            .await
+            .expect("create");
         assert_eq!(
             outcome,
             Outcome::Checked {
@@ -332,19 +373,33 @@ mod tests {
                 site: true
             }
         );
-        let first = seen.lock().expect("log").first().cloned().unwrap_or_default();
-        assert!(first.ends_with("/configmaps"), "the marker goes first, got {first}");
+        assert_eq!(
+            *seen.lock().expect("log"),
+            vec![
+                "GET /api/v1/namespaces/grid/configmaps/grid-operator-local-records",
+                "GET /api/v1/namespaces/grid/secrets/grid-swim-key",
+                "POST /api/v1/namespaces/grid/configmaps",
+                "GET /apis/grid.praxis.fast/v1alpha1/gridnetworks",
+                "POST /apis/grid.praxis.fast/v1alpha1/gridnetworks",
+                "POST /apis/grid.praxis.fast/v1alpha1/gridsites",
+            ],
+            "the Secret lookup precedes reservation, which precedes record creation"
+        );
     }
 
     #[tokio::test]
     async fn an_existing_network_is_used_and_an_existing_site_left_alone() {
         let existing = serde_json::json!([{ "metadata": { "name": "dagobah-local" }, "spec": {} }]);
         let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 404, status(404)),
             ("POST", "/configmaps", 201, object("ConfigMap", MARKER)),
             ("GET", "/gridnetworks", 200, networks(&existing)),
             ("POST", "/gridsites", 409, status(409)),
         ]);
-        let outcome = Box::pin(ensure(&client, "grid", &plan(None))).await.expect("ensure");
+        let outcome = Box::pin(create(&client, "grid", plan(None), "grid-swim-key"))
+            .await
+            .expect("create");
         assert_eq!(
             outcome,
             Outcome::Checked {
@@ -358,11 +413,13 @@ mod tests {
     #[tokio::test]
     async fn a_refused_network_create_is_an_error_and_no_site_follows() {
         let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 404, status(404)),
             ("POST", "/configmaps", 201, object("ConfigMap", MARKER)),
             ("GET", "/gridnetworks", 200, networks(&serde_json::json!([]))),
             ("POST", "/gridnetworks", 403, status(403)),
         ]);
-        ensure(&client, "grid", &plan(None))
+        create(&client, "grid", plan(None), "grid-swim-key")
             .await
             .expect_err("a 403 is not a conflict");
         assert!(!requested(&seen, "POST", "/gridsites"));
@@ -371,11 +428,13 @@ mod tests {
     #[tokio::test]
     async fn a_failed_create_removes_the_marker_so_the_next_start_retries() {
         let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 404, status(404)),
             ("POST", "/configmaps", 201, object("ConfigMap", MARKER)),
             ("GET", "/gridnetworks", 500, status(500)),
             ("DELETE", "/configmaps/grid-operator-local-records", 200, status(200)),
         ]);
-        Box::pin(ensure(&client, "grid", &plan(None)))
+        Box::pin(create(&client, "grid", plan(None), "grid-swim-key"))
             .await
             .expect_err("the list failed");
         assert!(requested(&seen, "DELETE", "/configmaps/grid-operator-local-records"));
@@ -383,10 +442,94 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_marker_write_creates_nothing() {
-        let (client, seen) = apiserver(vec![("POST", "/configmaps", 500, status(500))]);
-        ensure(&client, "grid", &plan(None))
+        let (client, seen) = apiserver(vec![
+            ("GET", "/configmaps/grid-operator-local-records", 404, status(404)),
+            ("GET", "/secrets/grid-swim-key", 404, status(404)),
+            ("POST", "/configmaps", 500, status(500)),
+        ]);
+        create(&client, "grid", plan(None), "grid-swim-key")
             .await
             .expect_err("the marker failed");
-        assert_eq!(seen.lock().expect("log").len(), 1);
+        assert_eq!(seen.lock().expect("log").len(), 3);
+        assert!(!requested(&seen, "DELETE", "/configmaps/grid-operator-local-records"));
+        assert!(!requested(&seen, "POST", "/gridnetworks"));
+        assert!(!requested(&seen, "POST", "/gridsites"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    /// Group request matching and response data for declarative API-server scripts.
+    type Answer = (&'static str, &'static str, u16, serde_json::Value);
+
+    fn plan(swim_key: Option<&str>) -> Plan {
+        Plan {
+            network: "grid".to_owned(),
+            site: "hub".to_owned(),
+            identity: Identity {
+                namespace: "grid".to_owned(),
+                secret: "grid-site-identity".to_owned(),
+            },
+            ca_secret: "grid-ca".to_owned(),
+            swim_key_secret: swim_key.map(str::to_owned),
+            modes: GridModes::without_network(Some(SignalMode::Poll), Some(PeerTrustMode::Pin)),
+        }
+    }
+
+    /// Record requests and reject unlisted routes so tests can assert expected calls.
+    fn apiserver(script: Vec<Answer>) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let service = tower::service_fn(move |req: http::Request<Body>| {
+            let (method, path) = (req.method().to_string(), req.uri().path().to_owned());
+            log.lock().expect("log").push(format!("{method} {path}"));
+            let (code, body) = script
+                .iter()
+                .find(|(m, suffix, ..)| *m == method && path.ends_with(suffix))
+                .map_or_else(
+                    || (404, serde_json::to_vec(&status(404)).expect("body")),
+                    |(.., code, body)| (*code, serde_json::to_vec(body).expect("body")),
+                );
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .body(Body::from(body))
+                        .expect("response"),
+                )
+            }
+        });
+        (Client::new(service, "client-default"), seen)
+    }
+
+    fn status(code: u16) -> serde_json::Value {
+        let reason = if code == 404 { "NotFound" } else { "" };
+        serde_json::json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": code, "reason": reason })
+    }
+
+    fn networks(items: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetworkList", "metadata": {}, "items": items,
+        })
+    }
+
+    fn object(kind: &str, name: &str) -> serde_json::Value {
+        let api_version = if kind == "ConfigMap" {
+            "v1"
+        } else {
+            "grid.praxis.fast/v1alpha1"
+        };
+        serde_json::json!({
+            "apiVersion": api_version, "kind": kind, "metadata": { "name": name },
+            "spec": { "gridNetworkRef": "grid" },
+        })
+    }
+
+    fn requested(seen: &Arc<Mutex<Vec<String>>>, method: &str, suffix: &str) -> bool {
+        seen.lock()
+            .expect("log")
+            .iter()
+            .any(|r| r.starts_with(method) && r.ends_with(suffix))
     }
 }

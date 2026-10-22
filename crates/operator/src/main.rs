@@ -83,7 +83,6 @@ use operator::{
     swim_endpoint::{SwimEndpoint, resolve_endpoint, resolve_endpoint_list_partial},
     swim_runtime::{self, RevisionLease, SwimConfig},
 };
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -173,24 +172,22 @@ async fn main() {
         SiteStartup::Identified => {},
     }
     if startup.creates_records() && config.grid.create_local_records {
-        Box::pin(create_local_records(&client, &config, identity)).await;
+        let result = Box::pin(create_local_records(&client, &config, identity)).await;
+        if let Err(error) = result {
+            tracing::error!(%error, "local grid records not created");
+            std::process::exit(1);
+        }
     }
-    let GridModes {
-        signal: signal_mode,
-        trust,
-    } = match resolve_grid_modes(
-        &client,
-        config.enrollment.enabled,
-        GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
-    )
-    .await
-    {
+    let install_modes = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
+    let modes = match resolve_grid_modes(&client, config.enrollment.enabled, install_modes).await {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
             std::process::exit(1);
         },
     };
+    let signal_mode = modes.signal;
+    let trust = modes.trust;
     // The loop follows the declared peer trust, which may change after startup.
     let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
     let mut rotation_running = false;
@@ -1276,31 +1273,27 @@ async fn site_from_identity(client: &Client, config: &Cli) -> Result<SiteIdentit
     })
 }
 
-/// Create this site's missing `GridNetwork` and `GridSite`, logging rather than failing startup.
-async fn create_local_records(client: &Client, config: &Cli, identity: operator::site_name::Identity) {
+/// Create this site's missing `GridNetwork` and `GridSite`, propagating lookup and creation errors.
+async fn create_local_records(
+    client: &Client,
+    config: &Cli,
+    identity: operator::site_name::Identity,
+) -> Result<(), OperatorError> {
     let Some(site) = config.swim.site_name.as_deref() else {
-        return;
+        return Ok(());
     };
-    let swim_key = operator::local_records::swim_key_beside(client, &identity, &config.grid.swim_key_secret)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "SWIM key Secret not readable; the GridNetwork names none");
-            None
-        });
     let plan = operator::local_records::Plan {
         network: config.grid.network.clone(),
         site: site.to_owned(),
         identity,
         ca_secret: config.enrollment.ca_secret.clone(),
-        swim_key_secret: swim_key,
+        swim_key_secret: None,
         modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
     };
-    match operator::local_records::ensure(client, client.default_namespace(), &plan).await {
-        Ok(outcome) => tracing::info!(?outcome, "local grid records checked"),
-        Err(error) => {
-            tracing::warn!(%error, "local grid records not created; retrying on the next start");
-        },
-    }
+    let outcome =
+        operator::local_records::create(client, client.default_namespace(), plan, &config.grid.swim_key_secret).await?;
+    tracing::info!(?outcome, "local grid records checked");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
