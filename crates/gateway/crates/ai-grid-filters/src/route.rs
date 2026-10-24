@@ -48,6 +48,37 @@ const SELECTED_CANDIDATE_HEADER: &str = "x-ai-routing-candidate";
 const PROVIDER_HOP_REQUEST_ID_HEADER: &str = "x-ai-routing-request-id";
 /// Internal request header carrying the serving overlay revision.
 const OVERLAY_REVISION_HEADER: &str = "x-ai-routing-revision";
+/// The caller's credentials, which never leave this site: another site authorizes the hop by
+/// its mutual TLS peer and candidate, so a caller's token would only leak.
+const CALLER_CREDENTIAL_HEADERS: [http::header::HeaderName; 10] = [
+    http::header::AUTHORIZATION,
+    http::header::PROXY_AUTHORIZATION,
+    http::header::COOKIE,
+    http::header::HeaderName::from_static("x-api-key"),
+    http::header::HeaderName::from_static("api-key"),
+    http::header::HeaderName::from_static("x-goog-api-key"),
+    http::header::HeaderName::from_static("ocp-apim-subscription-key"),
+    http::header::HeaderName::from_static("x-amz-security-token"),
+    http::header::HeaderName::from_static("x-auth-token"),
+    http::header::HeaderName::from_static("x-access-token"),
+];
+/// Query parameters that carry a caller's credential, stripped from a request that leaves this
+/// site for the same reason as the headers; every other parameter is kept as sent.
+const CALLER_CREDENTIAL_QUERY_PARAMS: [&str; 13] = [
+    "key",
+    "api_key",
+    "api-key",
+    "apikey",
+    "access_token",
+    "token",
+    "subscription-key",
+    "client_secret",
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-amz-credential",
+];
 /// Response header carrying the site selected by Grid.
 const ROUTE_SITE_HEADER: &str = "x-grid-site";
 /// Response header carrying the cluster selected by Grid.
@@ -72,6 +103,78 @@ fn route_decision(snapshot: &RouteSnapshot, earlier_selected: bool) -> RouteDeci
         RouteDecision::KeepEarlier
     } else {
         RouteDecision::Select
+    }
+}
+
+/// Request metadata `credential_inject` reads the selected credential from, as praxis-ai's
+/// `routing::metadata` names it.
+const CREDENTIAL_METADATA: [&str; 4] = [
+    "intelligent_route.credential.strategy",
+    "intelligent_route.credential.name",
+    "intelligent_route.credential.namespace",
+    "intelligent_route.credential.key",
+];
+
+/// `path_and_query` without the caller's credential parameters, or `None` when it carries none.
+///
+/// Names are matched percent-decoded and case-folded, as `url_rewrite` matches them; the
+/// remaining parameters keep their order and encoding.
+fn strip_credential_query(path_and_query: &str) -> Option<String> {
+    let (path, query) = path_and_query.split_once('?')?;
+    // Some backends split pairs on `;` as well as `&`, so both count as a separator.
+    let separator = |byte: char| byte == '&' || byte == ';';
+    let is_credential = |pair: &str| {
+        let name = pair.trim_end_matches(separator).split('=').next().unwrap_or_default();
+        let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
+        CALLER_CREDENTIAL_QUERY_PARAMS
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
+    };
+    if !query.split(separator).any(is_credential) {
+        return None;
+    }
+    let kept: String = query
+        .split_inclusive(separator)
+        .filter(|pair| !is_credential(pair))
+        .collect();
+    let kept = kept.trim_end_matches(separator);
+    Some(if kept.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{kept}")
+    })
+}
+
+/// The picked candidate's credentials: the caller's never leave this site, and a local
+/// candidate's own is selected where `credential_inject` reads it.
+fn write_credentials(ctx: &mut HttpFilterContext<'_>, candidate: &RouteCandidate, snapshot: &RouteSnapshot) {
+    for key in CREDENTIAL_METADATA {
+        ctx.filter_metadata.remove(key);
+    }
+    if candidate.site != snapshot.local_site || snapshot.provider_hop_clusters.contains(candidate.cluster.as_ref()) {
+        ctx.request_headers_to_remove.extend(CALLER_CREDENTIAL_HEADERS);
+        let sent = ctx.rewritten_path.as_deref().unwrap_or_else(|| {
+            ctx.request
+                .uri
+                .path_and_query()
+                .map_or("/", http::uri::PathAndQuery::as_str)
+        });
+        if let Some(stripped) = strip_credential_query(sent) {
+            ctx.rewritten_path = Some(stripped);
+        }
+        return;
+    }
+    let Some(credential) = candidate.credential.as_ref() else {
+        return;
+    };
+    let values = [
+        &credential.strategy,
+        &credential.secret_ref.name,
+        &credential.secret_ref.namespace,
+        &credential.secret_ref.key,
+    ];
+    for (key, value) in CREDENTIAL_METADATA.into_iter().zip(values) {
+        ctx.filter_metadata.insert(key.to_owned(), value.clone());
     }
 }
 
@@ -346,6 +449,7 @@ impl GridSiteRouteFilter {
         }
         ctx.cluster = Some(Arc::clone(&candidate.cluster));
         write_provider_context(ctx, candidate, snapshot)?;
+        write_credentials(ctx, candidate, snapshot);
         Ok(())
     }
 
@@ -368,6 +472,11 @@ impl GridSiteRouteFilter {
             Ok(pinned) => pinned,
             Err(answer) => return Ok(Some(answer)),
         };
+        // A pin names where the state lives; it does not exempt the request from shedding.
+        if let Some(model) = model.filter(|model| snapshot.shedding.contains(*model)) {
+            let turn = self.turn.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(refuse(Refused::Shed, model, turn)));
+        }
         let site = holder.as_ref().map(|holder| &holder.site);
         let candidate = match pinned_target(&snapshot, holder.as_ref(), model) {
             Target::Found(candidate) => candidate,
@@ -389,7 +498,9 @@ impl GridSiteRouteFilter {
         });
         ctx.cluster = Some(cluster);
         write_provider_context(ctx, candidate, &snapshot)?;
+        // The pinned path is rewritten first so a credential in its query is stripped too.
         ctx.rewritten_path = rewrite.or_else(|| ctx.rewritten_path.take());
+        write_credentials(ctx, candidate, &snapshot);
         // Ids are tagged in the body, so it must come back uncompressed.
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         Ok(Some(FilterAction::Continue))
@@ -702,7 +813,7 @@ fn pinned_site(
                 Err(FilterAction::Reject(Rejection::status(404)))
             },
             |pinned| {
-                let rewrite = pin::upstream_path(collection, &pinned.upstream, rest);
+                let rewrite = pin::upstream_path(collection, &pinned.upstream, rest, ctx.request.uri.query());
                 let holder = Holder {
                     site: Arc::from(pinned.site),
                     mark: Some(pinned.mark.to_owned()),
@@ -2368,5 +2479,52 @@ mod tests {
             Arc::default(),
             tuning,
         )
+    }
+    #[test]
+    fn a_credential_query_parameter_never_leaves_this_site() {
+        assert_eq!(
+            strip_credential_query("/v1/models?key=caller-secret&trace=1").as_deref(),
+            Some("/v1/models?trace=1"),
+            "the credential goes, the other parameter stays in place"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?trace=1&API_KEY=s&api%2Dkey=s&t=2").as_deref(),
+            Some("/v1/models?trace=1&t=2"),
+            "names match case-folded and percent-decoded"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?token=s").as_deref(),
+            Some("/v1/models"),
+            "a query left empty is dropped with its separator"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?limit=5"),
+            None,
+            "no credential, nothing rewritten"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models"),
+            None,
+            "no query, nothing rewritten"
+        );
+    }
+
+    #[test]
+    fn credential_query_names_match_across_separators_and_presigned_forms() {
+        assert_eq!(
+            strip_credential_query("/v1/models?a=1;key=s;b=2").as_deref(),
+            Some("/v1/models?a=1;b=2"),
+            "a semicolon separates pairs too, and the kept pairs keep their separator"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?X-Amz-Signature=s&X-Amz-Credential=c&v=1").as_deref(),
+            Some("/v1/models?v=1"),
+            "presigned-URL credentials are stripped"
+        );
+        assert_eq!(
+            strip_credential_query("/v1/models?client_secret=s;sig=x").as_deref(),
+            Some("/v1/models"),
+            "a query of only credentials is dropped whichever separator it used"
+        );
     }
 }
