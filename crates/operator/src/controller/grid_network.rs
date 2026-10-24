@@ -39,7 +39,7 @@ use crate::{
             ClusterEndpointConfig, ConsumerConfig, ConsumerConfigPhase, ConsumerConfigStatus, GatewayRef, GridNetwork,
             GridNetworkPhase, GridNetworkStatus, MountReconciliation, MountReconciliationPhase,
             MountReconciliationStatus, OverlayPhase, OverlayRevisionStatus, PeerTrustMode, SignalMode,
-            SiteIdentityStatus, TenantBudgetStatus, TransportMode,
+            SiteIdentityStatus, SiteRouter, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
         inference_provider::{InferenceProvider, InferenceProviderStatus},
@@ -47,7 +47,7 @@ use crate::{
     error::OperatorError,
     readiness,
     resources::{
-        consumer_config::{self, ConsumerConfigError},
+        consumer_config::{self, ConsumerConfigError, SiteRoutePrerequisite},
         derived_topology, gateway_mounts, overlay_envelope, provider_admission, provider_metrics, routing_overlay,
         secret,
         serving_config::{self, ServingInputs, WriteDecision, WriteGate},
@@ -2424,6 +2424,27 @@ async fn reconcile_routing_overlay_inner(
             );
         }
         withdraw_refused(&mut overlay, &refused);
+        let site_route = gw_ref
+            .praxis_config
+            .as_ref()
+            .filter(|cc| cc.generate && cc.site_router == SiteRouter::GridSiteRoute);
+        let hops = site_route.map_or(HopSource::Declared, |_| HopSource::Rendered(&cluster_endpoints));
+        if let Some(cc) = site_route
+            && let Some(missing) = site_route_unmet(gw_ref, cc, serving.is_some())
+        {
+            let error = OperatorError::ConsumerConfigRender(ConsumerConfigError::SiteRouteUnsupported(missing));
+            tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "consumer Praxis config not rendered");
+            consumer_statuses.push(consumer_config_status_error(gw_ref, cc, &error, observed_generation));
+            overlay_statuses.push(retained_overlay_status(
+                network,
+                gw_ref,
+                observed_generation,
+                None,
+                "SiteRouteUnsupported",
+                &missing.to_string(),
+            ));
+            continue;
+        }
         let render = match render_overlay_for_gateway(&overlay, network, gw_ref) {
             Ok(r) => r,
             Err(error) => {
@@ -2478,6 +2499,7 @@ async fn reconcile_routing_overlay_inner(
         // routing overlay. An empty overlay is published first so a mount or
         // config failure cannot retain a previously serving route.
         let mut delegated_mount_reconciled = false;
+        let mut awaiting_rollout = false;
         if !no_candidates
             && let Some(cc) = gw_ref
                 .praxis_config
@@ -2507,6 +2529,7 @@ async fn reconcile_routing_overlay_inner(
                     }
                     if let Some(status) = outcome.mount_status {
                         delegated_mount_reconciled = !status.applied_revision.is_empty();
+                        awaiting_rollout = status.phase == MountReconciliationPhase::WaitingForRollout;
                         mount_statuses.push(status);
                     }
                 },
@@ -2529,6 +2552,17 @@ async fn reconcile_routing_overlay_inner(
                 },
             }
             if !delegated_mount_reconciled {
+                // A serving file no pod has started on serves nothing, and the gateway cannot
+                // start, nor its rollout finish, without one, so a missing one is written now.
+                if let Some(source) = serving.filter(|_| awaiting_rollout) {
+                    let target = ServingTarget {
+                        gw_ref,
+                        hops,
+                        bootstrap: true,
+                    };
+                    let written = apply_serving_config(&overlay, source, network_name, target, client).await;
+                    fold_serving_write(&mut serving_retry, written, network_name, gw_ref);
+                }
                 overlay_statuses.push(retained_overlay_status(
                     network,
                     gw_ref,
@@ -2598,13 +2632,13 @@ async fn reconcile_routing_overlay_inner(
 
         // The embedded gateway watches valid serving revisions independently.
         if let Some(source) = serving {
-            match apply_serving_config(&overlay, source, network_name, gw_ref, client).await {
-                Ok(retry) => serving_retry = serving_retry.into_iter().chain(retry).min(),
-                Err(error) => {
-                    tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "serving config apply failed");
-                    serving_retry = serving_retry.into_iter().chain([SERVING_RETRY_REQUEUE]).min();
-                },
-            }
+            let target = ServingTarget {
+                gw_ref,
+                hops,
+                bootstrap: false,
+            };
+            let written = apply_serving_config(&overlay, source, network_name, target, client).await;
+            fold_serving_write(&mut serving_retry, written, network_name, gw_ref);
         }
 
         // Gateways with praxisConfig.generate=false get a Disabled entry.
@@ -2722,11 +2756,25 @@ fn serving_source<'ctx>(ctx: &'ctx OperatorCtx, providers: &[InferenceProvider])
     })
 }
 
+/// The first `grid_site_route` prerequisite this gateway does not meet.
+fn site_route_unmet(gw_ref: &GatewayRef, cc: &ConsumerConfig, polling: bool) -> Option<SiteRoutePrerequisite> {
+    if !polling {
+        Some(SiteRoutePrerequisite::PollTransport)
+    } else if !cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled) {
+        Some(SiteRoutePrerequisite::MountReconciliation)
+    } else if !gw_ref.provider_hop_endpoints.is_empty() {
+        Some(SiteRoutePrerequisite::DeclaredProviderHops)
+    } else {
+        None
+    }
+}
+
 /// Render the serving config text for one gateway, including authoritative no-route state.
 fn render_serving_text(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
     gw_ref: &GatewayRef,
+    hops: HopSource<'_>,
 ) -> Result<String, OperatorError> {
     let tls_mount = gw_ref
         .praxis_config
@@ -2734,7 +2782,7 @@ fn render_serving_text(
         .map_or(crate::crd::grid_network::DEFAULT_TLS_CERT_MOUNT_PATH, |cc| {
             cc.tls_cert_mount_path.as_str()
         });
-    let provider_hop_sni = serving_provider_hop_sni_for_overlay(overlay, gw_ref)?;
+    let provider_hop_sni = serving_hop_sni(overlay, gw_ref, hops)?;
     let provider_hop_clusters: BTreeSet<String> = provider_hop_sni.keys().cloned().collect();
     let heard = |site: &str, cluster: &str| source.load_heard.heard(site, cluster);
     let inputs = ServingInputs {
@@ -2747,8 +2795,34 @@ fn render_serving_text(
         peer_budget: source.settings.peer_budget,
         heard: &heard,
         quiet_local: &source.quiet_local,
+        inject_local_credentials: matches!(hops, HopSource::Rendered(_)),
     };
     serving_config::to_text(&serving_config::render(overlay, &inputs)).map_err(OperatorError::Json)
+}
+
+/// Where a gateway's serving config takes its provider hops from.
+#[derive(Clone, Copy)]
+enum HopSource<'endpoints> {
+    /// The declared `providerHopEndpoints`.
+    Declared,
+    /// The mutual TLS endpoints a generated `grid_site_route` config renders, so the gateway
+    /// can bind each one. Its local credentials ride along for the router to select.
+    Rendered(&'endpoints [ClusterEndpointConfig]),
+}
+
+/// The serving config's provider hops, each with the SNI its backend verifies.
+fn serving_hop_sni(
+    overlay: &routing_overlay::RoutingOverlay,
+    gw_ref: &GatewayRef,
+    hops: HopSource<'_>,
+) -> Result<BTreeMap<String, String>, OperatorError> {
+    match hops {
+        HopSource::Rendered(endpoints) if !overlay.candidates.is_empty() => {
+            consumer_config::provider_hops(endpoints).map_err(OperatorError::ConsumerConfigRender)
+        },
+        HopSource::Rendered(_) => Ok(BTreeMap::new()),
+        HopSource::Declared => serving_provider_hop_sni_for_overlay(overlay, gw_ref),
+    }
 }
 
 /// No candidate can receive hop context after an authoritative withdrawal.
@@ -2818,16 +2892,50 @@ fn serving_provider_hop_clusters(gw_ref: &GatewayRef) -> Result<BTreeSet<String>
     Ok(clusters)
 }
 
+/// One gateway's serving config write.
+#[derive(Clone, Copy)]
+struct ServingTarget<'target> {
+    /// The gateway it is written for.
+    gw_ref: &'target GatewayRef,
+    /// Where its provider hops come from.
+    hops: HopSource<'target>,
+    /// Write only a missing one, for a gateway whose first pod needs it to start.
+    bootstrap: bool,
+}
+
+/// Fold one serving write into the soonest retry, requeueing a failed one.
+fn fold_serving_write(
+    retry: &mut Option<Duration>,
+    written: Result<Option<Duration>, OperatorError>,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+) {
+    let next = written.unwrap_or_else(|error| {
+        tracing::warn!(network = network_name, gateway = %gw_ref.name, %error, "serving config apply failed");
+        Some(SERVING_RETRY_REQUEUE)
+    });
+    *retry = retry.iter().copied().chain(next).min();
+}
+
 /// Apply the serving config `ConfigMap` when changed, returning when to retry a deferred write.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the render, the write gate, and the apply are one serving write"
+)]
 async fn apply_serving_config(
     overlay: &routing_overlay::RoutingOverlay,
     source: &ServingSource<'_>,
     network_name: &str,
-    gw_ref: &GatewayRef,
+    target: ServingTarget<'_>,
     client: &Client,
 ) -> Result<Option<Duration>, OperatorError> {
+    let ServingTarget {
+        gw_ref,
+        hops,
+        bootstrap,
+    } = target;
     serving_config::warn_refused_sites(overlay, network_name, source.refused);
-    let text = render_serving_text(overlay, source, gw_ref)?;
+    let text = render_serving_text(overlay, source, gw_ref, hops)?;
     let name = serving_config::configmap_name(network_name, &gw_ref.name);
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
     let existing = api.get_opt(&name).await?;
@@ -2838,7 +2946,9 @@ async fn apply_serving_config(
         .map(String::as_str);
     let key = format!("{}/{name}", gw_ref.namespace);
     let now = Instant::now();
-    let decision = if overlay.candidates.is_empty() {
+    let decision = if bootstrap && existing.is_some() {
+        WriteDecision::Unchanged
+    } else if overlay.candidates.is_empty() {
         serving_config::decide_empty_withdrawal(stored, &text)
     } else {
         serving_config::decide_write(stored, &text, source.gate.last(&key), now)
@@ -3117,6 +3227,69 @@ const SECRET_RESOURCE_VERSIONS_ANNOTATION: &str = "grid.praxis-proxy.io/secret-r
 /// Reserved prefix for projected volume names owned by Grid.
 const GRID_MOUNT_PREFIX: &str = "grid-mount-";
 
+/// The 503 config a delegated gateway's first pod starts on.
+fn bootstrap_config_map(name: &str, cc: &ConsumerConfig, network_name: &str, gw_ref: &GatewayRef) -> ConfigMap {
+    consumer_config::build_consumer_config_map(
+        &consumer_config::bootstrap_praxis_config(cc.listener_port),
+        name,
+        &gw_ref.namespace,
+        network_name,
+        &gw_ref.name,
+    )
+}
+
+/// Create the bootstrap config, keeping one another writer created first.
+async fn create_bootstrap_config(
+    api: &Api<ConfigMap>,
+    name: &str,
+    cc: &ConsumerConfig,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+) -> Result<(), OperatorError> {
+    match api
+        .create(
+            &kube::api::PostParams::default(),
+            &bootstrap_config_map(name, cc, network_name, gw_ref),
+        )
+        .await
+    {
+        Ok(_) => info!(config_map = %name, "bootstrapped the gateway's first Praxis config"),
+        Err(kube::Error::Api(response)) if response.code == 409 => {},
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Replace a bootstrap left in the chart's own slot after the first flip, so a revert to that
+/// slot serves `config_yaml` rather than 503.
+async fn retire_bootstrap_slot(
+    api: &Api<ConfigMap>,
+    cc: &ConsumerConfig,
+    config_yaml: &str,
+    network_name: &str,
+    gw_ref: &GatewayRef,
+) -> Result<(), OperatorError> {
+    let base = &cc.config_map_name;
+    let bootstrap = bootstrap_config_map(base, cc, network_name, gw_ref);
+    if api
+        .get_opt(base)
+        .await?
+        .is_some_and(|current| current.data == bootstrap.data)
+    {
+        let cm = consumer_config::build_consumer_config_map(
+            config_yaml,
+            base,
+            &gw_ref.namespace,
+            network_name,
+            &gw_ref.name,
+        );
+        api.patch(base, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&cm))
+            .await?;
+        info!(config_map = %base, "replaced the retired bootstrap Praxis config");
+    }
+    Ok(())
+}
+
 /// A second, bounded config slot lets old and new Pod revisions retain their matching files.
 fn alternate_consumer_config_map_name(base: &str) -> String {
     let digest = gateway_mounts::config_revision(base);
@@ -3167,6 +3340,7 @@ async fn apply_consumer_config_for_gateway(
         cc.telemetry.as_ref(),
         cc.enable_projected_credentials,
         cc.mount_reconciliation.as_ref().is_some_and(|mounts| mounts.enabled),
+        cc.site_router,
     )?;
     if let Some(mounts) = cc.mount_reconciliation.as_ref().filter(|mounts| mounts.enabled) {
         let mut attempts = 0;
@@ -3828,7 +4002,13 @@ async fn reconcile_delegated_gateway(
         &gw_ref.name,
     );
     let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &gw_ref.namespace);
-    let active_config_current = Box::pin(config_map_current(&config_api, active_config_name, &active_cm)).await?;
+    let active = config_api.get_opt(active_config_name).await?;
+    if active.is_none() && !template_annotations.contains_key(CONFIG_REVISION_ANNOTATION) {
+        // Never staged, so no pod serves a config yet, and the first cannot start, nor the
+        // rollout finish, without one.
+        create_bootstrap_config(&config_api, active_config_name, cc, network_name, gw_ref).await?;
+    }
+    let active_config_current = active.is_some_and(|current| current.data == active_cm.data);
     let needs_revision_rollout = !additions.is_empty()
         || !mount_additions.is_empty()
         || !has_mount_revision
@@ -3993,6 +4173,9 @@ async fn reconcile_delegated_gateway(
         ));
     }
 
+    if active_config_name != cc.config_map_name {
+        retire_bootstrap_slot(&config_api, cc, &rendered.config_yaml, network_name, gw_ref).await?;
+    }
     Ok((
         mount_status(
             gw_ref,
@@ -5561,6 +5744,7 @@ pub(crate) fn consumer_config_status_disabled(
 /// `message` is derived from the `OperatorError` `Display` impl only.  That
 /// impl never includes credential token bytes; error messages describe
 /// structural failures (blank fields, JSON errors, Kubernetes API errors).
+#[expect(clippy::too_many_lines, reason = "one arm per status reason")]
 pub(crate) fn consumer_config_status_error(
     gw_ref: &GatewayRef,
     cc: &ConsumerConfig,
@@ -5578,6 +5762,7 @@ pub(crate) fn consumer_config_status_error(
         OperatorError::ConsumerConfigRender(ConsumerConfigError::ProjectedCredentialsUnsupported) => {
             "ProjectedCredentialsUnsupported"
         },
+        OperatorError::ConsumerConfigRender(ConsumerConfigError::SiteRouteUnsupported(_)) => "SiteRouteUnsupported",
         OperatorError::ConsumerConfigRender(_) => "PraxisConfigRenderFailed",
         OperatorError::MountReconciliation(failure) => failure.reason,
         OperatorError::Kube(_) => "PraxisConfigApplyFailed",
@@ -10172,6 +10357,119 @@ mod tests {
         );
     }
 
+    /// A delegated gateway generating config with `router`.
+    fn site_route_gateway(router: SiteRouter) -> GatewayRef {
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.praxis_config = Some(ConsumerConfig {
+            cluster_endpoints: vec![
+                typed_endpoint("prov-a", "a.example.invalid:8080"),
+                typed_endpoint("prov-b", "b.example.invalid:8080"),
+                typed_endpoint("prov-c", "c.example.invalid:8080"),
+            ],
+            mount_reconciliation: Some(
+                serde_json::from_value(json!({"enabled": true})).unwrap_or_else(|_| std::process::abort()),
+            ),
+            site_router: router,
+            ..make_consumer_config("praxis-consumer-config")
+        });
+        gw
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "each prerequisite is asserted in order")]
+    fn site_route_prerequisites_fail_closed() {
+        let gw = site_route_gateway(SiteRouter::GridSiteRoute);
+        let cc = gw.praxis_config.clone().unwrap_or_else(|| std::process::abort());
+        assert_eq!(site_route_unmet(&gw, &cc, true), None, "every prerequisite met");
+        assert_eq!(
+            site_route_unmet(&gw, &cc, false),
+            Some(SiteRoutePrerequisite::PollTransport),
+            "no serving config is written outside poll"
+        );
+        for mounts in [None, Some(json!({"enabled": false}))] {
+            let cc = ConsumerConfig {
+                mount_reconciliation: mounts
+                    .map(|value| serde_json::from_value(value).unwrap_or_else(|_| std::process::abort())),
+                ..cc.clone()
+            };
+            assert_eq!(
+                site_route_unmet(&gw, &cc, true),
+                Some(SiteRoutePrerequisite::MountReconciliation),
+                "without a rollout per revision the gateway never re-reads its hop backends"
+            );
+        }
+        let mut declared = gw;
+        declared.provider_hop_endpoints = vec![
+            serde_json::from_value(json!({
+                "cluster": "prov-b", "transport": {"mode": "mutual_tls", "sni": "site-b.grid.internal"}
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        ];
+        assert_eq!(
+            site_route_unmet(&declared, &cc, true),
+            Some(SiteRoutePrerequisite::DeclaredProviderHops)
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "derived, declared, and withdrawn hops share one fixture"
+    )]
+    fn site_route_serving_hops_are_the_rendered_mutual_tls_endpoints() {
+        let mtls = |cluster: &str, sni: &str| ClusterEndpointConfig {
+            cluster: cluster.to_owned(),
+            address: "203.0.113.20:8443".to_owned(),
+            transport: Some(crate::crd::grid_network::EndpointTransport {
+                mode: TransportMode::MutualTls,
+                sni: Some(sni.to_owned()),
+                ca_secret_ref: None,
+            }),
+        };
+        let endpoints = vec![
+            mtls("site-b", " site-b.grid.internal "),
+            typed_endpoint("prov-c", "c.example.invalid:8080"),
+        ];
+        let mut gw = make_gw_ref("inference-gw", "praxis-system");
+        gw.provider_hop_endpoints = vec![
+            serde_json::from_value(json!({
+                "cluster": "declared", "transport": {"mode": "mutual_tls", "sni": "declared.grid.internal"}
+            }))
+            .unwrap_or_else(|_| std::process::abort()),
+        ];
+        let overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![topology_candidate("site-b", "site-b")],
+            excluded: Vec::new(),
+            selection_policy: None,
+            generated_at: None,
+        };
+        let derived =
+            serving_hop_sni(&overlay, &gw, HopSource::Rendered(&endpoints)).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            derived.into_iter().collect::<Vec<_>>(),
+            [("site-b".to_owned(), "site-b.grid.internal".to_owned())],
+            "the hop is the rendered mTLS endpoint at its rendered SNI, never the hand list"
+        );
+        let declared = serving_hop_sni(&overlay, &gw, HopSource::Declared).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            declared.keys().collect::<Vec<_>>(),
+            ["declared"],
+            "intelligentRoute keeps the hand list"
+        );
+        let empty = routing_overlay::RoutingOverlay {
+            candidates: Vec::new(),
+            ..overlay
+        };
+        assert!(
+            serving_hop_sni(&empty, &gw, HopSource::Rendered(&endpoints))
+                .unwrap_or_else(|_| std::process::abort())
+                .is_empty(),
+            "no candidate receives hop context after an authoritative withdrawal"
+        );
+    }
+
     #[test]
     fn an_mcp_tool_candidate_is_never_withdrawn() {
         let mut gw = make_gw_ref("inference-gw", "praxis-system");
@@ -10365,6 +10663,7 @@ mod tests {
                 None,
                 false,
                 false,
+                cc.site_router,
             );
             assert!(render.is_ok(), "{live:?}: the render must succeed: {render:?}");
             let rendered = render.unwrap_or_else(|_| std::process::abort());

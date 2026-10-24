@@ -13,7 +13,9 @@ use crate::{
     resources::{
         geography::AdmissionState,
         overlay_envelope::hex_encode,
-        routing_overlay::{RoutingCandidate, RoutingOverlay, overlay_labels, scoped_configmap_name},
+        routing_overlay::{
+            ProjectedCredential, RoutingCandidate, RoutingOverlay, overlay_labels, scoped_configmap_name,
+        },
         tls_backend::sha256,
     },
     signals::SIGNALS_PATH,
@@ -139,6 +141,9 @@ pub(crate) struct ServingCandidate {
     /// operator has heard load for. Omitted when it does, as the gateway assumes when absent.
     #[serde(skip_serializing_if = "publishes")]
     pub(crate) publishes_load: bool,
+    /// A local candidate's credential locator, which `grid_site_route` selects for `credential_inject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) credential: Option<ProjectedCredential>,
 }
 
 /// Whether `publishes_load` is the default, which the gateway assumes when absent.
@@ -201,6 +206,8 @@ pub(crate) struct ServingInputs<'input> {
     pub(crate) heard: &'input (dyn Fn(&str, &str) -> bool + Sync),
     /// This site's provider clusters with no metrics to scrape.
     pub(crate) quiet_local: &'input BTreeSet<String>,
+    /// Whether the gateway's generated config injects the local credentials the router selects.
+    pub(crate) inject_local_credentials: bool,
 }
 
 /// Render for one gateway. Its only peer is the local operator, which relays
@@ -231,13 +238,25 @@ pub(crate) fn render(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Se
 /// A candidate's identity: remote after local, then site, name, cluster.
 type CandidateKey<'overlay> = (bool, &'overlay str, &'overlay str, &'overlay str);
 
-/// Each routable candidate once, with its freshness and admission.
+/// What the duplicates of one candidate fold into.
+struct Folded {
+    /// Fresh only if every duplicate is.
+    fresh: bool,
+    /// As restricted as the most restricted duplicate.
+    admission: AdmissionState,
+    /// The first identity any duplicate carries.
+    stable_id: Option<String>,
+    /// The first credential locator any duplicate carries.
+    credential: Option<ProjectedCredential>,
+}
+
+/// Each routable candidate once, folded.
 ///
 /// Any stale or more restricted duplicate marks the tuple, whatever the order.
 fn dedup<'overlay>(
     overlay: impl Iterator<Item = &'overlay RoutingCandidate>,
     local_site: &str,
-) -> BTreeMap<CandidateKey<'overlay>, (bool, AdmissionState, Option<String>)> {
+) -> BTreeMap<CandidateKey<'overlay>, Folded> {
     let mut unique = BTreeMap::new();
     for candidate in overlay.filter(|candidate| routable(candidate)) {
         let key = (
@@ -250,13 +269,19 @@ fn dedup<'overlay>(
         // Seeded with the identities of both folds, so the first candidate and every
         // duplicate after it take the same path: fresh only if all are, admission as
         // restricted as the most restricted.
-        let (fresh, held, stable_id) = unique
-            .entry(key)
-            .or_insert_with(|| (true, AdmissionState::NewAndExisting, candidate.stable_id.clone()));
-        *fresh &= candidate.fresh;
-        *held = (*held).max(admission);
-        if stable_id.is_none() {
-            stable_id.clone_from(&candidate.stable_id);
+        let folded = unique.entry(key).or_insert_with(|| Folded {
+            fresh: true,
+            admission: AdmissionState::NewAndExisting,
+            stable_id: None,
+            credential: None,
+        });
+        folded.fresh &= candidate.fresh;
+        folded.admission = folded.admission.max(admission);
+        if folded.stable_id.is_none() {
+            folded.stable_id.clone_from(&candidate.stable_id);
+        }
+        if folded.credential.is_none() {
+            folded.credential.clone_from(&candidate.credential);
         }
     }
     unique
@@ -277,23 +302,25 @@ fn candidates(overlay: &RoutingOverlay, inputs: &ServingInputs<'_>) -> Vec<Servi
             candidates = kept.len(),
             "serving config: dropping candidates past the gateway cap"
         );
-        kept.sort_by_key(|(key, (_, admission, _))| (*admission != AdmissionState::NewAndExisting, *key));
+        kept.sort_by_key(|(key, folded)| (folded.admission != AdmissionState::NewAndExisting, *key));
         kept.truncate(MAX_CANDIDATES);
         kept.sort_by_key(|(key, _)| *key);
     }
     kept.into_iter()
-        .map(
-            |((remote, site, name, cluster), (fresh, admission, stable_id))| ServingCandidate {
-                stable_id,
-                kind: INFERENCE_MODEL,
-                name: name.to_owned(),
-                site: site.to_owned(),
-                cluster: cluster.to_owned(),
-                fresh,
-                admission,
-                publishes_load: publishes_load(inputs, remote, site, cluster),
-            },
-        )
+        .map(|((remote, site, name, cluster), folded)| ServingCandidate {
+            stable_id: folded.stable_id,
+            kind: INFERENCE_MODEL,
+            name: name.to_owned(),
+            site: site.to_owned(),
+            cluster: cluster.to_owned(),
+            fresh: folded.fresh,
+            admission: folded.admission,
+            publishes_load: publishes_load(inputs, remote, site, cluster),
+            // Never on another site's cluster or a provider hop, so the secret stays on this site.
+            credential: folded.credential.filter(|_| {
+                inputs.inject_local_credentials && !remote && !inputs.provider_hop_clusters.contains(cluster)
+            }),
+        })
         .collect()
 }
 
@@ -493,6 +520,7 @@ mod tests {
         peer_budget: Duration::from_secs(10),
         heard: &|_, _| true,
         quiet_local: &NO_PROVIDER_HOPS,
+        inject_local_credentials: false,
     };
 
     fn cand(name: &str, site: &str, cluster: &str, admission: Option<&str>) -> RoutingCandidate {

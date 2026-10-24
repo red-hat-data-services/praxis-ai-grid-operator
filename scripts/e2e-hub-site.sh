@@ -10,6 +10,8 @@
 #
 # Env:
 #   MODES               peer trust modes to test (default "pin spiffe")
+#   HUB_ROUTER          hub gateway config: render (default), or operator, which serves the
+#                       operator's generated gridSiteRoute config under poll signals
 #   IMAGE_PREFIX        image repository prefix (default localhost/grid-)
 #   IMAGE_TAG           image tag (default e2e)
 #   SKIP_BUILD=1        use prebuilt <prefix>{operator,gateway,enrollment}:<tag> images
@@ -30,6 +32,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TOPO="$ROOT/tests/e2e/topologies/grid-hub-site"
 MODES=${MODES:-pin spiffe}
+HUB_ROUTER=${HUB_ROUTER:-render}
 IMAGE_PREFIX=${IMAGE_PREFIX:-localhost/grid-}
 IMAGE_TAG=${IMAGE_TAG:-e2e}
 CONTAINER_TOOL=${CONTAINER_TOOL:-docker}
@@ -180,14 +183,15 @@ plan_addresses() {
   SITE_SWIM_IP=$(ip_add "$site" 1)
   SITE_GW_IP=$(ip_add "$site" 2)
   SITE_SIG_IP=$(ip_add "$site" 3)
+  MODEL_LB_IP=$(ip_add "$site" 4)
   MODEL_IP=$(kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o jsonpath='{.spec.clusterIP}')
   [[ -n $MODEL_IP ]] || die "no vcr-inference-site Service on the site"
   # Two Services asking MetalLB for one address leaves the loser pending forever,
   # which surfaces as an unrelated deployment never going ready.
   local planned
   planned=$(printf '%s\n' "$ENROLL_IP" "$HUB_SWIM_IP" "$HUB_SIG_IP" \
-    "$SITE_SWIM_IP" "$SITE_SIG_IP" "$SITE_GW_IP")
-  [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 6 ]] \
+    "$SITE_SWIM_IP" "$SITE_SIG_IP" "$SITE_GW_IP" "$MODEL_LB_IP")
+  [[ $(printf '%s\n' "$planned" | sort -u | wc -l) -eq 7 ]] \
     || die "planned addresses are not distinct: $(printf '%s ' "$planned")"
   log "enrollment $ENROLL_IP, hub SWIM $HUB_SWIM_IP, hub signals $HUB_SIG_IP"
   log "site SWIM $SITE_SWIM_IP, site signals $SITE_SIG_IP, site gateway $SITE_GW_IP"
@@ -206,21 +210,79 @@ helm_on() {
 # renews: this leg asserts renewal, which only spiffe trust does.
 renews() { [[ $MODE == spiffe && -n ${ROTATION_LIFETIME:-} ]]; }
 
-# renewal_args <chart>: a short lifetime, signals polling, and a grid-admin for this leg.
+# site_route: the hub gateway serves the operator's generated gridSiteRoute config.
+site_route() { [[ $HUB_ROUTER == operator ]]; }
+
+# renewal_args <chart>: a short lifetime and a grid-admin for the renewal leg, and signals
+# polling for it and the site route leg.
 renewal_args() {
   RA=()
-  renews || return 0
-  case $1 in
-    grid-enrollment) RA=(--set "enrollment.certLifetimeSecs=$ROTATION_LIFETIME"
+  if renews && [[ $1 == grid-enrollment ]]; then
+    RA=(--set "enrollment.certLifetimeSecs=$ROTATION_LIFETIME"
       --set enrollment.gridAdmins.serviceAccount.create=true
       --set "enrollment.enrollmentAdmins.subjects[0].kind=ServiceAccount"
       --set "enrollment.enrollmentAdmins.subjects[0].name=grid-admin"
-      --set "enrollment.enrollmentAdmins.subjects[0].namespace=$ENS") ;;
+      --set "enrollment.enrollmentAdmins.subjects[0].namespace=$ENS")
+  fi
+  renews || site_route || return 0
+  case $1 in
     # grid.signals starts the operator in poll before its GridNetwork exists; without grid.id
     # the chart turns the signals listener on only when asked.
     grid-operator) RA=(--set grid.signals=poll --set signals.enabled=true) ;;
     grid-site) RA=(--set gridNetwork.signalTransport.mode=poll) ;;
   esac
+}
+
+# Test fixture: the site route leg's hub-local provider dials the site's model, which answers
+# only on a ClusterIP, through a LoadBalancer of its own.
+model_lb() {
+  kubectl --context "$SITE_CTX" -n model get service vcr-inference-site -o json \
+    | jq --arg ip "$MODEL_LB_IP" '{apiVersion: "v1", kind: "Service",
+        metadata: {name: "vcr-inference-hub-local", namespace: "model"},
+        spec: {type: "LoadBalancer", loadBalancerIP: $ip, selector: .spec.selector,
+          ports: [.spec.ports[] | {name, port, targetPort, protocol}]}}' \
+    | kubectl --context "$SITE_CTX" apply -f - >/dev/null || return 1
+  # The model admits only its own site's grid namespace; the hub reaches it over the kind network.
+  kubectl --context "$SITE_CTX" apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vcr-inference-allow-hub-local
+  namespace: model
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-vcr
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: ${MODEL_LB_IP%.*.*}.0.0/16
+      ports:
+        - protocol: TCP
+          port: 8000
+EOF
+}
+
+model_lb_ready() {
+  [[ $(kubectl --context "$SITE_CTX" -n model get service vcr-inference-hub-local \
+    -o jsonpath='{.status.loadBalancer.ingress[0].ip}') == "$MODEL_LB_IP" ]]
+}
+
+# site_route_providers <providers...>: the hub GridNetwork's generated gridSiteRoute config,
+# derived from these providers, and the hub-local provider beside the site's.
+site_route_providers() {
+  local i=0 provider
+  SR=(--set "gridNetwork.consumerGateways[0].praxisConfig.generate=true"
+    --set "gridNetwork.consumerGateways[0].praxisConfig.siteRouter=gridSiteRoute"
+    --set "gridNetwork.consumerGateways[0].praxisConfig.mountReconciliation.enabled=true"
+    --set "gridNetwork.consumerGateways[0].praxisConfig.mountReconciliation.deploymentName=grid-gateway"
+    --set "inferenceProviders.hub-local.endpoint=http://$MODEL_LB_IP:8000"
+    --set "inferenceProviders.hub-local.model=$MODEL")
+  for provider in "$@"; do
+    SR+=(--set "gridNetwork.consumerGateways[0].praxisConfig.deriveTopology.fromProviders[$i]=$provider")
+    i=$((i + 1))
+  done
 }
 
 # images <component>: this run's image for a chart, into IMG.
@@ -330,13 +392,24 @@ install_hub() {
     --set "peers.$SITE.address=$SITE_GW_IP:8080"
     --set gridNetwork.peerTrust.mode="$MODE" --set "gridNetwork.consumerGateways[0].name=grid-gateway"
     --set "gridNetwork.consumerGateways[0].namespace=$NS" --set "gridNetwork.consumerGateways[0].siteName=hub")
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" || die "install hub grid-site"
+  SR=()
+  site_route && site_route_providers vcr hub-local
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "install hub grid-site"
   images gateway
-  helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
-    --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
-    --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
-    --set praxisConfig.render.model="$MODEL" --set praxisConfig.render.auth.mode=none \
-    --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" || die "install hub grid-gateway"
+  if site_route; then
+    helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
+      --set fullnameOverride=grid-gateway --set praxisConfig.source=operator --set image.flavor=grid-gateway \
+      --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
+      --set praxisConfig.operator.gridServing.enabled=true --set mountReconciliation.enabled=true \
+      --set mountReconciliation.network=grid --set mountReconciliation.gatewayRef=grid-gateway \
+      --set "mountReconciliation.operator.namespace=$NS" "${IMG[@]}" || die "install hub grid-gateway"
+  else
+    helm_on "$HUB_CTX" "$NS" grid-gateway praxis-gateway \
+      --set fullnameOverride=grid-gateway --set praxisConfig.source=render --set grid.siteName=hub \
+      --set gridIdentity.tlsSecretName=grid-site-identity --set gridIdentity.caSecretName=grid-ca \
+      --set praxisConfig.render.model="$MODEL" --set praxisConfig.render.auth.mode=none \
+      --set "praxisConfig.render.backends.$SITE.endpoint=$SITE_GW_IP:8080" "${IMG[@]}" || die "install hub grid-gateway"
+  fi
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
     || die "hub not enrolled"
   HUB_DIGEST=$(leaf_digest "$HUB_CTX")
@@ -408,8 +481,9 @@ install_site() {
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
-  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" \
-    --set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")" || die "pin the site on the hub"
+  # Every later hub grid-site upgrade carries the site's digest: helm does not reuse the release's values.
+  HUB_SITE_ARGS+=(--set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")")
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "pin the site on the hub"
   snapshot_logs "$SITE_CTX" site || true
 }
 
@@ -535,8 +609,9 @@ enroll_rogue() {
       "https://$ENROLL_HOST:$ENROLL_PORT/v1alpha1/enrollments" | jq -er .certificate >"$d/rogue.crt"
 }
 
-consumer_served() {
-  local out="$WORK/consumer"
+# hub_chat <out prefix>: one chat completion through the hub gateway, succeeding on HTTP 200.
+hub_chat() {
+  local out=$1
   # A gateway rollout ends the port-forward's pod, so start another.
   if [[ -z $PF_PID ]] || ! kill -0 "$PF_PID" 2>/dev/null; then
     k "$HUB_CTX" port-forward service/grid-gateway 18080:8080 >"$WORK/pf.log" 2>&1 &
@@ -544,8 +619,22 @@ consumer_served() {
     sleep 2
   fi
   [[ $(chat_body | curl -sS -o "$out.body" -D "$out.hdr" -w '%{http_code}' --max-time 15 \
-    -H 'Content-Type: application/json' -d @- http://127.0.0.1:18080/v1/chat/completions) == 200 ]] \
-    && served "$out"
+    -H 'Content-Type: application/json' -d @- http://127.0.0.1:18080/v1/chat/completions) == 200 ]]
+}
+
+consumer_served() { hub_chat "$WORK/consumer" && served "$WORK/consumer"; }
+
+# local_served: a completion the hub served from its own hub-local model.
+local_served() {
+  hub_chat "$WORK/local" && grep -qi '^x-grid-site: hub' "$WORK/local.hdr" \
+    && jq -e '.choices | length > 0' "$WORK/local.body" >/dev/null
+}
+
+# stale_hop_dropped: the rolled pod started on a serving file naming the withdrawn site's hop,
+# which the operator rewrites only once the rollout is ready, and dropped it rather than exiting.
+stale_hop_dropped() {
+  k "$HUB_CTX" logs deployment/grid-gateway -c praxis 2>/dev/null \
+    | grep -q 'provider hops lack a matching verified TLS backend'
 }
 
 assert_serving() {
@@ -597,6 +686,70 @@ assert_serving() {
   else
     fail "enrolled identity the site does not trust: HTTP $code, curl exit $(cat "$WORK/rogue.rc") ($(tr '\n' ' ' <"$WORK/rogue.err" | cut -c1-200))"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Operator gridSiteRoute
+# ---------------------------------------------------------------------------
+
+# consumer_praxis: the praxis.yaml the operator generated for the hub gateway.
+consumer_praxis() {
+  local name
+  name=$(k "$HUB_CTX" get deployment grid-gateway -o json | jq -r '.spec.template.spec.volumes[]
+    | select(.configMap.name? // "" | test("consumer-config")) | .configMap.name' | head -1)
+  [[ -n $name ]] && k "$HUB_CTX" get configmap "$name" -o jsonpath='{.data.praxis\.yaml}'
+}
+
+# serving_json: the serving config the operator wrote for the hub gateway.
+serving_json() { k "$HUB_CTX" get configmap grid-serving-grid-grid-gateway -o jsonpath='{.data.serving-config\.json}'; }
+
+# routes_clusters <clusters...>: the generated config routes with grid_site_route over exactly these.
+routes_clusters() {
+  local yaml want
+  yaml=$(consumer_praxis) || return 1
+  grep -q 'filter: grid_site_route' <<<"$yaml" && ! grep -q intelligent_route <<<"$yaml" || return 1
+  want=$(printf '"%s", ' "$@")
+  grep -qF "clusters: [${want%, }]" <<<"$yaml"
+}
+
+# hop_clusters <clusters...>: the serving config's provider hops are exactly these.
+hop_clusters() {
+  serving_json | jq -e --argjson want "$(jq -cn '$ARGS.positional | sort' --args "$@")" \
+    '(.provider_hop_clusters // [] | sort) == $want'
+}
+
+# rolled_out: every replica runs the current template, which routes_clusters has already
+# shown mounts the generated config.
+rolled_out() {
+  k "$HUB_CTX" get deployment grid-gateway -o json | jq -e '.metadata.generation == .status.observedGeneration
+    and .status.replicas == .status.updatedReplicas and .status.updatedReplicas == .status.availableReplicas
+    and (.status.unavailableReplicas // 0) == 0'
+}
+
+assert_site_route() {
+  site_route || return 0
+  eventually "the operator renders the hub config with grid_site_route over both derived clusters" \
+    routes_clusters hub-local vcr || { consumer_praxis || true; }
+  eventually "the serving config's only provider hop is the site's mTLS cluster" hop_clusters vcr \
+    || { serving_json || true; }
+  eventually "the hub gateway rolled out on the generated config" rolled_out || true
+
+  # Withdraw the site's provider. The rollout runs on a praxis.yaml without it while the serving
+  # file still names its hop, which must not stop the new pod.
+  site_route_providers hub-local
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "withdraw vcr on the hub"
+  eventually "the withdrawn site leaves the generated config" routes_clusters hub-local || { consumer_praxis || true; }
+  eventually "the withdrawn site's hop leaves the serving config" hop_clusters || { serving_json || true; }
+  eventually "the gateway rolls out past the withdrawal" rolled_out || true
+  eventually "the rolled pod dropped the stale hop of the withdrawn site" stale_hop_dropped || true
+  eventually "the hub serves its local model with the site withdrawn" local_served || true
+
+  site_route_providers vcr hub-local
+  helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "restore vcr on the hub"
+  eventually "the restored site rejoins the generated config" routes_clusters hub-local vcr || true
+  eventually "the restored site's hop returns" hop_clusters vcr || true
+  eventually "the gateway rolls out past the restore" rolled_out || true
+  eventually "the hub gateway serves the site again after the restore" consumer_served || true
 }
 
 assert_health() {
@@ -696,12 +849,15 @@ watch_mtls() {
 # watch_hub_path: every 5s, a chat completion through the hub consumer gateway, which
 # calls the site gateway with the hub's client certificate. Three tries, as above.
 watch_hub_path() {
-  local pf="" code try out="$WORK/hubpath"
+  local pf="" code try out="$WORK/hubpath" tries=3
+  # A port-forward pins one pod. Under the site route leg the gateway rolls on every
+  # renewal, so allow a pod swap: Service traffic stays up, this tunnel does not.
+  site_route && tries=8
   # stop_monitors kills this subshell; take its port-forward with it.
   trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null; exit 0' TERM
   trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null' EXIT
   while :; do
-    for try in 1 2 3; do
+    for ((try = 1; try <= tries; try++)); do
       if [[ -z $pf ]] || ! kill -0 "$pf" 2>/dev/null; then
         k "$HUB_CTX" port-forward service/grid-gateway 18081:8080 >/dev/null 2>&1 &
         pf=$!
@@ -997,11 +1153,16 @@ cmd_test() {
   for m in $MODES; do
     case $m in pin | spiffe) ;; *) die "MODES entry $m is not pin or spiffe" ;; esac
   done
+  case $HUB_ROUTER in render | operator) ;; *) die "HUB_ROUTER $HUB_ROUTER is not render or operator" ;; esac
   for tool in kubectl helm jq openssl curl; do
     command -v "$tool" >/dev/null || die "$tool is required"
   done
   MODE=setup
   plan_addresses
+  if site_route; then
+    model_lb || die "expose the site model to the hub"
+    eventually "the site model answers on $MODEL_LB_IP" model_lb_ready || die "no address for the hub-local model"
+  fi
   for MODE in $MODES; do
     REFUSALS_FROM=""
     log "[$MODE] resetting the $NS namespace on both clusters"
@@ -1011,6 +1172,7 @@ cmd_test() {
     start_renewal_watch
     assert_membership
     assert_serving
+    assert_site_route
     assert_pin_no_renewal
     assert_renewal
     assert_health

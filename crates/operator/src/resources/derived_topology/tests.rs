@@ -967,18 +967,57 @@ fn an_mcp_tool_candidate_is_neither_resolved_nor_refused() {
 /// Contract fixture the gateway crate loads through Praxis.
 const DERIVED_RENDER_GOLDEN: &str = include_str!("../../../../gateway/tests/testdata/consumer-config-derived.yaml");
 
+/// The overlay envelope published for the same gateway, which the gateway
+/// crate builds together with [`DERIVED_RENDER_GOLDEN`].
+const DERIVED_OVERLAY_GOLDEN: &str = include_str!("../../../../gateway/tests/testdata/routing-overlay-derived.json");
+
+/// The providers both derived fixtures are rendered from.
+fn derived_providers() -> Vec<InferenceProvider> {
+    vec![
+        provider("prov-a", "https://model-a.models.svc:8443", None),
+        provider("prov-b", "https://model-b.models.svc:8443", None),
+    ]
+}
+
+/// The one site both derived fixtures place every candidate at.
+fn derived_sites() -> Vec<GridSite> {
+    vec![site("site-a", None)]
+}
+
+/// The routing overlay both derived fixtures are produced from, rendered the
+/// way the controller renders it so every candidate carries the admission
+/// state, locality tier and stable id that Praxis validates at load.
+fn derived_overlay() -> crate::resources::routing_overlay::RoutingOverlay {
+    let network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": "net" },
+        "spec": { "seeds": [] }
+    }))
+    .expect("network");
+    crate::resources::routing_overlay::render_routing_overlay(
+        &network,
+        &derived_sites(),
+        &derived_providers(),
+        &[],
+        &[],
+        "site-a",
+        None,
+        None,
+        &scoring::ScoringWeights::default(),
+    )
+    .expect("overlay")
+}
+
 #[test]
 #[expect(clippy::too_many_lines, reason = "the render takes every renderer input")]
 fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
-    let providers = vec![
-        provider("prov-a", "https://model-a.models.svc:8443", None),
-        provider("prov-b", "https://model-b.models.svc:8443", None),
-    ];
-    let sites = vec![site("site-a", None)];
-    let candidates = vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")];
+    let providers = derived_providers();
+    let sites = derived_sites();
+    let overlay = derived_overlay();
     let transport = declared(None, Some("models-ca"));
     let resolution = resolve(
-        &candidates,
+        &overlay.candidates,
         &[],
         &Declarations {
             transport: Some(&transport),
@@ -987,14 +1026,6 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
     );
     assert!(resolution.refused.is_empty(), "{:?}", resolution.refused);
     let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.values().map(|r| r.endpoint.clone()).collect();
-    let overlay = crate::resources::routing_overlay::RoutingOverlay {
-        network: "net".to_owned(),
-        local_site: "site-a".to_owned(),
-        candidates,
-        excluded: Vec::new(),
-        selection_policy: None,
-        generated_at: None,
-    };
     let rendered = crate::resources::consumer_config::render_consumer_config_with_projected(
         &overlay,
         "/run/secrets/grid-credentials",
@@ -1007,6 +1038,7 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
         None,
         false,
         false,
+        crate::crd::grid_network::SiteRouter::IntelligentRoute,
     )
     .expect("render");
     assert_eq!(rendered.config_yaml, DERIVED_RENDER_GOLDEN, "golden drifted");
@@ -1018,4 +1050,26 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
         (ca.secret.namespace.as_str(), ca.secret.name.as_str()),
         ("praxis-system", "models-ca")
     );
+}
+
+/// The envelope is pinned exactly as `build_overlay_configmap` serialises it,
+/// except for `producer_version`: provenance is evidence outside the semantic
+/// digest, and pinning the crate version would make every release bump drift
+/// the fixture.
+#[test]
+fn the_overlay_shipped_with_the_derived_render_matches_the_fixture_praxis_loads() {
+    let built = crate::resources::overlay_envelope::build_overlay_envelope(
+        &derived_overlay(),
+        "inference-gw",
+        "praxis-system",
+        "0f6c1b2e-5a3d-4c7e-9b1a-2d4f6e8a0c13",
+        1,
+        "2026-07-29T00:00:00Z",
+    )
+    .expect("envelope");
+    let mut envelope = built.envelope;
+    assert_eq!(envelope.provenance.producer_version, env!("CARGO_PKG_VERSION"));
+    envelope.provenance.producer_version = "fixture".to_owned();
+    let json = serde_json::to_string_pretty(&envelope).expect("serialise");
+    assert_eq!(json, DERIVED_OVERLAY_GOLDEN.trim_end(), "golden drifted");
 }

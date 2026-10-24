@@ -777,9 +777,11 @@ pub struct GatewayRef {
     pub site_name: Option<String>,
 
     /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
-    /// serving config. This allowlist is independent of `praxisConfig`, so a
-    /// missing or disabled generated Praxis config cannot alter embedded
-    /// serving behavior. Every entry must declare `mutual_tls` and a nonblank
+    /// serving config. With the default `praxisConfig.siteRouter`
+    /// `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
+    /// missing or disabled generated Praxis config cannot alter embedded serving
+    /// behavior. With `gridSiteRoute` the hops are the generated config's mutual
+    /// TLS endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
     /// SNI. The embedded gateway compares each declaration against the
     /// loaded Praxis load-balancer's verified mTLS backend before it sends
     /// provider-hop context. Changing Praxis backend transport requires a
@@ -792,10 +794,9 @@ pub struct GatewayRef {
     /// When absent or `generate: false`, this gateway behaves exactly as before:
     /// only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
     /// operator additionally renders a consumer Praxis `ConfigMap` containing the
-    /// inference-model `intelligent_route` candidates (with credential
-    /// `secretRef` data), a `credential_inject` section for credential-bearing
-    /// inference candidates, and a `load_balancer` section with one cluster
-    /// entry per unique inference cluster. Other capability kinds remain in the
+    /// routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+    /// a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+    /// one cluster entry per unique inference cluster. Other capability kinds remain in the
     /// routing overlay for dedicated data-plane pipelines.
     ///
     /// The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -810,7 +811,7 @@ pub struct GatewayRef {
 /// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
-/// inference-model `intelligent_route` candidates, `credential_inject` (when
+/// routing filter `siteRouter` selects, `credential_inject` (when
 /// credential-bearing inference candidates are present), and a `load_balancer`
 /// section.
 ///
@@ -935,6 +936,30 @@ pub struct ConsumerConfig {
     /// into this `ConfigMap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<GatewayTelemetryConfig>,
+
+    /// The filter that picks a candidate for each request.
+    ///
+    /// `gridSiteRoute` reads the serving config, so it needs the operator's
+    /// poll signal transport. It also needs an enabled `mountReconciliation`,
+    /// whose rollout per config revision re-reads the provider-hop backends,
+    /// and an empty `providerHopEndpoints`, since hops follow `clusterEndpoints`.
+    /// Every cluster is health-checked, so the gateway's readiness probe must
+    /// ask Praxis `/healthy`: `/ready` fails while any one site is down.
+    ///
+    /// Default: `intelligentRoute`.
+    #[serde(default)]
+    pub site_router: SiteRouter,
+}
+
+/// The filter an operator-generated consumer config routes with.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SiteRouter {
+    /// `intelligent_route` over the routing overlay.
+    #[default]
+    IntelligentRoute,
+    /// `grid_site_route` over the serving config.
+    GridSiteRoute,
 }
 
 /// Maximum batch interval accepted by Praxis telemetry configuration.
@@ -1068,6 +1093,7 @@ impl Default for ConsumerConfig {
             mount_reconciliation: None,
             listener_port: default_listener_port(),
             telemetry: None,
+            site_router: SiteRouter::IntelligentRoute,
         }
     }
 }
@@ -2262,6 +2288,34 @@ mod tests {
                 .any(|rule| rule.get("rule").and_then(serde_json::Value::as_str)
                     == Some("!has(self.transport) || self.transport.mode == 'tls'")),
             "a derived backend is server-authenticated TLS or plaintext by its scheme: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn grid_site_route_is_opt_in() {
+        let crd = crd_json();
+        let praxis = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties/praxisConfig")
+            .unwrap_or_else(|| std::process::abort());
+        let router = praxis
+            .pointer("/properties/siteRouter")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            router.get("default"),
+            Some(&serde_json::json!("intelligentRoute")),
+            "siteRouter defaults to intelligentRoute, so gridSiteRoute stays opt-in"
+        );
+        assert_eq!(
+            router.get("enum"),
+            Some(&serde_json::json!(["intelligentRoute", "gridSiteRoute"])),
+            "siteRouter admits exactly the two routers"
+        );
+        let parsed: ConsumerConfig =
+            serde_json::from_value(serde_json::json!({"generate": true})).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            parsed.site_router,
+            SiteRouter::IntelligentRoute,
+            "an existing gateway keeps its router"
         );
     }
 
