@@ -47,9 +47,13 @@ fn add_metrics_config_legacy_fields(schema: &mut schemars::Schema) {
     status = "InferenceProviderStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Provider","type":"string","jsonPath":".spec.providerKind"}"#,
-    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
+    printcolumn = r#"{"name":"Available","type":"string","jsonPath":".status.conditions[?(@.type==\"Available\")].status"}"#,
+    printcolumn = r#"{"name":"Progressing","type":"string","jsonPath":".status.conditions[?(@.type==\"Progressing\")].status"}"#,
+    printcolumn = r#"{"name":"Degraded","type":"string","jsonPath":".status.conditions[?(@.type==\"Degraded\")].status"}"#,
+    printcolumn = r#"{"name":"Since","type":"date","jsonPath":".status.conditions[?(@.type==\"Available\")].lastTransitionTime"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#,
-    printcolumn = r#"{"name":"Reason","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].reason","priority":1}"#,
+    printcolumn = r#"{"name":"Message","type":"string","jsonPath":".status.conditions[?(@.type==\"Available\")].message","priority":1}"#,
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status","priority":1}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -110,8 +114,8 @@ pub struct InferenceProviderSpec {
     ///
     /// When set, the operator polls the backend on a fixed cadence and holds
     /// the served-model set in memory, expiring it when polls stop succeeding.
-    /// Discovery does not yet affect routing or gossip; `spec.models` remains
-    /// the routing source.
+    /// Until route and provider-record formats support inventory expiry,
+    /// discovered names are withheld and do not fall back to `spec.models`.
     /// When absent, no discovery runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_discovery: Option<ModelDiscoveryConfig>,
@@ -675,6 +679,13 @@ pub struct InferenceProviderStatus {
     #[schemars(extend("format" = "date-time"))]
     pub served_models_expires_at: Option<String>,
 
+    /// Provider generation that produced the corresponding `servedModels` set.
+    ///
+    /// Readers must require this value to equal `metadata.generation`; a spec
+    /// change invalidates the inventory until discovery succeeds again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_models_observed_generation: Option<i64>,
+
     /// Effective model-listing URL when discovery is configured.
     ///
     /// This is the requested URL, not an indication that polling succeeded.
@@ -708,8 +719,8 @@ pub struct InferenceProviderStatus {
 
 impl InferenceProviderStatus {
     /// Compare the fields written by provider reconciliation, excluding the
-    /// discovery poller's fields (error, served models, and their expiry) and
-    /// the signals loop's conditions.
+    /// discovery poller's fields (error, served models, expiry, and observed
+    /// generation) and the signals loop's conditions.
     pub(crate) fn matches_reconciler_status(&self, desired: &Self) -> bool {
         self.matching_sites == desired.matching_sites
             && self.model_discovery_url == desired.model_discovery_url

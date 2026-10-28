@@ -42,7 +42,7 @@ use crate::{
             SiteIdentityStatus, SiteRouter, TenantBudgetStatus, TransportMode,
         },
         grid_site::{GridSite, GridSitePhase, GridSiteStatus},
-        inference_provider::{InferenceProvider, InferenceProviderStatus},
+        inference_provider::{Condition, InferenceProvider, InferenceProviderStatus},
     },
     error::OperatorError,
     readiness,
@@ -54,7 +54,7 @@ use crate::{
         tls_backend::ServerTlsConfig,
         trust_bundle::{self, CertPemStatus},
     },
-    served_models, signals,
+    rollup, served_models, signals,
     swim::{MemberStatus, MembershipSnapshot},
     swim_endpoint::{SeedResolution, resolve_endpoint_list_partial},
     swim_runtime::SwimHandle,
@@ -511,7 +511,8 @@ fn site_signals_ttl() -> Duration {
     Duration::from_secs(secs.max(1))
 }
 
-/// Scrape this site's providers once and publish the coarse signals observed.
+/// Scrape this site's providers once, write their readiness conditions, and, in Poll mode,
+/// publish the coarse signals observed.
 ///
 /// Called from its own loop rather than from reconcile. Reconcile runs on an
 /// interval sized for declarations, two orders of magnitude slower than these
@@ -522,25 +523,21 @@ fn site_signals_ttl() -> Duration {
 ///
 /// Returns [`OperatorError`] when providers or sites cannot be listed.
 pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &str) -> Result<(), OperatorError> {
-    let publisher = ctx.swim().map(Arc::as_ref);
+    // Under gossip, load travels the CRDT path, so this pass only judges readiness.
+    let polling = ctx.signal_mode == SignalMode::Poll;
+    let publisher = ctx.swim().filter(|_| polling).map(Arc::as_ref);
     let Some(_pass) = signal_pass(ctx, network_name, publisher) else {
         return Ok(());
     };
     let collected_at = Instant::now();
     let providers = list_all_inference_providers(client).await?;
-    ctx.signals.set_access(signal_access(&providers));
-    Box::pin(register_peers(ctx, client)).await?;
-    let scrape_started = Instant::now();
-    Box::pin(provider_metrics::collect_provider_signals(
-        network_name,
-        &providers,
-        Some(client),
-        &ctx.readiness,
-    ))
-    .await;
-    ctx.record_scrape_pass(network_name, scrape_started.elapsed());
+    if polling {
+        ctx.signals.set_access(signal_access(&providers));
+        Box::pin(register_peers(ctx, client)).await?;
+    }
+    Box::pin(scrape_providers(ctx, client, &providers, network_name)).await;
     let mut collected = resolve_readiness(ctx, client, &providers, network_name);
-    if !ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
+    if polling && !ctx.signal_fenced.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(swim) = publisher {
             let Some((epoch, sequence)) = publication_order(ctx, client, swim).await? else {
                 return Ok(());
@@ -550,6 +547,19 @@ pub async fn refresh_signals(ctx: &OperatorCtx, client: &Client, network_name: &
         publish_signals(ctx, collected, collected_at);
     }
     Ok(())
+}
+
+/// Scrape `providers` once into the readiness store and record how long the pass took.
+async fn scrape_providers(ctx: &OperatorCtx, client: &Client, providers: &[InferenceProvider], network_name: &str) {
+    let scrape_started = Instant::now();
+    Box::pin(provider_metrics::collect_provider_signals(
+        network_name,
+        providers,
+        Some(client),
+        &ctx.readiness,
+    ))
+    .await;
+    ctx.record_scrape_pass(network_name, scrape_started.elapsed());
 }
 
 /// Serialize collection and bind ordered publication to one network.
@@ -722,7 +732,7 @@ fn readiness_entry<'provider>(
             identity,
             verdict: readiness::Verdict {
                 reason: readiness::Reason::MetricsNotConfigured,
-                message: "no metricsConfig endpoint to read readiness from".to_owned(),
+                message: "metrics.endpoint is not set".to_owned(),
             },
             published: None,
         });
@@ -815,6 +825,10 @@ pub(crate) fn provider_readiness(
 }
 
 /// Write the provider's `Ready` condition when its status or reason changed.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the Kubernetes status patch future carries a full InferenceProvider response"
+)]
 async fn apply_ready_condition(
     client: &Client,
     provider: &InferenceProvider,
@@ -851,32 +865,17 @@ async fn apply_ready_condition(
     Ok(())
 }
 
-/// The status patch carrying the provider's `Ready` and `MetricsAvailable` conditions, `None`
-/// when neither changed. Both are always sent, since an apply that leaves one out removes it.
+/// The status patch carrying the conditions the readiness pass owns, `None` when none changed.
+/// Every one is sent, since an apply that leaves one out removes it.
 fn ready_condition_patch<'provider>(
     provider: &'provider InferenceProvider,
     verdict: &readiness::Verdict,
 ) -> Option<(&'provider str, Value)> {
     let name = provider.metadata.name.as_deref()?;
-    let status = provider.status.as_ref();
-    let current = status.map_or(&[][..], |status| status.conditions.as_slice());
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .ok()?;
-    let generation = provider.metadata.generation;
-    let ready = readiness::ready_condition(current, verdict, &now, generation);
-    let metrics = readiness::metrics_condition(current, verdict, &now, generation);
-    if ready.is_none() && metrics.is_none() {
-        return None;
-    }
-    let held = |type_: &str| current.iter().find(|c| c.type_ == type_).cloned();
-    let conditions: Vec<_> = [
-        ready.or_else(|| held(readiness::READY_CONDITION)),
-        metrics.or_else(|| held(readiness::METRICS_CONDITION)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let conditions = readiness_conditions(provider, verdict, &now)?;
     Some((
         name,
         serde_json::json!({
@@ -886,6 +885,59 @@ fn ready_condition_patch<'provider>(
             "status": { "conditions": conditions }
         }),
     ))
+}
+
+/// `Ready`, `MetricsAvailable`, `EndpointLive` and `MetricsReachable` for `verdict`, `None`
+/// when the live status already says them.
+fn readiness_conditions(
+    provider: &InferenceProvider,
+    verdict: &readiness::Verdict,
+    now: &str,
+) -> Option<Vec<Condition>> {
+    let current = provider
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let generation = provider.metadata.generation;
+    let stamp = rollup::Stamp { generation, now };
+    let ready = readiness::ready_condition(current, verdict, now, generation);
+    let metrics = readiness::metrics_condition(current, verdict, now, generation);
+    let live = readiness::endpoint_live(verdict, liveness_fallback(provider));
+    let live = rollup::condition(current, readiness::ENDPOINT_LIVE_CONDITION, live, stamp);
+    let reachable = readiness::metrics_reachable(verdict)
+        .map(|state| rollup::condition(current, readiness::METRICS_REACHABLE_CONDITION, state, stamp));
+    let held = |type_: &str| current.iter().find(|c| c.type_ == type_).cloned();
+    // Left out of the apply, a held MetricsReachable is removed once no endpoint is set.
+    let reachable_moved = reachable.as_ref().map_or_else(
+        || held(readiness::METRICS_REACHABLE_CONDITION).is_some(),
+        |reachable| rollup::differs(current, std::slice::from_ref(reachable)),
+    );
+    let live_moved = rollup::differs(current, std::slice::from_ref(&live));
+    if ready.is_none() && metrics.is_none() && !reachable_moved && !live_moved {
+        return None;
+    }
+    let conditions = [
+        ready.or_else(|| held(readiness::READY_CONDITION)),
+        metrics.or_else(|| held(readiness::METRICS_CONDITION)),
+        Some(live),
+        reachable,
+    ];
+    Some(conditions.into_iter().flatten().collect())
+}
+
+/// What stands in for metrics when judging a provider's liveness.
+fn liveness_fallback(provider: &InferenceProvider) -> readiness::Fallback {
+    let unavailable = provider
+        .status
+        .as_ref()
+        .is_some_and(|status| status.phase == crate::crd::inference_provider::ProviderPhase::Unavailable);
+    if unavailable {
+        readiness::Fallback::Unavailable
+    } else if provider.spec.health_check.is_some() {
+        readiness::Fallback::HealthChecked
+    } else {
+        readiness::Fallback::Unchecked
+    }
 }
 
 /// Server-side apply manager for the `Ready` condition, apart from provider reconciliation.
@@ -1669,6 +1721,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &providers,
         &tool_providers,
         &remote_crdt_providers,
+        &ctx.served_models,
         &raw_metrics,
         &scoring_weights,
         &admission_states,
@@ -1695,7 +1748,15 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
 
     // Publish provider CRDT state so peers learn this site's providers.
     let remote_provider_count = if let Some(swim) = ctx.swim().filter(|handle| handle.is_running()) {
-        publish_real_provider_state(swim, name, &grid_id, &providers, &tool_providers, &raw_metrics);
+        publish_real_provider_state(
+            swim,
+            name,
+            &grid_id,
+            &providers,
+            &tool_providers,
+            &raw_metrics,
+            &ctx.served_models,
+        );
         log_capacity_changes(&ctx.logged, name, &providers);
         count_remote_provider_records(swim, name)
     } else {
@@ -1713,6 +1774,8 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     let budget_statuses =
         crate::crd::grid_network::resolve_budget_statuses(network.spec.budget_policy.as_ref(), &tenant_spend);
 
+    let declared = Box::pin(local_site_declared(client, &network, ctx.site_name())).await;
+    let conditions = network_rollup(&network, ctx.site_name(), declared);
     update_status(
         &network,
         client,
@@ -1725,10 +1788,13 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         overlay_statuses,
         budget_statuses,
         identity,
+        conditions,
     )
     .await?;
 
-    Box::pin(apply_local_site_condition(client, &network, ctx.site_name())).await;
+    if let Some(declared) = declared {
+        Box::pin(apply_local_site_condition(client, &network, ctx.site_name(), declared)).await;
+    }
 
     // Auto-create or update GridSite records for remote Alive SWIM members.
     // Only runs when the GridNetwork explicitly opts in via LABEL_AUTO_DISCOVER_SITES.
@@ -1751,22 +1817,78 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ))
 }
 
-/// Report whether this site's own [`GridSite`] is declared and labelled.
-async fn apply_local_site_condition(client: &Client, network: &GridNetwork, local_site: Option<&str>) {
-    let Some(network_name) = network.metadata.name.as_deref() else {
-        return;
-    };
+/// Whether this site's own [`GridSite`] is declared and labelled, `None` when it cannot be read.
+async fn local_site_declared(
+    client: &Client,
+    network: &GridNetwork,
+    local_site: Option<&str>,
+) -> Option<crate::local_site::Declared> {
+    let network_name = network.metadata.name.as_deref()?;
     let site = match local_site {
         Some(local) => match Api::<GridSite>::all(client.clone()).get_opt(local).await {
             Ok(site) => site,
             Err(error) => {
                 tracing::debug!(%error, site = local, "local GridSite not readable; retrying next reconcile");
-                return;
+                return None;
             },
         },
         None => None,
     };
-    let declared = crate::local_site::Declared::of(network_name, local_site, site.as_ref());
+    Some(crate::local_site::Declared::of(network_name, local_site, site.as_ref()))
+}
+
+/// The network's roll-up: `LocalSiteDeclared` gates it, and rejected peer or gateway signal
+/// ages degrade it.
+fn network_rollup(
+    network: &GridNetwork,
+    local_site: Option<&str>,
+    declared: Option<crate::local_site::Declared>,
+) -> Vec<Condition> {
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return Vec::new();
+    };
+    let held = network
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let stamp = rollup::Stamp {
+        generation: network.metadata.generation,
+        now: &now,
+    };
+    // An unreadable GridSite keeps the last verdict rather than inventing one.
+    let gate = declared
+        .and_then(|declared| crate::local_site::desired(network, local_site, declared, &now))
+        .or_else(|| held_condition(held, crate::local_site::LOCAL_SITE_DECLARED).cloned())
+        .unwrap_or_else(|| {
+            let unread = (
+                "Unknown",
+                "AwaitingFirstCheck",
+                "the local GridSite has not been read".to_owned(),
+            );
+            rollup::condition(held, crate::local_site::LOCAL_SITE_DECLARED, unread, stamp)
+        });
+    let degraded = held_condition(held, crate::peer_ages::PEER_TIME_VALID)
+        .filter(|condition| condition.status == "False")
+        .or_else(|| {
+            held_condition(held, crate::gateway_ages::GATEWAY_AGES_REJECTED)
+                .filter(|condition| condition.status == "True")
+        })
+        .map(|condition| (condition.reason.as_str(), condition.message.as_str()));
+    rollup::trio(held, &[&gate], (degraded, None), stamp).into()
+}
+
+/// The condition of `type_` in `held`.
+fn held_condition<'held>(held: &'held [Condition], type_: &str) -> Option<&'held Condition> {
+    held.iter().find(|condition| condition.type_ == type_)
+}
+
+/// Report whether this site's own [`GridSite`] is declared and labelled.
+async fn apply_local_site_condition(
+    client: &Client,
+    network: &GridNetwork,
+    local_site: Option<&str>,
+    declared: crate::local_site::Declared,
+) {
     let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
         return;
     };
@@ -2307,7 +2429,7 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "scoring_weights is threaded through overlay rendering without hiding the selected strategy"
+    reason = "scoring weights and served-model state are threaded through overlay rendering without hiding their use"
 )]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
@@ -2315,6 +2437,7 @@ async fn reconcile_routing_overlay_inner(
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
+    served_model_store: &served_models::ServedModelStore,
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
@@ -2382,6 +2505,7 @@ async fn reconcile_routing_overlay_inner(
             timestamp.as_deref(),
             scoring_weights,
             Some(admission_states),
+            served_model_store,
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
@@ -4933,15 +5057,20 @@ fn log_capacity_changes(logged: &ChangeLog, network: &str, providers: &[Inferenc
 /// advances on spec and status writes, and falls back to `metadata.generation`
 /// when no parseable resource version is present.  Equal revisions break ties
 /// via `writer_id`, which is the advertising SWIM site identity.
-fn provider_state_from_kube(
+pub(crate) fn provider_state_from_kube(
     provider: &InferenceProvider,
     network_id: &str,
     site_id: &str,
     metrics: Option<scoring::BackendMetrics>,
+    served_model_store: &served_models::ServedModelStore,
 ) -> Option<crdt::ProviderState> {
     let provider_id = provider.metadata.name.as_deref()?;
     let routing_cluster = routing_overlay::routing_identity(provider)?.to_owned();
-    let models = provider.spec.models.iter().map(|m| m.name.clone()).collect();
+    let models = match served_model_store.select_for(provider) {
+        // FIXME: we are currently only wiring static config, even if we support discovery.
+        Some(inventory) if inventory.is_static() => inventory.models().to_vec(),
+        _ => Vec::new(),
+    };
     let phase = crdt_phase_from_provider(
         provider.status.as_ref(),
         provider.metadata.generation.unwrap_or_default(),
@@ -5313,7 +5442,7 @@ fn provider_state_broadcast(
 /// to SWIM peers via [`SwimHandle::publish_state_broadcast`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "tool_providers is the new distinct input alongside existing inference parameters"
+    reason = "tool providers and served-model state are distinct inputs alongside existing inference parameters"
 )]
 fn publish_real_provider_state(
     swim: &SwimHandle,
@@ -5322,6 +5451,7 @@ fn publish_real_provider_state(
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
+    served_model_store: &served_models::ServedModelStore,
 ) {
     let site_name = swim.site_name();
     let mut snap = crdt::GridStateSnapshot::new(site_name.to_owned());
@@ -5333,7 +5463,7 @@ fn publish_real_provider_state(
         }
         let routing_id = routing_overlay::routing_identity(provider).unwrap_or("");
         let metrics = raw_metrics.get(routing_id).copied();
-        if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics) {
+        if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics, served_model_store) {
             upsert_provider_with_capabilities(&mut snap, &mut max_revision, state);
         }
     }
@@ -5493,14 +5623,14 @@ async fn update_status(
     overlay_statuses: Vec<OverlayRevisionStatus>,
     budget_statuses: Vec<TenantBudgetStatus>,
     identity: Option<SiteIdentityStatus>,
+    conditions: Vec<Condition>,
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
-        // Signal publishers own this evidence under separate field managers. Left
-        // empty, it is not serialized, so this apply never claims or clears it.
-        conditions: Vec::new(),
+        // The roll-up only: other condition types belong to their own field managers.
+        conditions,
         gateway_age_reports: Vec::new(),
         gateway_age_report_overflow: false,
         connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
@@ -5613,13 +5743,14 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
 /// Ignore conditions and gateway evidence managed by the signal publishers.
 fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired: &GridNetworkStatus) -> bool {
     current.is_none_or(|current| {
-        *desired
-            != GridNetworkStatus {
-                conditions: desired.conditions.clone(),
-                gateway_age_reports: desired.gateway_age_reports.clone(),
-                gateway_age_report_overflow: desired.gateway_age_report_overflow,
-                ..current.clone()
-            }
+        rollup::differs(&current.conditions, &desired.conditions)
+            || *desired
+                != GridNetworkStatus {
+                    conditions: desired.conditions.clone(),
+                    gateway_age_reports: desired.gateway_age_reports.clone(),
+                    gateway_age_report_overflow: desired.gateway_age_report_overflow,
+                    ..current.clone()
+                }
     })
 }
 
@@ -6724,8 +6855,16 @@ mod tests {
             "type": "MetricsAvailable", "status": "True", "reason": "ScrapeSucceeded", "message": "metrics scraped",
             "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
         });
+        let live = serde_json::json!({
+            "type": "EndpointLive", "status": "False", "reason": "NoEndpointsReady", "message": "0 ready endpoints",
+            "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
+        });
+        let reachable = serde_json::json!({
+            "type": "MetricsReachable", "status": "True", "reason": "MetricsReachable", "message": "",
+            "lastTransitionTime": "2026-10-03T00:00:00Z", "observedGeneration": 1
+        });
         let current = provider_with_status(&serde_json::json!({
-            "conditions": [ready_condition_json("False", "NoEndpointsReady"), metrics]
+            "conditions": [ready_condition_json("False", "NoEndpointsReady"), metrics, live, reachable]
         }));
         assert!(
             ready_condition_patch(&current, &down).is_none(),
@@ -7744,7 +7883,7 @@ mod tests {
     #[test]
     fn provider_state_from_kube_maps_basic_fields() {
         let p = make_provider("my-provider", "net", "local", 3);
-        let state = provider_state_from_kube(&p, "net", "site-a", None);
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new());
         let state = state.unwrap_or_else(|| std::process::abort());
         assert_eq!(state.network_id, "net", "network_id from owning GridNetwork");
         assert_eq!(state.provider_id, "my-provider", "provider_id from metadata.name");
@@ -7756,9 +7895,35 @@ mod tests {
     }
 
     #[test]
+    fn provider_state_from_kube_does_not_gossip_dynamic_spec_models() {
+        let p: InferenceProvider = serde_json::from_value(serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1",
+            "kind": "InferenceProvider",
+            "metadata": { "name": "dynamic-provider", "uid": "provider-uid", "generation": 1 },
+            "spec": {
+                "gridNetworkRef": "net",
+                "providerKind": "self_hosted",
+                "backendKind": "local",
+                "endpoint": "http://localhost:8080",
+                "models": [{ "name": "configured-model" }],
+                "modelDiscovery": { "openAiModels": {} }
+            }
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
+
+        assert!(
+            state.models.is_empty(),
+            "dynamic providers without a fresh inventory must not gossip spec.models"
+        );
+    }
+
+    #[test]
     fn provider_state_from_kube_uses_metadata_name_as_routing_cluster_by_default() {
         let p = make_provider("prov-a", "net", "api_provider", 0);
-        let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.routing_cluster, "prov-a",
             "routing_cluster defaults to metadata.name"
@@ -7768,7 +7933,8 @@ mod tests {
     #[test]
     fn provider_state_from_kube_uses_routing_cluster_ref_when_set() {
         let p = make_provider_with_routing_ref("prov-x", "net", "site-override");
-        let state = provider_state_from_kube(&p, "net", "site-a", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.routing_cluster, "site-override",
             "clusterName must override metadata.name"
@@ -7791,7 +7957,7 @@ mod tests {
         }))
         .unwrap_or_else(|_| std::process::abort());
         assert!(
-            provider_state_from_kube(&p, "net", "site-a", None).is_none(),
+            provider_state_from_kube(&p, "net", "site-a", None, &served_models::ServedModelStore::new()).is_none(),
             "provider with no metadata.name must yield None"
         );
     }
@@ -7858,7 +8024,8 @@ mod tests {
     #[test]
     fn provider_state_from_kube_propagates_provider_phase_via_status() {
         let p = make_provider_with_status("prov-a", "net", "Degraded");
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.phase,
             crdt::ProviderPhase::Degraded,
@@ -7869,7 +8036,7 @@ mod tests {
     #[test]
     fn provider_state_from_kube_unavailable_is_included_not_skipped() {
         let p = make_provider_with_status("prov-a", "net", "Unavailable");
-        let state = provider_state_from_kube(&p, "net", "s", None);
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new());
         assert!(
             state.is_some(),
             "Unavailable providers must be published so remote sites know to avoid them"
@@ -7901,7 +8068,8 @@ mod tests {
     #[test]
     fn revision_falls_back_to_generation_field() {
         let p = make_provider("prov-g", "net", "local", 42);
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(state.revision, 42, "revision must fall back to Kubernetes generation");
     }
 
@@ -7909,7 +8077,8 @@ mod tests {
     fn revision_prefers_resource_version_over_generation() {
         let mut p = make_provider("prov-rv", "net", "local", 42);
         p.metadata.resource_version = Some("99".to_owned());
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(
             state.revision, 99,
             "resourceVersion advances on status writes and must win over generation"
@@ -7931,7 +8100,8 @@ mod tests {
             }
         }))
         .unwrap_or_else(|_| std::process::abort());
-        let state = provider_state_from_kube(&p, "net", "s", None).unwrap_or_else(|| std::process::abort());
+        let state = provider_state_from_kube(&p, "net", "s", None, &served_models::ServedModelStore::new())
+            .unwrap_or_else(|| std::process::abort());
         assert_eq!(state.revision, 0, "missing generation must default to revision=0");
     }
 
@@ -8444,7 +8614,7 @@ mod tests {
     fn independently_owned_evidence_is_omitted_and_does_not_trigger_reconcile() -> Result<(), serde_json::Error> {
         let baseline = GridNetworkStatus::default();
         let mut independently_owned = baseline.clone();
-        independently_owned.conditions = vec![crate::crd::inference_provider::Condition {
+        independently_owned.conditions = vec![Condition {
             type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
             status: "False".to_owned(),
             reason: "TimestampOutOfRange".to_owned(),
@@ -8474,6 +8644,58 @@ mod tests {
         Ok(())
     }
 
+    /// A network holding `conditions` as `(type, status, reason)`.
+    fn network_holding(conditions: &[(&str, &str, &str)]) -> GridNetwork {
+        let mut network = base_network();
+        network.status = Some(GridNetworkStatus {
+            conditions: conditions
+                .iter()
+                .map(|(type_, status, reason)| Condition {
+                    type_: (*type_).to_owned(),
+                    status: (*status).to_owned(),
+                    reason: (*reason).to_owned(),
+                    ..Condition::default()
+                })
+                .collect(),
+            ..GridNetworkStatus::default()
+        });
+        network
+    }
+
+    /// `(status, reason)` of `type_` in the network's roll-up with no site identity.
+    fn rolled_up(network: &GridNetwork, type_: &str) -> Option<(String, String)> {
+        network_rollup(network, None, Some(crate::local_site::Declared::NoSite))
+            .into_iter()
+            .find(|condition| condition.type_ == type_)
+            .map(|condition| (condition.status, condition.reason))
+    }
+
+    #[test]
+    fn rejected_peer_ages_degrade_first_and_the_local_site_gates() {
+        let network = network_holding(&[
+            (
+                crate::gateway_ages::GATEWAY_AGES_REJECTED,
+                "True",
+                "GatewayAgesRejected",
+            ),
+            (crate::peer_ages::PEER_TIME_VALID, "False", "TimestampOutOfRange"),
+        ]);
+        let pair = |status: &str, reason: &str| Some((status.to_owned(), reason.to_owned()));
+        assert_eq!(rolled_up(&network, "Available"), pair("False", "NoSiteIdentity"));
+        assert_eq!(rolled_up(&network, "Degraded"), pair("True", "TimestampOutOfRange"));
+    }
+
+    #[test]
+    fn rejected_gateway_ages_degrade() {
+        let network = network_holding(&[(
+            crate::gateway_ages::GATEWAY_AGES_REJECTED,
+            "True",
+            "GatewayAgesRejected",
+        )]);
+        let degraded = rolled_up(&network, "Degraded");
+        assert_eq!(degraded, Some(("True".to_owned(), "GatewayAgesRejected".to_owned())));
+    }
+
     #[test]
     fn a_condition_alone_never_calls_for_a_status_write() {
         let baseline = GridNetworkStatus {
@@ -8482,10 +8704,10 @@ mod tests {
             ..GridNetworkStatus::default()
         };
         let with_condition = GridNetworkStatus {
-            conditions: vec![crate::crd::inference_provider::Condition {
+            conditions: vec![Condition {
                 type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
                 status: "True".to_owned(),
-                ..crate::crd::inference_provider::Condition::default()
+                ..Condition::default()
             }],
             ..baseline.clone()
         };

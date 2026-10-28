@@ -1222,6 +1222,12 @@ func (in *GridSiteStatus) DeepCopyInto(out *GridSiteStatus) {
 		out.Capabilities = new(GridSiteCapabilities)
 		in.Capabilities.DeepCopyInto(out.Capabilities)
 	}
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		for i := range in.Conditions {
+			in.Conditions[i].DeepCopyInto(&out.Conditions[i])
+		}
+	}
 	if in.LastProbeTime != nil {
 		x := *in.LastProbeTime
 		out.LastProbeTime = &x
@@ -1584,6 +1590,10 @@ func (in *InferenceProviderStatus) DeepCopyInto(out *InferenceProviderStatus) {
 	if in.ServedModelsExpiresAt != nil {
 		x := *in.ServedModelsExpiresAt
 		out.ServedModelsExpiresAt = &x
+	}
+	if in.ServedModelsObservedGeneration != nil {
+		x := *in.ServedModelsObservedGeneration
+		out.ServedModelsObservedGeneration = &x
 	}
 }
 
