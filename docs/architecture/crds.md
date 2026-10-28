@@ -8,6 +8,33 @@ unchanged by the project-name update.
 
 All CRDs are cluster-scoped and served at `v1alpha1`.
 
+## Status conditions
+
+`GridNetwork`, `GridSite`, `InferenceProvider` and `SiteInvite` each carry
+`Available`, `Progressing` and `Degraded` after their first reconcile, so one
+client reads any of them the same way.
+
+- `Available` is `True` with reason `Available` when every gating condition of
+  the kind is `True`. Otherwise it copies the status, reason and message of the
+  first gating condition, in the kind's order, that is not.
+- `Degraded` is `True` when a non-gating condition is bad, and copies its reason
+  and message. Otherwise it is `False` with reason `AsExpected`.
+- `Progressing` is `True` with reason `NewGeneration` while a gating condition
+  describes an older `metadata.generation`, or with a reason naming a change the
+  operator expects to finish without a person. Otherwise it is `False` with
+  reason `AsExpected`.
+- A positive condition's `True` reason is its own type name. `Unknown` means only
+  that the operator has not evaluated the condition: `AwaitingFirstCheck` or
+  `AwaitingFirstScrape` before the first evaluation, or `NotEvaluated`.
+
+Available `True` and Degraded `False` is healthy. Progressing `True` means wait.
+Available `False` with Progressing `False` means act, on the reason given.
+
+Every kind prints the same status columns: AVAILABLE, PROGRESSING and DEGRADED
+read those conditions, and SINCE is when Available last changed. `-o wide` adds
+MESSAGE, the Available message, then PHASE, kept while v1alpha1 has it, and on
+`InferenceProvider` READY.
+
 ## SiteInvite
 
 Declares an invitation on the signer cluster. The signer pins the site name and
@@ -35,6 +62,25 @@ referenced Secret as a credential and deliver it and the grid CA bundle to the
 joining site's operator namespace out of band. The token itself is never
 published in status.
 
+**Conditions**: `Minted`, `Redeemed` and `Issued` are the facts, and
+`Available` says whether the token can still be presented. An invite is one-shot,
+like a Job, so a spent invite reads `Available` `False` and stays not `Degraded`.
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Minted` | `True` | `Minted` | The signer recorded the token. |
+| `Minted` | `False` | `Minting` | The token is checkpointed and the mint is in flight. `Progressing` is `True` with `Minting`. |
+| `Minted` | `False` | `NameTaken`, `TokenOutstanding`, `NameDeleted` | The signer refused the mint. The message names the fix. |
+| `Redeemed` | `True` | `Redeemed` | A site spent the token. |
+| `Redeemed` | `False` | `AwaitingRequest`, `Expired`, `Revoked` | No site has spent it, its lifetime ended, or it was revoked. |
+| `Issued` | `True` | `Issued` | The site's certificate was issued, today in the same step as redemption. |
+| `Issued` | `False` | `AwaitingRequest`, `Expired`, `InviteRevoked` | No certificate was issued. |
+| `Available` | `False` | `Redeemed`, `Expired`, `Revoked`, or the `Minted` reason | The token cannot be presented. |
+
+`Ready` stays for v1alpha1 readers and follows `Available` under its earlier
+reasons: `True` `Ready` while the token can be presented, `False` `Pending` until
+it is minted, and `False` `Redeemed`, `Expired` or `Revoked` after.
+
 In Kubernetes, the controller reads SiteInvite objects, stores each token in a
 Secret, and revokes unused tokens when an admin deletes an invite.
 Standalone enrollment does not start the controller. Enrollment enforces an
@@ -57,6 +103,9 @@ The AGN logical network and top-level tenancy scope. `GridNetwork` is a
 cluster-scoped CRD. The current AGN deployment supports only one
 `GridNetwork` in the cluster. The operator fails startup when it finds more
 than one; adding another after startup is not supported.
+
+Its roll-up is gated by `LocalSiteDeclared`. A `PeerTimeValid` of `False`, or a
+`GatewayAgesRejected` of `True`, sets `Degraded` with that condition's reason.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -522,7 +571,7 @@ spec:
 
 **Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
 
-**Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
+**Status fields**: `conditions`, `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
 `lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
 
@@ -592,7 +641,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 **Metrics:** `grid_site_phase{site,phase}` reports each `GridSite`'s phase as a state
 set, the shape of kube-state-metrics' `kube_pod_status_phase`. The series for the
 current phase is 1 and the other five are 0, so a site is ready when
-`grid_site_phase{phase="Active"} == 1`. It follows the phase the printer column shows,
+`grid_site_phase{phase="Active"} == 1`. It follows the phase the wide PHASE column shows,
 updates on every `GridNetwork` reconcile, and drops a site's series once its `GridSite`
 is gone. Cardinality is six series per site. `grid_site_phase_transition_total`
 still counts the transitions by phase and reason.
@@ -697,32 +746,29 @@ status:
   observedGeneration: 2
 ```
 
-### Status conditions (acceptance criterion open)
+### Status conditions
 
-The current `GridSite` status uses a flat
-`phase`/`reason`/`message` model rather than a
-Kubernetes-style `conditions[]` array.
+The operator writes `Connected` and the roll-up beside the phase, which stays for
+v1alpha1 readers. `Connected` is the only gate.
 
-Issue #11's acceptance criteria include a conditions-based
-status contract.  That criterion is **not yet resolved**:
-it requires either (a) implementing a `conditions[]` array
-or (b) formally amending the issue to accept the
-`phase`/`reason`/`message` model as the replacement.
-Neither has happened at the time of writing.
+A peer's `GridSite` is a local object, and its conditions record what this site
+observes of that peer. Status is never shared between sites, so two sites can
+disagree about one peer during a partition. The peer's own health is in its own
+`GridSite` and its signals.
 
-The flat model is the current contract:
+| Status | Reason | When |
+|---|---|---|
+| `True` | `Connected` | The TLS handshake verified the chain, identity and pin. |
+| `Unknown` | `AwaitingFirstCheck` | An address is known and the first probe has not run. `Progressing` is `True` with `Probing`. |
+| `False` | `AwaitingDiscovery` | The record waits for discovery to supply its address. |
+| `False` | `AddressMissing` | No gateway address is configured. |
+| `False` | `AddressRefused` | The gossiped address is not a dialable literal `IP:port`. |
+| `False` | `Unreachable` | The TCP connect was refused or timed out. The message names which. After an address edit, `Progressing` is `True` with `Probing`. |
+| `False` | `TLSProtocolError` | The TLS handshake failed or timed out at the protocol level. |
+| `False` | `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, `CertificateNotYetValid`, `PinMismatch`, `TrustMaterialMissing`, `TrustMaterialInvalid`, `IdentityVerificationRequired` | The probe's trust failure, named as the probe reports it. |
 
-- `phase` provides the primary lifecycle state;
-  `reason` encodes the machine-readable probe outcome;
-  `message` gives a bounded human-readable explanation.
-- Richer conditions (e.g. `Reachable`, `IdentityVerified`,
-  `CertificatePinned`) may be added when multi-signal
-  readiness is needed (see `docs/architecture/overview.md`,
-  Trust and Readiness section).
-
-Tools and automation **must not** depend on a
-`conditions[]` field existing.  Match on `phase` for
-coarse state and on `reason` for specific probe outcomes.
+`Connected` is applied by the field manager `grid-operator-probe`, and the roll-up
+by `grid-operator-site`. The phase stays a merge patch.
 
 ## InferenceProvider
 
@@ -791,7 +837,8 @@ probe anonymously. Redirects are not followed; a 3xx response degrades health.
 **Phases**: Pending → Available → Degraded → Unavailable
 
 **Readiness**: `status.conditions` carries a `Ready` condition, written by the
-operator's signals loop from each scrape of the provider's metrics. Readiness is
+operator's signals loop from each scrape of the provider's metrics, in every
+signal mode. Readiness is
 a condition, not a phase: `phase` follows the provider's configuration only, and
 says nothing about whether it serves now.
 
@@ -799,16 +846,16 @@ says nothing about whether it serves now.
 |---|---|---|
 | `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint. |
 | `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints, and the EPP recorded no engine answer in the last 30s. |
-| `Unknown` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). Readiness is unknown rather than false, so the provider is not excluded: a provider pointed at vLLM's own `/metrics` carries no such series. The message names what was missing. |
+| `True` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). Routing serves the provider, so `Ready` reads `True`: a provider pointed at vLLM's own `/metrics` carries no such series. The message names what was missing. |
 | `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds` or the [readiness floor](polling-metrics.md#provider-readiness), if longer, and the latest timed out. |
 | `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |
 | `False` | `TLSHandshakeFailed` | As above, and the latest failed TLS, including the TLS material. |
-| `Unknown` | `MetricsBodyTooLarge` | The endpoint answered, but its metrics HTTP response body passed the operator's 1 MiB budget. Readiness is unknown rather than false, so the provider remains a routing candidate. |
+| `True` | `MetricsBodyTooLarge` | The endpoint answered, but its metrics HTTP response body passed the operator's 1 MiB budget. The provider remains a routing candidate, so `Ready` reads `True`, and `MetricsReachable` reports the failure. |
 | `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `parse`, or `config`. |
 | `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds` or the [readiness floor](polling-metrics.md#provider-readiness), if longer, and none failed. |
 | `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
 | `Unknown` | `AwaitingFirstScrape` | No scrape has succeeded yet, within the grace window. |
-| `Unknown` | `MetricsNotConfigured` | No `metricsConfig`, so readiness cannot be read. |
+| `Unknown` | `NotEvaluated` | No metrics endpoint is set, so readiness is not evaluated. `MetricsAvailable` reads the same. |
 
 The operator logs each change of reason once: at WARN when the provider turns not
 ready, at INFO when it returns to `Ready` or waits. Each scrape counts in
@@ -821,13 +868,32 @@ A provider whose `Ready` is `False` is excluded from routing: its site publishes
 `grid_provider_ready 0`, and its serving config entry carries `admission: none`.
 See [Polling Cross-Site Load Signals](polling-metrics.md#provider-readiness).
 
-The READY column reads the condition's status directly, so no status field
-repeats it. `-o wide` adds REASON, the condition's reason, and PHASE.
+**Roll-up**: `Available` is gated by `Accepted`, `ResolvedRefs` and
+`EndpointLive`, in that order, and a `MetricsReachable` failure sets `Degraded`.
+The provider reconciler writes `Accepted`, `ResolvedRefs` and the roll-up. The
+signals loop writes `EndpointLive` and `MetricsReachable` with `Ready`.
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted` | `False` | `Invalid` | The endpoint or a model name is blank, or `spec.auth` does not parse. |
+| `ResolvedRefs` | `False` | `BackendNotFound` | The referenced `GridNetwork` does not exist. |
+| `ResolvedRefs` | `False` | `NoSitesMatched` | Sites exist and `siteSelector` matches none. |
+| `ResolvedRefs` | `Unknown` | `NotEvaluated` | An invalid spec or an unreadable credential stopped resolution first. |
+| `EndpointLive` | `True` | `EndpointLive` | The latest scrape counted ready endpoints, or, without metrics, the health check passes. |
+| `EndpointLive` | `True` | `NoHealthSignal` | Nothing checks liveness: no metrics endpoint and no health check, or metrics without a ready-endpoint series. Routing serves it, so the condition says so. |
+| `EndpointLive` | `False` | `NoEndpointsReady` | Scrapes count zero ready endpoints, or the provider is `Unavailable`. |
+| `EndpointLive` | `False` | `LivenessStale` | No scrape succeeded within the readiness window. `MetricsReachable` names why. |
+| `EndpointLive` | `Unknown` | `AwaitingFirstCheck` | No scrape has succeeded yet, within the grace window. |
+| `MetricsReachable` | `False` | The `Ready` scrape reason | The latest scrape failed. Absent when no metrics endpoint is set. |
+
+`Programmed`, from model discovery, joins the gates later. The phase is computed
+as before.
+
 
 ```text
-NAME           PROVIDER      READY   AGE
-qwen3-site-a   self_hosted   True    3d
-qwen3-site-b   self_hosted   False   3d
+NAME           PROVIDER      AVAILABLE   PROGRESSING   DEGRADED   SINCE   AGE
+qwen3-site-a   self_hosted   True        False         False      3d      3d
+qwen3-site-b   self_hosted   False       False         False      2m      3d
 ```
 
 `spec.capacityWeight` is an optional positive relative provider capacity from
@@ -1054,8 +1120,10 @@ as a normalized `0.0` to `1.0` gauge before the operator scrapes it.
 ### Model discovery
 
 `spec.modelDiscovery` makes the operator poll the backend for the models it
-serves. Discovery does not yet affect routing or gossip; `spec.models`
-remains the routing source.
+serves. For now, discovered model names are withheld from routes and provider
+records because those formats cannot enforce inventory expiry. A provider with
+discovery configured does not fall back to `spec.models`; providers without
+discovery continue to use `spec.models`.
 
 ```yaml
 spec:
@@ -1100,8 +1168,13 @@ require this timestamp to be in the future before using `servedModels`. The
 discovery loop may not clear the status until its next round after the TTL, so
 the presence of `servedModels` alone does not prove freshness. Failed polls do
 not extend the deadline. When the set is unknown, expired and cleared, or
-discovery is disabled, both fields are absent; readers must fail closed.
-Writing either field advances `metadata.resourceVersion`, so the CRDT revision
+discovery is disabled, these discovery inventory fields are absent; readers
+must fail closed.
+`status.servedModelsObservedGeneration` records the provider `metadata.generation`
+that produced the set. Readers must require it to equal the current generation;
+a spec change makes the prior inventory unusable until a successful poll writes
+a new set, expiry, and generation together.
+Updating these fields advances `metadata.resourceVersion`, so the CRDT revision
 of the gossiped provider record advances with discovery status changes.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS

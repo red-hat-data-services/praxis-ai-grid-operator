@@ -975,6 +975,7 @@ dependencies = [
  "site-invite-api",
  "socket2",
  "sqlx",
+ "status-harness",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -2067,7 +2068,7 @@ dependencies = [
  "jiff",
  "json-patch",
  "k8s-openapi",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde-value",
  "serde_json",
@@ -2534,7 +2535,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rustls",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "scoring",
  "serde",
  "serde_json",
@@ -2542,6 +2543,7 @@ dependencies = [
  "sha2 0.11.1",
  "site-invite-api",
  "socket2",
+ "status-harness",
  "swim",
  "thiserror 2.0.21",
  "time",
@@ -3082,7 +3084,7 @@ dependencies = [
  "pin-project-lite",
  "rand 0.10.3",
  "reqwest",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "sse-stream",
@@ -3250,14 +3252,14 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
  "chrono",
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.2.2",
+ "schemars_derive 1.2.3",
  "serde",
  "serde_json",
 ]
@@ -3276,9 +3278,9 @@ dependencies = [
 
 [[package]]
 name = "schemars_derive"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3556,7 +3558,7 @@ version = "0.2.2"
 dependencies = [
  "k8s-openapi",
  "kube",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
 ]
@@ -3827,6 +3829,19 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "status-harness"
+version = "0.2.2"
+dependencies = [
+ "http",
+ "http-body-util",
+ "k8s-openapi",
+ "kube",
+ "serde_json",
+ "tower",
+ "yaml_serde",
+]
 
 [[package]]
 name = "stringprep"
@@ -4817,7 +4832,7 @@ dependencies = [
  "prettyplease 0.3.0",
  "rand 0.10.3",
  "schemars 0.8.22",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "sha2 0.11.1",
