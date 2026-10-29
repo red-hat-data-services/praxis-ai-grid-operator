@@ -107,13 +107,7 @@ async fn main() {
     if let Some(site_name) = config.grid.site_name.take() {
         config.swim.site_name.get_or_insert(site_name);
     }
-    config.grid.signal_transport = match config.grid.startup_signal_transport() {
-        Ok(mode) => mode,
-        Err(error) => {
-            tracing::error!(%error, "contradictory grid modes");
-            std::process::exit(1);
-        },
-    };
+    config.grid.signal_transport = config.grid.startup_signal_transport();
 
     let client = match Client::try_default().await {
         Ok(c) => c,
@@ -246,18 +240,16 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let install_modes = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
-    let modes = match resolve_grid_modes(&client, has_identity, install_modes).await {
+    let install_modes = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust)
+        .with_membership(config.grid.membership);
+    let (modes, membership_declared) = match resolve_grid_modes(&client, has_identity, install_modes).await {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
             std::process::exit(1);
         },
     };
-    if config.grid.membership == Membership::Local && modes.signal != SignalMode::Poll {
-        tracing::error!("GRID_MEMBERSHIP_SOURCE Local polls signals, but the GridNetwork declares gossip");
-        std::process::exit(1);
-    }
+    config.grid.membership = modes.membership;
     let signal_mode = modes.signal;
     let trust = modes.trust;
     // The loop follows the declared peer trust, which may change after startup.
@@ -319,6 +311,7 @@ async fn main() {
             .with_mode_restart(mode_restart)
             .with_site_name(config.swim.site_name.clone())
             .with_membership(config.grid.membership)
+            .with_membership_fallback(install_modes.membership)
             .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
     );
@@ -368,7 +361,6 @@ async fn main() {
     let serving = async {
         tokio::try_join!(
             start_swim(
-                client.clone(),
                 config.clone(),
                 Arc::clone(&ctx),
                 StandDown {
@@ -377,6 +369,7 @@ async fn main() {
                     routes: routes.clone(),
                 },
                 swim_tx,
+                membership_declared,
             ),
             writers,
             async { metrics_server.await? },
@@ -595,15 +588,23 @@ type SwimStartup = tokio::sync::watch::Receiver<SwimStage>;
 ///
 /// Returns the reason SWIM cannot start, which stops the operator.
 async fn start_swim(
-    client: Client,
     cli: Cli,
     ctx: Arc<OperatorCtx>,
     restart: StandDown,
     started: tokio::sync::watch::Sender<SwimStage>,
+    membership_declared: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = ctx.client.clone();
     let retry = restart.clone();
     let ready = Arc::clone(&restart.ready);
-    let started_swim = Box::pin(maybe_start_swim(&client, &cli, ctx.signal_mode(), restart)).await;
+    let started_swim = Box::pin(maybe_start_swim(
+        &client,
+        &cli,
+        ctx.signal_mode(),
+        restart,
+        membership_declared,
+    ))
+    .await;
     let swim = report_swim(&client, cli.grid.membership, started_swim, retry)?;
     if let Some(handle) = &swim {
         ctx.set_swim(Arc::clone(handle));
@@ -743,30 +744,40 @@ async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::Swim
 
 /// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup, or
 /// `without_network` when none exists yet.
-async fn resolve_grid_modes(client: &Client, enrolled: bool, without_network: GridModes) -> Result<GridModes, String> {
+async fn resolve_grid_modes(
+    client: &Client,
+    enrolled: bool,
+    without_network: GridModes,
+) -> Result<(GridModes, bool), String> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let items = networks
         .list(&kube::api::ListParams::default())
         .await
         .map_err(|e| format!("listing GridNetworks: {e}"))?
         .items;
-    match items.as_slice() {
+    let (modes, declared) = match items.as_slice() {
         [] => {
             let identity = if enrolled { " (enrolled identity)" } else { "" };
             tracing::info!(modes = ?without_network, "no GridNetwork yet; starting in the install's modes{identity}");
-            Ok(without_network)
+            (without_network, false)
         },
         [network] => {
-            let modes = GridModes::of(network);
+            let modes = GridModes::of(network, without_network.membership);
             tracing::info!(?modes, "resolved grid-wide modes");
-            Ok(modes)
+            (modes, network.spec.membership.is_some())
         },
-        many => Err(format!(
-            "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
+        many => {
+            return Err(format!(
+                "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
              cannot serve more than one grid mode",
-            many.len()
-        )),
+                many.len()
+            ));
+        },
+    };
+    if modes.membership == Membership::Local && modes.signal != SignalMode::Poll {
+        return Err("Local membership requires signalTransport.mode poll".to_owned());
     }
+    Ok((modes, declared))
 }
 
 // ---------------------------------------------------------------------------
@@ -794,16 +805,11 @@ async fn maybe_start_swim(
     cli: &Cli,
     signal_mode: SignalMode,
     restart: StandDown,
+    membership_declared: bool,
 ) -> Result<Option<Arc<swim_runtime::SwimHandle>>, SwimFailure> {
     let bind = std::env::var("GRID_SWIM_BIND_ADDR").ok();
-    if cli.grid.membership == Membership::Local {
-        return match bind {
-            Some(_) => Err(SwimFailure::new(
-                "MembershipConflict",
-                "GRID_MEMBERSHIP_SOURCE Local runs no SWIM, but GRID_SWIM_BIND_ADDR is set",
-            )),
-            None => Ok(None),
-        };
+    if !swim_requested(cli.grid.membership, membership_declared, bind.is_some())? {
+        return Ok(None);
     }
     let Some(addr_str) = bind else {
         return Ok(None);
@@ -921,6 +927,18 @@ async fn maybe_start_swim(
             "StartFailed",
             format!("SWIM runtime failed to start: {e}"),
         )),
+    }
+}
+
+/// Whether startup may open SWIM, preserving install validation while honoring a network override.
+fn swim_requested(membership: Membership, declared: bool, has_bind: bool) -> Result<bool, SwimFailure> {
+    match membership {
+        Membership::Local if has_bind && !declared => Err(SwimFailure::new(
+            "MembershipConflict",
+            "GRID_MEMBERSHIP_SOURCE Local runs no SWIM, but GRID_SWIM_BIND_ADDR is set",
+        )),
+        Membership::Local => Ok(false),
+        Membership::Swim => Ok(has_bind),
     }
 }
 
@@ -1748,7 +1766,8 @@ async fn create_local_records(
         identity,
         ca_secret: operator::enroll::CA_SECRET.to_owned(),
         swim_key_secret: None,
-        modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
+        modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust)
+            .with_membership(config.grid.membership),
     };
     // Without SWIM the network names no SWIM key.
     let swim_key = match config.grid.membership {
@@ -4306,6 +4325,120 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_reads_network_membership_before_selecting_the_swim_listener() -> Result<(), String> {
+        let install = GridModes::without_network(Some(SignalMode::Poll), Some(operator::signals::PeerTrustMode::Pin));
+        for (spec, expected, declared) in [
+            (None, Membership::Swim, false),
+            (Some(serde_json::json!({})), Membership::Swim, false),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "poll"}})),
+                Membership::Local,
+                true,
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Swim"}})),
+                Membership::Swim,
+                true,
+            ),
+        ] {
+            let client = network_modes_client(spec.clone());
+            let (modes, membership_declared) = resolve_grid_modes(&client, true, install).await?;
+            assert_eq!(modes.membership, expected, "spec={spec:?}, modes={modes:?}");
+            assert_eq!(membership_declared, declared, "spec={spec:?}, modes={modes:?}");
+            let swim = swim_requested(modes.membership, membership_declared, true);
+            assert!(
+                swim.as_ref()
+                    .is_ok_and(|enabled| *enabled == (expected == Membership::Swim)),
+                "spec={spec:?}, modes={modes:?}, membership_declared={membership_declared}, swim={swim:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_validates_transport_after_network_overrides() -> Result<(), String> {
+        let cli = Cli::try_parse_from(["operator", "--membership-source", "Local", "--grid-signals", "gossip"])
+            .map_err(|error| error.to_string())?;
+        let install = GridModes::without_network(cli.grid.startup_signal_transport(), cli.grid.peer_trust)
+            .with_membership(cli.grid.membership);
+        for (spec, expected) in [
+            (
+                Some(serde_json::json!({"membership": {"mode": "Swim"}, "signalTransport": {"mode": "gossip"}})),
+                Some((Membership::Swim, SignalMode::Gossip)),
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "poll"}})),
+                Some((Membership::Local, SignalMode::Poll)),
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "gossip"}})),
+                None,
+            ),
+            (None, None),
+        ] {
+            let resolved = resolve_grid_modes(&network_modes_client(spec.clone()), true, install).await;
+            if let Some((membership, signal)) = expected {
+                let (modes, declared) = resolved?;
+                assert_eq!(
+                    (modes.membership, modes.signal),
+                    (membership, signal),
+                    "spec={spec:?}, modes={modes:?}"
+                );
+                assert!(
+                    declared,
+                    "spec={spec:?} must override the install's contradictory modes"
+                );
+            } else {
+                assert!(
+                    resolved
+                        .as_ref()
+                        .is_err_and(|error| error.contains("Local membership requires")),
+                    "spec={spec:?} leaves Local/gossip invalid: {resolved:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// An API serving the optional network used to resolve startup modes.
+    fn network_modes_client(spec: Option<serde_json::Value>) -> Client {
+        let items: Vec<_> = spec
+            .into_iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
+                    "metadata": {"name": "grid"}, "spec": spec
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetworkList",
+            "metadata": {}, "items": items
+        })
+        .to_string();
+        Client::new(
+            tower::service_fn(move |_request: http::Request<kube::client::Body>| {
+                let body = body.clone();
+                async move { Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body))) }
+            }),
+            "default",
+        )
+    }
+
+    #[test]
+    fn declared_local_membership_disables_an_installed_swim_listener() {
+        for has_bind in [false, true] {
+            assert!(swim_requested(Membership::Local, true, has_bind).is_ok_and(|enabled| !enabled));
+            assert!(swim_requested(Membership::Swim, true, has_bind).is_ok_and(|enabled| enabled == has_bind));
+        }
+        assert!(
+            swim_requested(Membership::Local, false, true).is_err(),
+            "without a network override, contradictory install settings remain an error"
+        );
+        assert!(swim_requested(Membership::Local, false, false).is_ok_and(|enabled| !enabled));
+    }
 
     #[tokio::test]
     async fn feedback_handler_refuses_every_peer_scope() {
