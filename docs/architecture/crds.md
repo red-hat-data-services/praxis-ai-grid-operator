@@ -114,10 +114,11 @@ writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
 [Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
 
 `spec.gridId` is the grid the network belongs to, set once: a DNS label of at most 63
-characters, and a change is refused. `status.gridId` mirrors it. The operator mints an
-ID only while `spec.gridId` is empty and the operator config names no site, the
-standalone install. Beside a site section it mints nothing, holds the grid runtime, and
-`Accepted` reads `False` with `GridIdUnset` until `spec.gridId` is set. Moving a cluster
+characters, and a change is refused. `status.gridId` mirrors it. Bootstrap owns
+ID generation and persists it independently of the CA; the operator never mints
+an ID. Every installation waits with `Accepted=False`, reason `GridIdUnset`,
+until `spec.gridId` is set. During migration, bootstrap adopts an existing
+declared or legacy status ID rather than creating another one. Moving a cluster
 to another grid means deleting and recreating its GridNetwork, and its identity with it.
 
 ```yaml
@@ -126,7 +127,7 @@ kind: GridNetwork
 metadata:
   name: production
 spec:
-  gridId: ""                    # the grid, set once; minted only without an operator config site section
+  gridId: "production-grid"     # the stable ID supplied by bootstrap
   seeds:
     - "10.0.0.5:7946"
   consumerGateways:
@@ -270,12 +271,30 @@ membership the operator removes the condition, since SWIM never runs there.
 | `False` | `StartFailed` | The runtime failed to start, binding its socket included; retried after 300 s. |
 | `True` | `Swim` | SWIM runs. |
 
-**Membership source:** the chart value `grid.membership.source`, the operator's
-`GRID_MEMBERSHIP_SOURCE`, says where a site learns its members. It is install
-configuration, not a `GridNetwork` field. `Swim`, the default, discovers members by SWIM
-gossip. `Local` means this site's configuration lists its peers as `GridSite` objects.
-Local needs poll signals: an unset transport starts in poll, and gossip fails the render
-and the operator's startup. Both are supported peer options.
+**Membership mode:** `spec.membership.mode` selects how a site learns its
+members. `Swim` discovers members by SWIM gossip. `Local` uses the site's
+declared `GridSite` objects and requires `spec.signalTransport.mode: poll`:
+
+```yaml
+spec:
+  membership:
+    mode: Local
+  signalTransport:
+    mode: poll
+```
+
+An explicit mode overrides the install's `GRID_MEMBERSHIP_SOURCE`. When the
+field is absent, the install setting applies, defaulting to `Swim`. Changing
+the mode, including removing an override, gracefully restarts the operator
+to apply the new selection. A declared `Local` mode disables SWIM even when
+the platform Deployment still sets `GRID_SWIM_BIND_ADDR`; the Deployment
+does not need to change. Local requires reachable peer signals endpoints
+and matching identities, independently of how those resources are delivered.
+
+The `grid-operator` and `grid-site` charts write this field from their existing
+`grid.membership.source` value. Under `Local` they also default signals to
+poll and reject contradictory gossip settings. Install-only Local mode
+continues to reject an explicitly configured SWIM bind address.
 
 Local assumes something outside the grid delivers every site's `GridSite` records, the
 same set to every member. The operator discovers no peers in this mode. It polls the
