@@ -134,6 +134,7 @@ spec:
     - name: inference-gw
       namespace: praxis-system
       siteName: cluster-east   # optional; defaults to network name
+      modelDiscoveryContractVersion: v1 # only after the running gateway implements the model-discovery contract
       praxisConfig:               # optional; opt-in consumer Praxis config generation
         generate: true
         enableProjectedCredentials: true  # generate filter, then roll out consumer
@@ -165,6 +166,9 @@ spec:
     probeInterval: 5s           # WAN probe interval
     suspicionTimeout: 10s       # before declaring dead
     gossipNodes: 3              # indirect probe fanout
+  peerTrust:
+    mode: pin                    # pin (default) or spiffe
+    signedState: "off"           # off (default) or enforce
   tls:
     caSecretRef:
       name: grid-ca
@@ -182,6 +186,21 @@ spec:
       - tenantId: tenant-b
         capUsd: 250.0
 ```
+
+`peerTrust.mode` controls how this grid accepts peer signing identities for
+SWIM state gossip. `pin` (the default) requires the peer certificate's
+canonical DER SHA-256 fingerprint to appear in that peer's
+`GridSite.spec.trust.canonicalFingerprints`. It still verifies the certificate
+against this grid's CA and expected site identity. `spiffe` also verifies the
+grid CA and site identity, requires the site's SPIFFE URI, and does not read
+fingerprints. See [Signed gossip trust](signed-gossip-trust.md) for how those
+identities gate signed CRDT state and how the certificate bootstrap works.
+
+`peerTrust.signedState` gates that signing. `off` (the default) gossips state
+unsigned, as before. `enforce` signs this site's state and refuses peer state
+without a verified signature. Switch every site together: an enforcing site
+drops state from peers still at `off`. Setting `off` again removes the signer
+and pins on the next reconcile.
 
 ### Routing policy fields
 
@@ -574,6 +593,13 @@ This field is independent of `praxisConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
 
+### GatewayRef.modelDiscoveryContractVersion
+
+Set `spec.consumerGateways[].modelDiscoveryContractVersion: v1` only after the
+running gateway image understands and enforces the `expires_at` field on local
+discovered-model candidates. Missing or unknown versions cause Grid to omit
+discovered candidates for that gateway while keeping static candidates.
+
 ### GatewayRef.praxisConfig
 
 `spec.consumerGateways[].praxisConfig` opts a gateway into operator-managed consumer
@@ -879,6 +905,11 @@ by pin or SPIFFE ID, so the server name need not appear in the peer's certificat
 |---|---|
 | `canonicalFingerprints` | Required DER-certificate SHA-256 pins (`hex(sha256(der_bytes))`), one or two entries for bounded rotation overlap |
 | `certFingerprint` | **Deprecated.** Legacy PEM-based fingerprint; rejected at runtime with `TrustMaterialInvalid`; migrate to `canonicalFingerprints` |
+
+The same `GridSite.spec.trust.canonicalFingerprints` policy is used by
+`peerTrust.mode: pin` to verify a site's signing identity for SWIM/CRDT state.
+The certificate must also chain to the grid CA and identify the expected site;
+the fingerprint is an additional exact-certificate check.
 
 **Routing eligibility:** `GridSite.status.phase == Active` is the control-plane eligibility
 gate for remote CRDT provider records. Active means the control plane has
@@ -1363,10 +1394,11 @@ as a normalized `0.0` to `1.0` gauge before the operator scrapes it.
 ### Model discovery
 
 `spec.modelDiscovery` makes the operator poll the backend for the models it
-serves. For now, discovered model names are withheld from routes and provider
-records because those formats cannot enforce inventory expiry. A provider with
-discovery configured does not fall back to `spec.models`; providers without
-discovery continue to use `spec.models`.
+serves. Discovered model names can appear in local route candidates only for a
+gateway that declares `modelDiscoveryContractVersion: v1`. They remain
+withheld from provider records because the current provider-record format
+cannot carry expiry. A provider with discovery configured does not fall back to
+`spec.models`; providers without discovery continue to use `spec.models`.
 
 ```yaml
 spec:
@@ -1419,6 +1451,23 @@ a spec change makes the prior inventory unusable until a successful poll writes
 a new set, expiry, and generation together.
 Updating these fields advances `metadata.resourceVersion`, so the CRDT revision
 of the gossiped provider record advances with discovery status changes.
+
+### Gateway model discovery contract
+
+The operator adds `expires_at` (RFC 3339 UTC) to each discovered local route
+candidate. A gateway may receive these candidates only when its `GatewayRef`
+declares `modelDiscoveryContractVersion: v1`, after the running image has
+implemented this contract. At request time the gateway must treat the candidate
+as expired once its UTC clock reaches `expires_at` minus 30 seconds. This
+conservative allowance covers gateways whose clocks are up to 30 seconds behind
+the operator; a gateway with a clock ahead may withdraw the route early. The
+gateway must never extend the deadline or apply a grace period after it.
+Gateways without the declaration receive no discovered candidates.
+
+The embedded gateway carries the same deadline in its watched serving config as
+`expires_at_ms`. It checks the deadline during route selection and pinned
+requests, using the same 30-second allowance; expiry therefore remains enforced
+even when operator reconciliation or config delivery stops.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
 when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no
