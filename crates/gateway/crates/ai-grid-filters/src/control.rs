@@ -1,8 +1,9 @@
 //! Applies a grid serving config: the candidate topology and the peer pollers.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, PoisonError, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -14,14 +15,22 @@ use std::{
 use arc_swap::ArcSwap;
 use grid_client::{PollHandle, PollerConfig};
 use grid_signals::LoadStore;
+use praxis_core::config::InsecureOptions;
 use praxis_filter::FilterError;
 
 use crate::{
-    descriptor::{RouteCandidate, validate_local_site, validate_provider_hop_clusters, validate_serving_candidates},
+    descriptor::{
+        CandidateConfig, RouteCandidate, validate_local_site, validate_provider_hop_clusters,
+        validate_serving_candidates,
+    },
+    dial::{BACKEND_CA_BASE, Dials, GridIdentity, validate_dials},
     health::ClusterHealth,
     pin::TagKey,
     prefix::{AffinitySettings, PrefixAffinity},
-    serving::{AvailabilitySettings, GridServingConfig, PeerServingConfig, validate_peer},
+    serving::{
+        AvailabilitySettings, DIAL_FILE, DialConfig, DialTransport, GridServingConfig, PeerServingConfig,
+        dial_config_path, mount_revision, parse_dial_config, validate_peer,
+    },
     snapshot::{self, Gauged, RouteSnapshot},
 };
 
@@ -31,6 +40,41 @@ pub(crate) type Refresh = Box<dyn Fn(&LoadStore) + Send>;
 /// Starts one peer's poller feeding `store`, running `refresh` each cycle.
 pub(crate) type StartPeer =
     Box<dyn Fn(&PeerServingConfig, &PollerConfig, Arc<LoadStore>, Refresh) -> Result<PollHandle, FilterError> + Send>;
+
+/// What the gateway fixed at startup, which no serving reload changes.
+#[derive(Clone, Debug)]
+pub struct Binding {
+    /// The directory every server-only TLS dial's CA must be under.
+    pub backend_ca_base: PathBuf,
+
+    /// The directory every local dial's credential must be under.
+    pub credential_base: PathBuf,
+
+    /// The verified SNI of each mutual TLS `load_balancer` cluster, by cluster.
+    pub backend_tls: BTreeMap<String, String>,
+
+    /// The identity every mutual TLS dial presents and verifies against.
+    pub grid_identity: GridIdentity,
+
+    /// The insecure options every dial is validated under.
+    pub insecure: InsecureOptions,
+
+    /// Every `load_balancer` cluster, which a dial of the same name shadows.
+    pub lb_clusters: BTreeSet<String>,
+}
+
+impl Default for Binding {
+    fn default() -> Self {
+        Self {
+            backend_ca_base: PathBuf::from(BACKEND_CA_BASE),
+            backend_tls: BTreeMap::new(),
+            credential_base: PathBuf::from(crate::dial::CREDENTIAL_BASE),
+            grid_identity: GridIdentity::default(),
+            insecure: InsecureOptions::default(),
+            lb_clusters: BTreeSet::new(),
+        }
+    }
+}
 
 /// The `grid_site_route` filter's tuning, set from its praxis config block and read by the
 /// control step. The serving config is routing data the operator writes, so plugin tuning
@@ -102,13 +146,21 @@ pub(crate) struct Topology {
 }
 
 impl Topology {
-    /// Validate the topology half of `config`.
+    /// Validate the topology half of `config`, with no dial built.
     fn from_config(config: &GridServingConfig) -> Result<Self, FilterError> {
+        Self::with_dials(config, &Dials::default())
+    }
+
+    /// Validate the topology half of `config`, each candidate on a built dial sent to it.
+    fn with_dials(config: &GridServingConfig, dials: &Dials) -> Result<Self, FilterError> {
         validate_local_site(&config.local_site)?;
         if config.horizon_ms.is_some_and(|horizon| horizon <= 0) {
             return Err("grid: horizon_ms must be greater than zero".into());
         }
-        let base = validate_serving_candidates(config.candidates.clone())?;
+        let mut base = validate_serving_candidates(config.candidates.clone())?;
+        for candidate in &mut base {
+            candidate.dial = dials.get(&candidate.cluster).cloned();
+        }
         let provider_hop_clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
         for candidate in &config.candidates {
             if provider_hop_clusters.contains(&candidate.cluster) && candidate.stable_id.is_none() {
@@ -157,13 +209,8 @@ impl Topology {
             &mut inputs,
         );
         ordered.provider_hop_clusters = Arc::clone(&self.provider_hop_clusters);
-        // Praxis demotes a cluster only once it has reported health. Without a registry the
-        // gateway knows nothing about backends, so it demotes nothing rather than guessing.
-        let ordered = if health.observed() {
-            ordered.demote(&health.down())
-        } else {
-            ordered
-        };
+        // Without a registry only a failing dial is down: the gateway demotes no backend by guessing.
+        let ordered = ordered.demote(&health.down());
         ordered.shed(shedding, availability).published(gauged)
     }
 }
@@ -227,6 +274,9 @@ pub(crate) struct Control {
     /// The last applied config, so an unchanged file is a no-op.
     applied: Option<GridServingConfig>,
 
+    /// The dial file applied with it.
+    dial: DialConfig,
+
     /// Digest of the identity files the applied config names, so a renewed Secret restarts the pollers.
     identity: Option<[u8; 32]>,
 
@@ -244,25 +294,43 @@ pub(crate) struct Control {
     /// The tuning generation the applied config adopted.
     tuned: u64,
 
-    /// Verified TLS identities from the loaded Praxis backend configuration.
-    backend_tls: BTreeMap<String, String>,
+    /// What the praxis config fixed at startup.
+    binding: Binding,
 }
 
 impl Control {
     /// Build the control plane for `config` without starting any poller.
     #[cfg(test)]
     pub(crate) fn new(config: &GridServingConfig, start: StartPeer) -> Result<Self, FilterError> {
-        Self::new_with_backend_tls(config, start, BTreeMap::new())
+        Self::new_with(config, start, Binding::default())
     }
 
-    /// Build with the verified backend identities that serving reloads must preserve.
+    /// Build with only the verified backend identities.
+    #[cfg(test)]
     pub(crate) fn new_with_backend_tls(
         config: &GridServingConfig,
         start: StartPeer,
         backend_tls: BTreeMap<String, String>,
     ) -> Result<Self, FilterError> {
-        validate_provider_hop_binding(config, &backend_tls)?;
-        let topology = Topology::from_config(config)?;
+        Self::new_with(
+            config,
+            start,
+            Binding {
+                backend_tls,
+                ..Binding::default()
+            },
+        )
+    }
+
+    /// Build with what the praxis config fixed at startup, which serving reloads must preserve.
+    pub(crate) fn new_with(
+        config: &GridServingConfig,
+        start: StartPeer,
+        binding: Binding,
+    ) -> Result<Self, FilterError> {
+        let (bound, _) = narrowed(config, &DialConfig::default(), &binding.backend_tls)?;
+        // Cold start routes nothing over a dial: the first apply builds them.
+        let topology = Topology::from_config(&bound)?;
         // Cold start: config order until the first poll re-orders it by live load.
         let mut gauged = Gauged::new();
         let mut cold_start = RouteSnapshot::from_static(
@@ -283,13 +351,14 @@ impl Control {
             window_secs: config.window_secs,
             peers: HashMap::new(),
             applied: None,
+            dial: DialConfig::default(),
             identity: None,
             start,
             affinity: Arc::default(),
             health: Arc::default(),
             tuning: Arc::default(),
             tuned: 0,
-            backend_tls,
+            binding,
         })
     }
 
@@ -318,17 +387,16 @@ impl Control {
         Arc::clone(&self.tuning)
     }
 
-    /// Make `config` the running one: its identity, the tuning's affinity settings at
+    /// Adopt `bound`, the view that routes: its identity, the tuning's affinity settings at
     /// `generation`, and only its clusters' prefixes.
-    fn adopt(&mut self, config: &GridServingConfig, identity: [u8; 32], tag_key: Option<TagKey>, generation: u64) {
-        let clusters: Vec<Arc<str>> = config
+    fn adopt(&mut self, bound: &GridServingConfig, identity: [u8; 32], tag_key: Option<TagKey>, generation: u64) {
+        let clusters: Vec<Arc<str>> = bound
             .candidates
             .iter()
             .map(|candidate| Arc::from(candidate.cluster.as_str()))
             .collect();
         self.affinity
             .apply(self.tuning.affinity().as_ref().clone(), tag_key, &clusters);
-        self.applied = Some(config.clone());
         self.identity = Some(identity);
         self.tuned = generation;
     }
@@ -349,25 +417,51 @@ impl Control {
     ///
     /// Returns [`FilterError`] for an invalid config or a poller that cannot start, changing nothing.
     pub(crate) fn apply(&mut self, config: &GridServingConfig) -> Result<Option<ReloadOutcome>, FilterError> {
-        let identity = identity_digest(config, &self.tuning.affinity());
-        self.apply_with(config, identity)
+        let dial = self.dial.clone();
+        self.apply_joined(config, &dial)
+    }
+
+    /// [`Self::apply`] with the dial file read beside `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] for an invalid pair or a poller that cannot start, changing nothing.
+    pub(crate) fn apply_joined(
+        &mut self,
+        config: &GridServingConfig,
+        dial: &DialConfig,
+    ) -> Result<Option<ReloadOutcome>, FilterError> {
+        let identity = identity_digest(config, dial, &self.binding.grid_identity, &self.tuning.affinity());
+        self.apply_with(config, dial, identity)
     }
 
     /// [`Self::apply`] with the identity digest already computed.
     fn apply_with(
         &mut self,
-        config: &GridServingConfig,
+        raw: &GridServingConfig,
+        dial: &DialConfig,
         identity: [u8; 32],
     ) -> Result<Option<ReloadOutcome>, FilterError> {
         let renewed = self.identity.is_some_and(|applied| applied != identity);
         // A filter configured after the last apply changes the tuning, so the same file re-applies.
         let generation = self.tuning.generation();
-        if self.applied.as_ref() == Some(config) && !renewed && self.tuned == generation {
+        if self.applied.as_ref() == Some(raw) && self.dial == *dial && !renewed && self.tuned == generation {
             return Ok(None);
         }
         // Validated before any poller starts, so an invalid config starts and drops nothing.
-        validate_provider_hop_binding(config, &self.backend_tls)?;
-        let topology = Arc::new(validate_config(config)?);
+        validate_dials(raw, dial, &self.binding)?;
+        report_shadowed(dial, &self.binding.lb_clusters);
+        let bound = routed_view_with(raw, dial, &self.binding.backend_tls)?;
+        validate_config(bound.as_ref(), dial, &self.binding)?;
+        let dials = Dials::build(
+            dial,
+            &self.binding.insecure,
+            &self.binding.grid_identity.snapshot(),
+            self.health.dials(),
+        );
+        let dialable = without_unroutable(bound, &dials, &self.binding.lb_clusters);
+        let config = dialable.as_ref();
+        let topology = Arc::new(Topology::with_dials(config, &dials)?);
         let tag_key = load_tag_key(&self.tuning.affinity())?;
         if config.window_secs != self.window_secs {
             tracing::warn!(
@@ -389,7 +483,11 @@ impl Control {
         // The reload stands and its topology is published: only now may the new pollers write,
         // so their first refresh orders the new topology. Committing a kept poller is a no-op.
         self.peers.values().for_each(|running| running.handle.commit());
+        self.health.dials().adopt(dials.states());
         self.adopt(config, identity, tag_key, generation);
+        // The file as written, so re-reading it settles.
+        self.applied = Some(raw.clone());
+        self.dial = dial.clone();
         Ok(Some(outcome))
     }
 
@@ -509,8 +607,9 @@ pub(crate) fn load_tag_key(affinity: &AffinitySettings) -> Result<Option<TagKey>
         .map_err(|error| -> FilterError { format!("grid: {error}").into() })
 }
 
-/// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, or duplicate site.
-fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> {
+/// The topology of `config`, refusing what no retry can fix: a bad candidate, peer, duplicate site, or dial.
+fn validate_config(config: &GridServingConfig, dial: &DialConfig, binding: &Binding) -> Result<Topology, FilterError> {
+    validate_dials(config, dial, binding)?;
     let topology = Topology::from_config(config)?;
     let mut sites = std::collections::HashSet::with_capacity(config.peers.len());
     for peer in &config.peers {
@@ -522,26 +621,165 @@ fn validate_config(config: &GridServingConfig) -> Result<Topology, FilterError> 
     Ok(topology)
 }
 
-/// Bind every declared provider hop to one verified backend and its exact TLS SNI.
-fn validate_provider_hop_binding(
-    config: &GridServingConfig,
+/// Log and export the dials that replace a `load_balancer` cluster of the same name.
+fn report_shadowed(dial: &DialConfig, lb_clusters: &BTreeSet<String>) {
+    let shadowed: Vec<&String> = dial
+        .dial
+        .keys()
+        .filter(|cluster| lb_clusters.contains(*cluster))
+        .collect();
+    metrics::gauge!("grid_serving_dial_shadowed_clusters")
+        .set(f64::from(u32::try_from(shadowed.len()).unwrap_or(u32::MAX)));
+    if !shadowed.is_empty() {
+        tracing::info!(clusters = ?shadowed, "grid: dials replace load_balancer clusters of the same name");
+    }
+}
+
+/// [`routed_view_with`] and no dial file.
+#[cfg(test)]
+fn routed_view<'config>(
+    config: &'config GridServingConfig,
     backend_tls: &BTreeMap<String, String>,
-) -> Result<(), FilterError> {
+) -> Result<Cow<'config, GridServingConfig>, FilterError> {
+    routed_view_with(config, &DialConfig::default(), backend_tls)
+}
+
+/// The view of `config`, joined with `dial`, the router serves, logging and exporting what it leaves out.
+fn routed_view_with<'config>(
+    config: &'config GridServingConfig,
+    dial: &DialConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> Result<Cow<'config, GridServingConfig>, FilterError> {
+    let (view, narrowing) = narrowed(config, dial, backend_tls)?;
+    metrics::gauge!("grid_serving_unbound_provider_hops")
+        .set(f64::from(u32::try_from(narrowing.unbound.len()).unwrap_or(u32::MAX)));
+    if !narrowing.unbound.is_empty() {
+        tracing::warn!(
+            clusters = ?narrowing.unbound,
+            "grid: provider hops lack a matching verified TLS backend; their candidates take no traffic until a serving config names the verified SNI, or until restart for a backend not verified at startup"
+        );
+    }
+    if narrowing.crossing {
+        tracing::warn!("grid: a credential on a remote or provider-hop cluster is never injected");
+    }
+    Ok(view)
+}
+
+/// What [`narrowed`] left out of a serving config.
+struct Narrowing {
+    /// Declared provider hops with no startup-verified backend at their SNI.
+    unbound: BTreeSet<String>,
+    /// Whether a credential would have left this site.
+    crossing: bool,
+}
+
+/// The view of `config` the router serves.
+///
+/// A provider hop that does not bind to a startup-verified backend at its exact SNI leaves
+/// with its candidates: the verified map never grows, so hop context only reaches a
+/// startup-verified identity. An unbound hop's site takes no traffic rather than routing
+/// without hop context, until a serving config names the SNI its backend verified at startup,
+/// or, for a backend not verified at startup, until restart. A credential stays only on a local cluster that no Grid
+/// mutual TLS backend serves, so this site's secret is never sent to another site.
+fn narrowed<'config>(
+    config: &'config GridServingConfig,
+    dial: &DialConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> Result<(Cow<'config, GridServingConfig>, Narrowing), FilterError> {
+    let unbound = unbound_provider_hops(config, dial, backend_tls)?;
+    let leaves_site = |candidate: &CandidateConfig| credential_leaves_site(candidate, config, dial, backend_tls);
+    let crossing = config.candidates.iter().any(leaves_site);
+    let hops: Vec<(&String, &str)> = mutual_tls_dials(dial)
+        .filter(|(cluster, _)| !config.provider_hop_sni.contains_key(*cluster))
+        .collect();
+    if unbound.is_empty() && !crossing && hops.is_empty() {
+        return Ok((Cow::Borrowed(config), Narrowing { unbound, crossing }));
+    }
+    let mut view = config.clone();
+    view.provider_hop_clusters.retain(|cluster| !unbound.contains(cluster));
+    view.provider_hop_sni.retain(|cluster, _| !unbound.contains(cluster));
+    // A mutual TLS dial is a hop the gateway built itself, so it is bound by construction.
+    for (cluster, sni) in hops {
+        view.provider_hop_clusters.push(cluster.clone());
+        view.provider_hop_sni.insert(cluster.clone(), sni.to_owned());
+    }
+    view.candidates
+        .retain(|candidate| !unbound.contains(&candidate.cluster));
+    for candidate in view.candidates.iter_mut().filter(|candidate| leaves_site(candidate)) {
+        candidate.credential = None;
+    }
+    Ok((Cow::Owned(view), Narrowing { unbound, crossing }))
+}
+
+/// Whether `candidate` carries a credential its cluster would send off this site: a remote
+/// site's, or a cluster a Grid mutual TLS backend, provider hop, or dial serves.
+fn credential_leaves_site(
+    candidate: &CandidateConfig,
+    config: &GridServingConfig,
+    dials: &DialConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> bool {
+    let dial = dials.dial.get(&candidate.cluster);
+    candidate.credential.is_some()
+        && (candidate.site != config.local_site
+            || backend_tls.contains_key(&candidate.cluster)
+            || config.provider_hop_clusters.contains(&candidate.cluster)
+            || dial.is_some_and(|dial| {
+                dial.site != config.local_site || matches!(dial.transport, DialTransport::MutualTls { .. })
+            }))
+}
+
+/// The mutual TLS dials of `dial` with the name each verifies.
+fn mutual_tls_dials(dial: &DialConfig) -> impl Iterator<Item = (&String, &str)> {
+    dial.dial.iter().filter_map(|(cluster, dial)| match &dial.transport {
+        DialTransport::MutualTls { sni, .. } => Some((cluster, sni.as_str())),
+        DialTransport::Tls { .. } | DialTransport::Plaintext => None,
+    })
+}
+
+/// `config` without the candidates of a dial praxis refused or whose TLS material could not be
+/// read, unless a `load_balancer` cluster of the same name still routes them.
+fn without_unroutable<'config>(
+    config: Cow<'config, GridServingConfig>,
+    dials: &Dials,
+    lb_clusters: &BTreeSet<String>,
+) -> Cow<'config, GridServingConfig> {
+    let stranded = |cluster: &String| dials.unroutable(cluster) && !lb_clusters.contains(cluster);
+    if !config.candidates.iter().any(|candidate| stranded(&candidate.cluster)) {
+        return config;
+    }
+    let mut view = config.into_owned();
+    view.candidates.retain(|candidate| !stranded(&candidate.cluster));
+    Cow::Owned(view)
+}
+
+/// The declared provider hops with no startup-verified backend at their SNI, refusing a malformed declaration.
+fn unbound_provider_hops(
+    config: &GridServingConfig,
+    dial: &DialConfig,
+    backend_tls: &BTreeMap<String, String>,
+) -> Result<BTreeSet<String>, FilterError> {
     let clusters = validate_provider_hop_clusters(config.provider_hop_clusters.clone())?;
     if config.provider_hop_sni.len() != clusters.len() {
         return Err("grid: provider-hop SNI declarations must match the allowlist".into());
     }
-    for cluster in &clusters {
+    let mut unbound = BTreeSet::new();
+    for cluster in clusters {
         let declared = config
             .provider_hop_sni
-            .get(cluster)
+            .get(&cluster)
             .filter(|sni| !sni.trim().is_empty())
             .ok_or_else(|| -> FilterError { format!("grid: missing provider-hop SNI for {cluster}").into() })?;
-        if backend_tls.get(cluster) != Some(declared) {
-            return Err(format!("grid: provider-hop backend {cluster} lacks matching verified TLS identity").into());
+        let bound = match dial.dial.get(&cluster).map(|dial| &dial.transport) {
+            Some(DialTransport::MutualTls { sni, .. }) => sni == declared,
+            Some(DialTransport::Tls { .. } | DialTransport::Plaintext) => false,
+            None => backend_tls.get(&cluster) == Some(declared),
+        };
+        if !bound {
+            unbound.insert(cluster);
         }
     }
-    Ok(())
+    Ok(unbound)
 }
 
 /// Order the current topology under the current availability tuning and swap it in.
@@ -580,18 +818,42 @@ where
 }
 
 /// A change detector over every identity file `config` names, the grid CA, client
-/// certificate, and key, and the tag key `affinity` names. Not a security function.
-///
-/// Each file is hashed on its own, so no buffer holds the concatenated key.
-fn identity_digest(config: &GridServingConfig, affinity: &AffinitySettings) -> [u8; 32] {
+/// certificate, and key of each peer, the files `dial` reads, and the tag key `affinity` names.
+/// Not a security function.
+fn identity_digest(
+    config: &GridServingConfig,
+    dial: &DialConfig,
+    identity: &GridIdentity,
+    affinity: &AffinitySettings,
+) -> [u8; 32] {
+    let mutual = dial
+        .dial
+        .values()
+        .any(|dial| matches!(dial.transport, DialTransport::MutualTls { .. }));
     let paths: BTreeSet<&str> = config
         .peers
         .iter()
         .flat_map(|peer| [&peer.grid_ca_path, &peer.client_cert_path, &peer.client_key_path])
         .map(String::as_str)
+        // A dial's TLS material is read once per apply, so a rotated file re-applies the config.
+        .chain(dial.dial.values().filter_map(|dial| dial.transport.ca_path()))
+        .chain(
+            dial.dial
+                .values()
+                .filter_map(|dial| dial.credential.as_ref().map(|credential| credential.path.as_str())),
+        )
+        .chain(mutual.then(|| identity.paths()).into_iter().flatten())
         // A rotated tag key re-applies the config like a renewed certificate.
         .chain(affinity.tag_key_path.as_deref())
         .collect();
+    files_digest(paths)
+}
+
+/// A change detector over the content of each of `paths`, an unreadable one included. Not a
+/// security function.
+///
+/// Each file is hashed on its own, so no buffer holds the concatenated key.
+pub(crate) fn files_digest(paths: BTreeSet<&str>) -> [u8; 32] {
     let mut material = Vec::new();
     for path in paths {
         material.extend_from_slice(&path.len().to_be_bytes());
@@ -631,6 +893,16 @@ pub(crate) struct WatchCounts {
 }
 
 impl WatchCounts {
+    /// Count one applied file.
+    pub(crate) fn count_applied(&self) {
+        self.applied.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Count one rejected file.
+    pub(crate) fn count_rejected(&self) {
+        self.rejected.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Files applied so far.
     #[cfg(test)]
     pub(crate) fn applied(&self) -> usize {
@@ -658,28 +930,40 @@ impl Watcher {
     }
 }
 
-/// Apply `path` through `control` when it changes, keeping the last good config on a bad file.
+/// Apply `path` and the dial file beside it through `control` when either changes, keeping the
+/// last good pair on a bad file.
 pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration) -> std::io::Result<Watcher> {
+    let dial_path = dial_config_path(&path);
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let (stop, stopped) = mpsc::channel::<()>();
     let counts = Arc::new(WatchCounts::default());
     let tally = Arc::clone(&counts);
     std::thread::Builder::new()
         .name("grid-serving-watch".to_owned())
         .spawn(move || {
-            // The last file applied or refused for good. A file that failed for a
+            // The last pair applied or refused for good. A pair that failed for a
             // reason a retry can fix stays pending and is applied again next tick.
-            let mut settled: Option<Vec<u8>> = None;
+            let mut settled: Option<(Vec<u8>, Option<Vec<u8>>)> = None;
             while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
-                // The kubelet swaps the mounted ..data symlink, so a plain read sees the new file.
-                match std::fs::read(&path) {
-                    Ok(bytes) if settled.as_ref() != Some(&bytes) => {
-                        if apply_file(&control, &path, &bytes, &tally) {
-                            settled = Some(bytes);
+                // Both files from one revision, so a ..data swap never pairs two.
+                let revision = mount_revision(&dir);
+                let serving = path
+                    .file_name()
+                    .map_or_else(|| path.clone(), |name| revision.join(name));
+                match (std::fs::read(&serving), read_dial(&revision.join(DIAL_FILE))) {
+                    (Ok(bytes), Ok(dial)) => {
+                        let pair = (bytes, dial);
+                        if settled.as_ref() != Some(&pair)
+                            && apply_file(&control, (&path, &pair.0), (&dial_path, pair.1.as_deref()), &tally)
+                        {
+                            settled = Some(pair);
                         }
                     },
-                    Ok(_) => {},
-                    Err(_) => {
-                        tracing::warn!(path = %path.display(), "grid: serving config unreadable; keeping the last good config");
+                    (Err(error), _) => {
+                        tracing::warn!(path = %path.display(), %error, "grid: serving config unreadable; keeping the last good config");
+                    },
+                    (_, Err(error)) => {
+                        tracing::warn!(path = %dial_path.display(), %error, "grid: dial file unreadable; keeping the last good config");
                     },
                 }
                 // The running config renews its identity whatever the pending file does.
@@ -689,20 +973,46 @@ pub(crate) fn watch(control: Arc<Mutex<Control>>, path: PathBuf, every: Duration
     Ok(Watcher { _stop: stop, counts })
 }
 
-/// Parse and apply one changed file, logging and counting the result.
+/// The dial file's bytes, `None` when it does not exist.
+pub(crate) fn read_dial(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Parse and apply one changed serving file and dial file, logging and counting the result.
 ///
-/// Returns whether the file is settled: applied, or refused for good because it
+/// Returns whether the pair is settled: applied, or refused for good because it
 /// does not parse or validate. Any other failure, such as identity files
 /// mid-rotation, is retried on the next tick.
-fn apply_file(control: &Mutex<Control>, path: &std::path::Path, bytes: &[u8], tally: &WatchCounts) -> bool {
+fn apply_file(
+    control: &Mutex<Control>,
+    (path, bytes): (&Path, &[u8]),
+    (dial_path, dial_bytes): (&Path, Option<&[u8]>),
+    tally: &WatchCounts,
+) -> bool {
     let parsed = serde_yaml::from_slice::<GridServingConfig>(bytes)
         .map_err(|error| -> FilterError { format!("grid: parsing {}: {error}", path.display()).into() })
-        .and_then(|config| validate_config(&config).map(|_| config));
+        .and_then(|config| {
+            let dial =
+                dial_bytes.map_or_else(|| Ok(DialConfig::default()), |dial| parse_dial_config(dial_path, dial))?;
+            Ok((config, dial))
+        });
     let (result, settled) = match parsed {
-        Ok(config) => {
-            let result = control.lock().unwrap_or_else(PoisonError::into_inner).apply(&config);
-            let settled = result.is_ok();
-            (result, settled)
+        Ok((config, dial)) => {
+            let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
+            let outcome = match validate_config(&config, &dial, &control.binding) {
+                Ok(_) => {
+                    let result = control.apply_joined(&config, &dial);
+                    let settled = result.is_ok();
+                    (result, settled)
+                },
+                Err(error) => (Err(error), true),
+            };
+            drop(control);
+            outcome
         },
         Err(error) => (Err(error), true),
     };
@@ -713,13 +1023,19 @@ fn apply_file(control: &Mutex<Control>, path: &std::path::Path, bytes: &[u8], ta
 /// Re-apply the last good config, which restarts the pollers once its identity files change.
 fn renew_identity(control: &Mutex<Control>, tally: &WatchCounts) {
     let mut control = control.lock().unwrap_or_else(PoisonError::into_inner);
+    let dial = control.dial.clone();
     let Some((config, identity)) = control.applied.as_ref().and_then(|config| {
-        let identity = identity_digest(config, &control.tuning.affinity());
+        let identity = identity_digest(
+            config,
+            &dial,
+            &control.binding.grid_identity,
+            &control.tuning.affinity(),
+        );
         (control.identity != Some(identity)).then(|| (config.clone(), identity))
     }) else {
         return;
     };
-    let result = control.apply_with(&config, identity);
+    let result = control.apply_with(&config, &dial, identity);
     drop(control);
     if !matches!(result, Ok(None)) {
         report(&result, tally, "grid: identity rotated; peer pollers restarted");
@@ -753,7 +1069,6 @@ fn report(result: &Result<Option<ReloadOutcome>, FilterError>, tally: &WatchCoun
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::min_ident_chars,
-    clippy::too_many_lines,
     clippy::disallowed_methods,
     reason = "tests; the pollers run on their own threads, so these sync tests wait with thread::sleep"
 )]
@@ -765,12 +1080,10 @@ mod tests {
 
     use grid_client::{FetchError, Scrape, SignalSource, spawn_on_thread_held};
     use grid_signals::{Timeline, now_ms};
+    use rustls::pki_types::pem::PemObject as _;
 
     use super::*;
-    use crate::{
-        descriptor::{CandidateConfig, CapabilityKind},
-        signals::llm_d::QUEUE_METRIC,
-    };
+    use crate::{descriptor::CapabilityKind, signals::llm_d::QUEUE_METRIC};
 
     /// Queue depth each mock peer reports, and how often each was scraped and started.
     #[derive(Clone, Default)]
@@ -877,6 +1190,7 @@ mod tests {
 
     fn candidate(site: &str) -> CandidateConfig {
         CandidateConfig {
+            expires_at_ms: None,
             admission: crate::descriptor::AdmissionState::default(),
             cluster: format!("pool-{site}"),
             credential: None,
@@ -1782,5 +2096,618 @@ mod tests {
             loud.contains("grid: serving config reloaded"),
             "a real reload logs at info: {loud}"
         );
+    }
+
+    /// `config` with a provider hop on `site`'s cluster declaring `sni`.
+    fn with_hop(mut config: GridServingConfig, site: &str, sni: &str) -> GridServingConfig {
+        let cluster = format!("pool-{site}");
+        for candidate in config
+            .candidates
+            .iter_mut()
+            .filter(|candidate| candidate.cluster == cluster)
+        {
+            candidate.stable_id = Some(format!("candidate-{site}"));
+        }
+        config.provider_hop_clusters.push(cluster.clone());
+        config.provider_hop_sni.insert(cluster, sni.to_owned());
+        config
+    }
+
+    /// Verified backend identities as the loaded praxis.yaml declares them.
+    fn verified(backends: &[(&str, &str)]) -> BTreeMap<String, String> {
+        backends
+            .iter()
+            .map(|(cluster, sni)| ((*cluster).to_owned(), (*sni).to_owned()))
+            .collect()
+    }
+
+    /// East and west, each a provider hop at its own SNI.
+    fn two_hops() -> GridServingConfig {
+        with_hop(
+            with_hop(config(&["east", "west"]), "east", "east.grid.internal"),
+            "west",
+            "west.grid.internal",
+        )
+    }
+
+    #[test]
+    fn a_config_whose_every_hop_binds_is_used_as_written() {
+        let backends = verified(&[("pool-east", "east.grid.internal"), ("pool-west", "west.grid.internal")]);
+        let config = two_hops();
+        let bound = routed_view(&config, &backends).expect("binds");
+        assert!(matches!(bound, Cow::Borrowed(_)), "nothing to drop, nothing copied");
+    }
+
+    #[test]
+    fn a_hop_that_does_not_bind_leaves_with_its_candidates() {
+        for (label, backends) in [
+            ("cluster absent", verified(&[("pool-east", "east.grid.internal")])),
+            (
+                "SNI changed",
+                verified(&[
+                    ("pool-east", "east.grid.internal"),
+                    ("pool-west", "west-new.grid.internal"),
+                ]),
+            ),
+        ] {
+            let config = two_hops();
+            let bound = routed_view(&config, &backends).expect("an unbound hop is dropped, not refused");
+            assert_eq!(
+                bound.provider_hop_clusters,
+                ["pool-east"],
+                "{label}: west's hop is gone"
+            );
+            assert_eq!(
+                bound.provider_hop_sni.keys().collect::<Vec<_>>(),
+                ["pool-east"],
+                "{label}: west's SNI is gone"
+            );
+            assert_eq!(
+                bound.candidates.iter().map(|c| c.site.as_str()).collect::<Vec<_>>(),
+                ["east"],
+                "{label}: west is unroutable, not routed without hop context"
+            );
+            assert_eq!(bound.peers, config.peers, "{label}: peers keep polling");
+        }
+    }
+
+    /// A bearer-token locator on a candidate.
+    fn token() -> crate::metadata::CandidateCredential {
+        serde_json::from_value(serde_json::json!({
+            "strategy": "bearer_token",
+            "secretRef": {"name": "grid-model-client", "namespace": "models", "key": "token"}
+        }))
+        .expect("credential")
+    }
+
+    #[test]
+    fn a_credential_stays_only_on_a_local_cluster_no_grid_backend_serves() {
+        let local_backends = verified(&[("pool-east", "east.grid.internal")]);
+        let mut local = with_hop(config(&["local", "east"]), "east", "east.grid.internal");
+        local.candidates[0].credential = Some(token());
+        assert!(
+            matches!(routed_view(&local, &local_backends).expect("view"), Cow::Borrowed(_)),
+            "a local plaintext cluster keeps its credential"
+        );
+        for (label, site, cluster) in [
+            ("a remote site's", "east", "pool-east"),
+            ("a provider hop relabelled local", "local", "pool-east"),
+            ("a verified mTLS backend relabelled local", "local", "pool-west"),
+        ] {
+            let mut crossing = with_hop(config(&["local", "east"]), "east", "east.grid.internal");
+            crossing.candidates[1].site = site.to_owned();
+            crossing.candidates[1].cluster = cluster.to_owned();
+            crossing.candidates[1].credential = Some(token());
+            let backends = verified(&[("pool-east", "east.grid.internal"), ("pool-west", "west.grid.internal")]);
+            let view = routed_view(&crossing, &backends).expect("view");
+            assert!(
+                view.candidates.iter().all(|candidate| candidate.credential.is_none()),
+                "{label} credential never rides off this site"
+            );
+            assert_eq!(
+                view.candidates.len(),
+                2,
+                "{label}: the candidate still routes, without the credential"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_hop_declaration_is_still_refused() {
+        let backends = verified(&[("pool-east", "east.grid.internal")]);
+        let mut duplicate = with_hop(config(&["east"]), "east", "east.grid.internal");
+        duplicate.provider_hop_clusters.push("pool-east".to_owned());
+        let mut blank = with_hop(config(&["east"]), "east", "east.grid.internal");
+        blank.provider_hop_sni.insert("pool-east".to_owned(), " ".to_owned());
+        let mut unpaired = with_hop(config(&["east"]), "east", "east.grid.internal");
+        unpaired
+            .provider_hop_sni
+            .insert("pool-west".to_owned(), "west.grid.internal".to_owned());
+        let mut unnamed = with_hop(config(&["east"]), "east", "east.grid.internal");
+        unnamed.provider_hop_sni.clear();
+        unnamed
+            .provider_hop_sni
+            .insert("pool-west".to_owned(), "west.grid.internal".to_owned());
+        for (label, config) in [
+            ("duplicate", duplicate),
+            ("blank SNI", blank),
+            ("SNI without a hop", unpaired),
+            ("hop without its SNI", unnamed),
+        ] {
+            assert!(routed_view(&config, &backends).is_err(), "{label} is refused");
+        }
+    }
+
+    #[test]
+    fn an_unbound_hop_starts_the_gateway_and_its_file_settles() {
+        let backends = verified(&[("pool-east", "east.grid.internal")]);
+        let config = two_hops();
+        let mut control =
+            Control::new_with_backend_tls(&config, Peers::default().starter(), backends).expect("starts, not fatal");
+        assert!(
+            control.apply(&config).expect("applies").is_some(),
+            "the first apply swaps in"
+        );
+        let snapshot = control.snapshot().load_full();
+        assert_eq!(sites(&snapshot), ["east"], "only the bound site routes");
+        assert!(snapshot.provider_hop_clusters.contains("pool-east"));
+        assert!(
+            !snapshot.provider_hop_clusters.contains("pool-west"),
+            "no hop context for the unbound cluster"
+        );
+        assert!(
+            control.apply(&config).expect("re-applies").is_none(),
+            "the same file is already applied, so the watcher settles"
+        );
+        control.readopt();
+        assert_eq!(
+            sites(&control.snapshot().load_full()),
+            ["east"],
+            "re-adopting keeps the bound view"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_that_binds_restores_the_dropped_site() {
+        let backends = verified(&[
+            ("pool-east", "east.grid.internal"),
+            ("pool-west", "west-new.grid.internal"),
+        ]);
+        let stale = two_hops();
+        let mut control = Control::new_with_backend_tls(&stale, Peers::default().starter(), backends).expect("starts");
+        control.apply(&stale).expect("applies");
+        assert_eq!(
+            sites(&control.snapshot().load_full()),
+            ["east"],
+            "the stale SNI keeps west out"
+        );
+        let mut current = two_hops();
+        current
+            .provider_hop_sni
+            .insert("pool-west".to_owned(), "west-new.grid.internal".to_owned());
+        assert!(control.apply(&current).expect("applies").is_some());
+        let mut routed = sites(&control.snapshot().load_full());
+        routed.sort();
+        assert_eq!(routed, ["east", "west"], "the matching SNI routes west again");
+        assert!(control.snapshot().load().provider_hop_clusters.contains("pool-west"));
+    }
+
+    /// A dial to `pool-{site}` at `site` over `transport`.
+    fn dial_spec(site: &str, transport: DialTransport) -> crate::serving::DialSpec {
+        crate::serving::DialSpec {
+            address: format!("{site}.example.com:8443"),
+            base_path: None,
+            connect_retries: None,
+            connect_timeout_ms: None,
+            credential: None,
+            read_timeout_ms: None,
+            site: site.to_owned(),
+            total_connect_timeout_ms: None,
+            transport,
+            trusted_private: false,
+            write_timeout_ms: None,
+        }
+    }
+
+    /// Mutual TLS to `site`.
+    fn mutual_tls(site: &str) -> DialTransport {
+        DialTransport::MutualTls {
+            sni: certs::site_dns_name(site),
+        }
+    }
+
+    /// East served over a mutual TLS dial, no peers polled.
+    fn dialed_east() -> (GridServingConfig, DialConfig) {
+        let mut config = config(&["east"]);
+        config.peers.clear();
+        config.candidates[0].stable_id = Some("candidate-east".to_owned());
+        let mut dial = DialConfig::default();
+        dial.dial
+            .insert("pool-east".to_owned(), dial_spec("east", mutual_tls("east")));
+        (config, dial)
+    }
+
+    /// What a gateway whose grid identity is mounted at `dir` fixed at startup.
+    fn bound_at(dir: &Path) -> Binding {
+        Binding {
+            grid_identity: GridIdentity::under(&dir.to_string_lossy()),
+            ..Binding::default()
+        }
+    }
+
+    /// A control plane over `config` presenting the identity under `dir`.
+    fn dial_control(config: &GridServingConfig, dir: &Path) -> Control {
+        Control::new_with(config, Peers::default().starter(), bound_at(dir)).expect("control")
+    }
+
+    /// A fresh `local` identity under `dir`, returning its leaf certificate PEM.
+    fn write_identity(dir: &Path, ca: &certs::CaCert) -> String {
+        praxis_tls::provider::install();
+        let leaf = certs::generate_site_cert(ca, "local").expect("leaf");
+        std::fs::create_dir_all(dir).expect("test io");
+        std::fs::write(dir.join("ca.crt"), &ca.cert_pem).expect("test io");
+        std::fs::write(dir.join("tls.crt"), &leaf.cert_pem).expect("test io");
+        std::fs::write(dir.join("tls.key"), &leaf.key_pem).expect("test io");
+        leaf.cert_pem
+    }
+
+    /// The leaf DER the dial for `cluster` presents in `snapshot`.
+    fn presented(snapshot: &RouteSnapshot, cluster: &str) -> Option<Vec<u8>> {
+        let candidate = snapshot
+            .candidates
+            .iter()
+            .find(|candidate| &*candidate.cluster == cluster)?;
+        let tls = candidate.dial.as_ref()?.upstream().tls.clone()?;
+        tls.client_cert()?.cert_der().first().cloned()
+    }
+
+    /// The address the dial for `cluster` sends to in `snapshot`.
+    fn address(snapshot: &RouteSnapshot, cluster: &str) -> Option<String> {
+        let candidate = snapshot
+            .candidates
+            .iter()
+            .find(|candidate| &*candidate.cluster == cluster)?;
+        Some(candidate.dial.as_ref()?.upstream().address.to_string())
+    }
+
+    /// A temp directory unique to `name` and this process.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("grid-control-{name}-{}", std::process::id()));
+        let _cleared = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn an_undialable_cluster_takes_no_traffic_until_its_identity_reads() {
+        let dir = temp_dir("undialable");
+        let (config, dial) = dialed_east();
+        let mut control = dial_control(&config, &dir);
+        control
+            .apply_joined(&config, &dial)
+            .expect("an unreadable identity does not reject the file");
+        let snapshot = control.snapshot();
+        assert!(
+            snapshot.load().candidates.is_empty(),
+            "east has nothing to dial with, so it takes no traffic"
+        );
+
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let control = Mutex::new(control);
+        renew_identity(&control, &WatchCounts::default());
+        assert!(
+            presented(&snapshot.load(), "pool-east").is_some(),
+            "the identity read, so east is dialed again with no config change"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rotated_identity_rebuilds_the_dial() {
+        let dir = temp_dir("rotated");
+        let ca = certs::generate_ca("grid-ca").expect("ca");
+        let first = write_identity(&dir, &ca);
+        let (config, dial) = dialed_east();
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let snapshot = control.snapshot();
+        let leaf = |pem: &str| {
+            rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+                .next()
+                .expect("a leaf")
+                .expect("parses")
+                .to_vec()
+        };
+        assert_eq!(presented(&snapshot.load(), "pool-east"), Some(leaf(&first)));
+
+        let renewed = write_identity(&dir, &ca);
+        let control = Mutex::new(control);
+        renew_identity(&control, &WatchCounts::default());
+        assert_eq!(
+            presented(&snapshot.load(), "pool-east"),
+            Some(leaf(&renewed)),
+            "the renewed leaf is presented on the next dial"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dial_violating_a_trust_rule_keeps_the_last_good_config() {
+        let dir = temp_dir("violation");
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (config, good) = dialed_east();
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &good).expect("applies");
+        let mut bad = good.clone();
+        if let Some(dial) = bad.dial.get_mut("pool-east") {
+            dial.transport = DialTransport::Plaintext;
+        }
+        assert!(
+            control.apply_joined(&config, &bad).is_err(),
+            "plaintext off this site is refused"
+        );
+        assert!(
+            presented(&control.snapshot().load(), "pool-east").is_some(),
+            "the last good dial still serves"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dial_praxis_refuses_drops_only_its_cluster_and_startup_still_succeeds() {
+        let dir = temp_dir("refused");
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (mut config, mut dial) = dialed_east();
+        let mut west = candidate("west");
+        west.stable_id = Some("candidate-west".to_owned());
+        config.candidates.push(west);
+        dial.dial
+            .insert("pool-west".to_owned(), dial_spec("west", mutual_tls("west")));
+        if let Some(east) = dial.dial.get_mut("pool-east") {
+            east.address = "east.cluster.internal:8443".to_owned();
+        }
+        let grid = crate::serving::start_runtime_with(&config, &dial, Peers::default().starter(), bound_at(&dir))
+            .expect("a refused dial never stops startup");
+        let snapshot = grid.snapshot().load_full();
+        assert_eq!(sites(&snapshot), ["west"], "east's candidates take no traffic");
+        assert!(presented(&snapshot, "pool-west").is_some(), "west still dials");
+        drop(grid);
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_dial_with_a_load_balancer_cluster_of_its_name_routes_through_it() {
+        let dir = temp_dir("refused-lb");
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (config, mut dial) = dialed_east();
+        if let Some(east) = dial.dial.get_mut("pool-east") {
+            east.address = "east.cluster.internal:8443".to_owned();
+        }
+        for (lb, routes) in [(true, true), (false, false)] {
+            let binding = Binding {
+                lb_clusters: lb.then(|| "pool-east".to_owned()).into_iter().collect(),
+                ..bound_at(&dir)
+            };
+            let mut control = Control::new_with(&config, Peers::default().starter(), binding).expect("control");
+            control
+                .apply_joined(&config, &dial)
+                .expect("a refused dial never rejects the file");
+            let snapshot = control.snapshot().load_full();
+            assert_eq!(
+                !sites(&snapshot).is_empty(),
+                routes,
+                "a load_balancer cluster {lb}: east routes {routes}"
+            );
+            assert!(
+                snapshot.candidates.iter().all(|candidate| candidate.dial.is_none()),
+                "with no dial built"
+            );
+        }
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dial_file_breaking_a_trust_rule_at_startup_serves_without_dials() {
+        let (config, mut dial) = dialed_east();
+        if let Some(east) = dial.dial.get_mut("pool-east") {
+            east.transport = DialTransport::Plaintext;
+        }
+        let grid = crate::serving::start_runtime_with(&config, &dial, Peers::default().starter(), Binding::default())
+            .expect("a bad dial file never stops startup");
+        let snapshot = grid.snapshot().load_full();
+        assert_eq!(sites(&snapshot), ["east"], "east routes through its declared cluster");
+        assert!(
+            snapshot.candidates.iter().all(|candidate| candidate.dial.is_none()),
+            "with no dial built"
+        );
+    }
+
+    #[test]
+    fn a_dial_decides_a_hop_binding_over_a_load_balancer_cluster_of_the_same_name() {
+        let dir = temp_dir("shadow");
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (config, dial) = dialed_east();
+        let config = with_hop(config, "east", "east.grid.internal");
+        let binding = Binding {
+            backend_tls: verified(&[("pool-east", "east.grid.internal")]),
+            lb_clusters: BTreeSet::from(["pool-east".to_owned()]),
+            ..bound_at(&dir)
+        };
+        let mut control = Control::new_with(&config, Peers::default().starter(), binding).expect("control");
+        control.apply_joined(&config, &dial).expect("applies");
+        let snapshot = control.snapshot().load_full();
+        assert!(
+            presented(&snapshot, "pool-east").is_some(),
+            "the dial at the verified name binds the hop"
+        );
+        assert!(
+            snapshot.provider_hop_clusters.contains("pool-east"),
+            "the hop keeps its context"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_credential_never_rides_a_mutual_tls_or_off_site_dial() {
+        let mut config = config(&["local", "east"]);
+        config.peers.clear();
+        let mut dial = DialConfig::default();
+        let mut local = |cluster: &str, transport: DialTransport| {
+            let mut candidate = candidate("local");
+            candidate.cluster = cluster.to_owned();
+            candidate.stable_id = Some(format!("candidate-{cluster}"));
+            candidate.credential = Some(token());
+            config.candidates.push(candidate);
+            dial.dial.insert(cluster.to_owned(), dial_spec("local", transport));
+        };
+        local("local-mtls", mutual_tls("local"));
+        local(
+            "local-tls",
+            DialTransport::Tls {
+                ca_path: None,
+                sni: "models.local.example.com".to_owned(),
+            },
+        );
+        local("local-plain", DialTransport::Plaintext);
+        let east = config
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.site == "east")
+            .expect("east");
+        east.credential = Some(token());
+        east.stable_id = Some("candidate-east".to_owned());
+        dial.dial.insert(
+            "pool-east".to_owned(),
+            dial_spec(
+                "east",
+                DialTransport::Tls {
+                    ca_path: None,
+                    sni: "east.example.com".to_owned(),
+                },
+            ),
+        );
+        assert!(
+            validate_dials(&config, &dial, &Binding::default()).is_err(),
+            "a credentialed candidate is never dialed"
+        );
+
+        let view = routed_view_with(&config, &dial, &BTreeMap::new()).expect("view");
+        let credentialed: BTreeSet<&str> = view
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.credential.is_some())
+            .map(|candidate| candidate.cluster.as_str())
+            .collect();
+        assert_eq!(
+            credentialed,
+            BTreeSet::from(["local-plain", "local-tls"]),
+            "a credential stays only on a local dial without this site's identity"
+        );
+        assert_eq!(
+            view.provider_hop_clusters,
+            ["local-mtls"],
+            "a mutual TLS dial is a hop, so the caller's credentials are stripped too"
+        );
+        assert_eq!(
+            view.provider_hop_sni.get("local-mtls").map(String::as_str),
+            Some("local.grid.internal"),
+            "bound at the name the dial verifies"
+        );
+    }
+
+    #[test]
+    fn a_failing_dial_is_ordered_last_but_never_excluded() {
+        let dir = temp_dir("demoted");
+        write_identity(&dir, &certs::generate_ca("grid-ca").expect("ca"));
+        let (mut config, mut dial) = dialed_east();
+        let mut west = candidate("west");
+        west.stable_id = Some("candidate-west".to_owned());
+        config.candidates.insert(0, west);
+        dial.dial
+            .insert("pool-west".to_owned(), dial_spec("west", mutual_tls("west")));
+        let mut control = dial_control(&config, &dir);
+        control.apply_joined(&config, &dial).expect("applies");
+        let east = control.health().dials().state("pool-east", "east.example.com:8443");
+        east.record(false, crate::health::monotonic_ms());
+        east.record(false, crate::health::monotonic_ms());
+        assert!(control.health().update(), "the down dial is news");
+        control.refresh()(&control.store());
+        let snapshot = control.snapshot().load_full();
+        assert_eq!(sites(&snapshot), ["west", "east"], "east is ordered last, not removed");
+        let mut reloaded = config.clone();
+        reloaded.load_window_ms = 31_000;
+        control.apply_joined(&reloaded, &dial).expect("a rewrite applies");
+        assert!(
+            control
+                .health()
+                .dials()
+                .state("pool-east", "east.example.com:8443")
+                .down(),
+            "a reload keeps the down dial"
+        );
+        let _cleaned = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_watch_applies_the_dial_file_beside_the_serving_file() {
+        let dir = temp_dir("watch-dial");
+        let tls = dir.join("tls");
+        write_identity(&tls, &certs::generate_ca("grid-ca").expect("ca"));
+        let write = |name: &str, text: &str| {
+            let staged = dir.join(format!("{name}.tmp"));
+            std::fs::write(&staged, text).expect("write");
+            std::fs::rename(&staged, dir.join(name)).expect("rename");
+        };
+        let serving = r#"{"local_site":"local","window_secs":60,"load_window_ms":30000,"candidates":[{"kind":"inference_model","name":"llama","site":"east","cluster":"pool-east","stable_id":"candidate-east"}],"peers":[]}"#;
+        let dial = |mode: &str| {
+            format!(
+                r#"{{"version":"v1","dial":{{"pool-east":{{"address":"east.example.com:8443","site":"east","transport":{{"mode":"{mode}","sni":"east.grid.internal"}}}}}}}}"#
+            )
+        };
+        write("serving-config.json", serving);
+        write(DIAL_FILE, &dial("mutual_tls"));
+        let (config, _) = dialed_east();
+
+        let mut grid = crate::serving::start_runtime_with(
+            &config,
+            &DialConfig::default(),
+            Peers::default().starter(),
+            bound_at(&tls),
+        )
+        .expect("runtime starts");
+        grid.watch(dir.join("serving-config.json"), Duration::from_millis(20))
+            .expect("watch");
+        let snapshot = grid.snapshot();
+        let counts = || grid.watcher().expect("watching").counts();
+        eventually("the dial file applied", || counts().applied() == 1);
+        assert!(presented(&snapshot.load(), "pool-east").is_some(), "east is dialed");
+
+        write(
+            DIAL_FILE,
+            &dial("mutual_tls").replace("east.example.com:8443", "east-2.example.com:8443"),
+        );
+        eventually("the moved address applied", || counts().applied() == 2);
+        assert_eq!(
+            address(&snapshot.load(), "pool-east").as_deref(),
+            Some("east-2.example.com:8443"),
+            "a dial file change alone re-applies"
+        );
+
+        write(DIAL_FILE, &dial("insecure"));
+        eventually("the bad dial file refused", || counts().rejected() == 1);
+        assert!(
+            presented(&snapshot.load(), "pool-east").is_some(),
+            "a bad dial file keeps the last good pair"
+        );
+
+        std::fs::remove_file(dir.join(DIAL_FILE)).expect("remove");
+        eventually("the removal applied", || counts().applied() == 3);
+        let routed = snapshot.load_full();
+        assert_eq!(sites(&routed), ["east"], "east still routes");
+        assert!(
+            routed.candidates.iter().all(|candidate| candidate.dial.is_none()),
+            "a missing dial file names no dial, so east falls back to its declared cluster"
+        );
+        drop(grid);
+        let _cleaned = std::fs::remove_dir_all(&dir);
     }
 }

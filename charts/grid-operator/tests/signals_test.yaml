@@ -444,3 +444,42 @@ tests:
           content:
             name: GRID_SIGNALS_PEER_INTERVAL_SECS
             value: "99999"
+
+  - it: refuses a Cluster policy on the signals Service behind a LoadBalancer
+    template: templates/deployment.yaml
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      swim.service.type: LoadBalancer
+      signals.service.enabled: true
+      signals.service.externalTrafficPolicy: Cluster
+    asserts:
+      - failedTemplate:
+          errorPattern: signals.service.externalTrafficPolicy Local
+
+  - it: accepts a Cluster policy on a ClusterIP signals Service, and renders none, which the API server would refuse
+    template: templates/service-signals.yaml
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.service.enabled: true
+      signals.service.type: ClusterIP
+      signals.service.externalTrafficPolicy: Cluster
+    asserts:
+      - hasDocuments:
+          count: 1
+      - notExists:
+          path: spec.externalTrafficPolicy
+
+  - it: passes the per-source handshake cap for a site behind a router
+    template: templates/deployment.yaml
+    set:
+      signals.enabled: true
+      swim.service.enabled: true
+      signals.maxHandshakesPerSource: 64
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE
+            value: "64"

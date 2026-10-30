@@ -11,7 +11,10 @@ use kube::{
 use crate::{
     controller::grid_network::GridModes,
     crd::{
-        grid_network::{GridNetwork, GridNetworkSpec, PeerTrustConfig, SecretRef, SignalTransportConfig, TlsConfig},
+        grid_network::{
+            GridNetwork, GridNetworkSpec, MembershipConfig, PeerTrustConfig, SecretRef, SignalTransportConfig,
+            SignedStateMode, TlsConfig,
+        },
         grid_site::{GridSite, GridSiteSpec},
     },
     error::OperatorError,
@@ -79,7 +82,13 @@ pub fn grid_network(plan: &Plan) -> Result<GridNetwork, OperatorError> {
     spec.signal_transport = Some(SignalTransportConfig {
         mode: plan.modes.signal,
     });
-    spec.peer_trust = Some(PeerTrustConfig { mode: plan.modes.trust });
+    spec.peer_trust = Some(PeerTrustConfig {
+        mode: plan.modes.trust,
+        signed_state: SignedStateMode::default(),
+    });
+    spec.membership = Some(MembershipConfig {
+        mode: plan.modes.membership,
+    });
     let mut network = GridNetwork::new(&plan.network, spec);
     network.metadata.labels = Some(created_by());
     Ok(network)
@@ -95,6 +104,7 @@ pub fn grid_site(plan: &Plan, network: &str) -> GridSite {
         sovereignty_zone: None,
         zone: None,
         trust: None,
+        signals_endpoint: None,
     };
     let mut site = GridSite::new(&plan.site, spec);
     let mut labels = created_by();
@@ -188,7 +198,8 @@ fn created_by() -> BTreeMap<String, String> {
     BTreeMap::from([(CREATED_BY_LABEL.to_owned(), CREATED_BY.to_owned())])
 }
 
-/// The SWIM key Secret's name when it exists in the identity's namespace.
+/// The SWIM key Secret's name when it exists in the identity's namespace, `None` for an
+/// empty name.
 ///
 /// # Errors
 ///
@@ -198,6 +209,9 @@ pub async fn swim_key_secret_for_identity(
     identity: &Identity,
     name: &str,
 ) -> Result<Option<String>, OperatorError> {
+    if name.is_empty() {
+        return Ok(None);
+    }
     let found = Box::pin(Api::<Secret>::namespaced(client.clone(), &identity.namespace).get_opt(name)).await?;
     Ok(found.map(|_| name.to_owned()))
 }
@@ -211,7 +225,7 @@ mod tests {
 
     use crate::{
         controller::grid_network::GridModes,
-        crd::grid_network::{PeerTrustMode, SignalMode},
+        crd::grid_network::{MembershipMode, PeerTrustMode, SignalMode},
         local_records::{CREATED_BY_LABEL, MARKER, Outcome, Plan, create, grid_network, grid_site},
         local_site::PROVIDER_SITE_LABEL,
         site_name::Identity,
@@ -281,9 +295,14 @@ mod tests {
 
     #[test]
     fn the_network_declares_the_install_modes() {
-        let network = grid_network(&plan(None)).expect("network");
-        assert_eq!(network.spec.signal_transport.map(|t| t.mode), Some(SignalMode::Poll));
-        assert_eq!(network.spec.peer_trust.map(|t| t.mode), Some(PeerTrustMode::Pin));
+        for membership in [MembershipMode::Swim, MembershipMode::Local] {
+            let mut plan = plan(None);
+            plan.modes = plan.modes.with_membership(membership);
+            let network = grid_network(&plan).expect("network");
+            assert_eq!(network.spec.membership.map(|m| m.mode), Some(membership));
+            assert_eq!(network.spec.signal_transport.map(|t| t.mode), Some(SignalMode::Poll));
+            assert_eq!(network.spec.peer_trust.map(|t| t.mode), Some(PeerTrustMode::Pin));
+        }
     }
 
     #[test]

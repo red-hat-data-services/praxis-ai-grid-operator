@@ -16,12 +16,37 @@ spec:
         - jsonPath: .status.gridId
           name: Grid ID
           type: string
-        - jsonPath: .status.phase
-          name: Phase
-          type: string
         - jsonPath: .status.connectedSites
           name: Sites
           type: integer
+        - jsonPath: .status.conditions[?(@.type=="Available")].status
+          name: Available
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Progressing")].status
+          name: Progressing
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Degraded")].status
+          name: Degraded
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Available")].lastTransitionTime
+          name: Since
+          type: date
+        - jsonPath: .status.conditions[?(@.type=="Available")].message
+          name: Message
+          priority: 1
+          type: string
+        - jsonPath: .status.phase
+          name: Phase
+          priority: 1
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="Enrolled")].status
+          name: Enrolled
+          priority: 1
+          type: string
+        - jsonPath: .status.conditions[?(@.type=="IdentityValid")].status
+          name: Identity
+          priority: 1
+          type: string
       name: v1alpha1
       schema:
         openAPIV3Schema:
@@ -163,10 +188,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          inference-model `intelligent_route` candidates (with credential
-                          `secretRef` data), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -234,9 +258,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -295,14 +322,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.
@@ -329,9 +357,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -415,6 +446,23 @@ spec:
                                 description: Enable delegated mount reconciliation. Defaults to `false`.
                                 type: boolean
                             type: object
+                          siteRouter:
+                            default: intelligentRoute
+                            description: |-
+                              The filter that picks a candidate for each request.
+
+                              `gridSiteRoute` reads the serving config, so it needs the operator's
+                              poll signal transport. It also needs an enabled `mountReconciliation`,
+                              whose rollout per config revision re-reads the provider-hop backends,
+                              and an empty `providerHopEndpoints`, since hops follow `clusterEndpoints`.
+                              Every cluster is health-checked, so the gateway's readiness probe must
+                              ask Praxis `/healthy`: `/ready` fails while any one site is down.
+
+                              Default: `intelligentRoute`.
+                            enum:
+                              - intelligentRoute
+                              - gridSiteRoute
+                            type: string
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -518,6 +566,16 @@ spec:
                           [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                         nullable: true
                         type: string
+                      modelDiscoveryContractVersion:
+                        description: |-
+                          Model-discovery contract version supported by the running gateway.
+
+                          Set this only after the gateway is running an image that understands
+                          the `expires_at` routing-candidate field and enforces its deadline.
+                          The operator includes discovered model candidates only when this is
+                          exactly `v1`; absent or other values keep dynamic candidates withheld.
+                        nullable: true
+                        type: string
                       name:
                         description: Gateway name.
                         type: string
@@ -531,10 +589,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          inference-model `intelligent_route` candidates (with credential
-                          `secretRef` data), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -602,9 +659,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -668,14 +728,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.
@@ -702,9 +763,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -799,6 +863,23 @@ spec:
                             x-kubernetes-validations:
                               - message: deploymentName is required when mount reconciliation is enabled
                                 rule: '!has(self.enabled) || !self.enabled || has(self.deploymentName)'
+                          siteRouter:
+                            default: intelligentRoute
+                            description: |-
+                              The filter that picks a candidate for each request.
+
+                              `gridSiteRoute` reads the serving config, so it needs the operator's
+                              poll signal transport. It also needs an enabled `mountReconciliation`,
+                              whose rollout per config revision re-reads the provider-hop backends,
+                              and an empty `providerHopEndpoints`, since hops follow `clusterEndpoints`.
+                              Every cluster is health-checked, so the gateway's readiness probe must
+                              ask Praxis `/healthy`: `/ready` fails while any one site is down.
+
+                              Default: `intelligentRoute`.
+                            enum:
+                              - intelligentRoute
+                              - gridSiteRoute
+                            type: string
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -888,9 +969,11 @@ spec:
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
-                          serving config. This allowlist is independent of `praxisConfig`, so a
-                          missing or disabled generated Praxis config cannot alter embedded
-                          serving behavior. Every entry must declare `mutual_tls` and a nonblank
+                          serving config. With the default `praxisConfig.siteRouter`
+                          `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
+                          missing or disabled generated Praxis config cannot alter embedded serving
+                          behavior. With `gridSiteRoute` the hops are the generated config's mutual
+                          TLS endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
                           SNI. The embedded gateway compares each declaration against the
                           loaded Praxis load-balancer's verified mTLS backend before it sends
                           provider-hop context. Changing Praxis backend transport requires a
@@ -918,9 +1001,12 @@ spec:
                                   nullable: true
                                   properties:
                                     key:
-                                      description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                      description: |-
+                                        Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                        or `..`, and not starting with `..`.
                                       minLength: 1
                                       nullable: true
+                                      pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                       type: string
                                     name:
                                       description: Secret name in the target gateway namespace.
@@ -992,10 +1078,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          inference-model `intelligent_route` candidates (with credential
-                          `secretRef` data), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -1063,9 +1148,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -1124,14 +1212,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.
@@ -1158,9 +1247,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -1244,6 +1336,23 @@ spec:
                                 description: Enable delegated mount reconciliation. Defaults to `false`.
                                 type: boolean
                             type: object
+                          siteRouter:
+                            default: intelligentRoute
+                            description: |-
+                              The filter that picks a candidate for each request.
+
+                              `gridSiteRoute` reads the serving config, so it needs the operator's
+                              poll signal transport. It also needs an enabled `mountReconciliation`,
+                              whose rollout per config revision re-reads the provider-hop backends,
+                              and an empty `providerHopEndpoints`, since hops follow `clusterEndpoints`.
+                              Every cluster is health-checked, so the gateway's readiness probe must
+                              ask Praxis `/healthy`: `/ready` fails while any one site is down.
+
+                              Default: `intelligentRoute`.
+                            enum:
+                              - intelligentRoute
+                              - gridSiteRoute
+                            type: string
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -1347,6 +1456,16 @@ spec:
                           [`GridNetwork`]: crate::crd::grid_network::GridNetwork
                         nullable: true
                         type: string
+                      modelDiscoveryContractVersion:
+                        description: |-
+                          Model-discovery contract version supported by the running gateway.
+
+                          Set this only after the gateway is running an image that understands
+                          the `expires_at` routing-candidate field and enforces its deadline.
+                          The operator includes discovered model candidates only when this is
+                          exactly `v1`; absent or other values keep dynamic candidates withheld.
+                        nullable: true
+                        type: string
                       name:
                         description: Gateway name.
                         type: string
@@ -1360,10 +1479,9 @@ spec:
                           When absent or `generate: false`, this gateway behaves exactly as before:
                           only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
                           operator additionally renders a consumer Praxis `ConfigMap` containing the
-                          inference-model `intelligent_route` candidates (with credential
-                          `secretRef` data), a `credential_inject` section for credential-bearing
-                          inference candidates, and a `load_balancer` section with one cluster
-                          entry per unique inference cluster. Other capability kinds remain in the
+                          routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+                          a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+                          one cluster entry per unique inference cluster. Other capability kinds remain in the
                           routing overlay for dedicated data-plane pipelines.
 
                           The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -1431,9 +1549,12 @@ spec:
                                       nullable: true
                                       properties:
                                         key:
-                                          description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                          description: |-
+                                            Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                            or `..`, and not starting with `..`.
                                           minLength: 1
                                           nullable: true
+                                          pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                           type: string
                                         name:
                                           description: Secret name in the target gateway namespace.
@@ -1492,14 +1613,15 @@ spec:
                             type: string
                           deriveTopology:
                             description: |-
-                              Derive the endpoint topology from the declarations of named providers,
-                              instead of requiring a `clusterEndpoints` entry per candidate.
+                              Settings for the endpoint topology the operator derives for each candidate
+                              with no `clusterEndpoints` entry. Absent still derives.
                             nullable: true
                             properties:
                               fromProviders:
                                 default: []
                                 description: |-
-                                  Routing identities whose declarations this gateway derives from.
+                                  Remote routing identities this gateway derives a hop for without a member catalog,
+                                  as under SWIM membership.
 
                                   Each entry is a provider's `clusterName`, or its `metadata.name`
                                   when that is unset. At most 64 entries, each named once.
@@ -1526,9 +1648,12 @@ spec:
                                     nullable: true
                                     properties:
                                       key:
-                                        description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                        description: |-
+                                          Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                          or `..`, and not starting with `..`.
                                         minLength: 1
                                         nullable: true
+                                        pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                         type: string
                                       name:
                                         description: Secret name in the target gateway namespace.
@@ -1612,6 +1737,23 @@ spec:
                                 description: Enable delegated mount reconciliation. Defaults to `false`.
                                 type: boolean
                             type: object
+                          siteRouter:
+                            default: intelligentRoute
+                            description: |-
+                              The filter that picks a candidate for each request.
+
+                              `gridSiteRoute` reads the serving config, so it needs the operator's
+                              poll signal transport. It also needs an enabled `mountReconciliation`,
+                              whose rollout per config revision re-reads the provider-hop backends,
+                              and an empty `providerHopEndpoints`, since hops follow `clusterEndpoints`.
+                              Every cluster is health-checked, so the gateway's readiness probe must
+                              ask Praxis `/healthy`: `/ready` fails while any one site is down.
+
+                              Default: `intelligentRoute`.
+                            enum:
+                              - intelligentRoute
+                              - gridSiteRoute
+                            type: string
                           supportsProjectedCredentials:
                             default: false
                             description: |-
@@ -1701,9 +1843,11 @@ spec:
                       providerHopEndpoints:
                         description: |-
                           Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
-                          serving config. This allowlist is independent of `praxisConfig`, so a
-                          missing or disabled generated Praxis config cannot alter embedded
-                          serving behavior. Every entry must declare `mutual_tls` and a nonblank
+                          serving config. With the default `praxisConfig.siteRouter`
+                          `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
+                          missing or disabled generated Praxis config cannot alter embedded serving
+                          behavior. With `gridSiteRoute` the hops are the generated config's mutual
+                          TLS endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
                           SNI. The embedded gateway compares each declaration against the
                           loaded Praxis load-balancer's verified mTLS backend before it sends
                           provider-hop context. Changing Praxis backend transport requires a
@@ -1731,9 +1875,12 @@ spec:
                                   nullable: true
                                   properties:
                                     key:
-                                      description: Optional key containing the CA bundle. Defaults to `ca.crt`.
+                                      description: |-
+                                        Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+                                        or `..`, and not starting with `..`.
                                       minLength: 1
                                       nullable: true
+                                      pattern: ^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$
                                       type: string
                                     name:
                                       description: Secret name in the target gateway namespace.
@@ -1791,9 +1938,28 @@ spec:
                 gridId:
                   default: ""
                   description: |-
-                    Grid ID for tenancy. Empty on creation; auto-generated
-                    on first join with another site.
+                    The grid this network belongs to, set once by bootstrap or its delivery automation.
+                    The operator waits until this is declared and never generates a grid ID.
+                    A grid ID that operators before #474 kept only in status is copied here once, and status then mirrors spec.
+                    Moving to another grid means recreating the network.
+                  maxLength: 63
+                  pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$
                   type: string
+                membership:
+                  description: |-
+                    Grid-wide membership source. When absent, the install's startup setting applies.
+                    A change causes the operator to restart gracefully into the declared mode.
+                  nullable: true
+                  properties:
+                    mode:
+                      description: 'Membership source. Local requires `signalTransport.mode: poll`.'
+                      enum:
+                        - Swim
+                        - Local
+                      type: string
+                  required:
+                    - mode
+                  type: object
                 metricsRefreshInterval:
                   description: |-
                     Maximum time between metric refreshes and score/ranking recalculation.
@@ -1807,7 +1973,9 @@ spec:
                   pattern: ^([1-9][0-9]*s|[1-9][0-9]{3,}ms)$
                   type: string
                 peerTrust:
-                  description: Grid-wide peer trust on the signals path, `pin` when absent, read at operator start.
+                  description: |-
+                    Grid-wide peer trust: signals-path mode, `pin` when absent, read at operator start; signed state, read each
+                    reconcile.
                   nullable: true
                   properties:
                     mode:
@@ -1815,6 +1983,13 @@ spec:
                       enum:
                         - pin
                         - spiffe
+                      type: string
+                    signedState:
+                      default: "off"
+                      description: 'Signed state, `off` when absent. Switch every site together: an enforcing site refuses unsigned peers.'
+                      enum:
+                        - "off"
+                        - enforce
                       type: string
                   required:
                     - mode
@@ -2099,6 +2274,10 @@ spec:
               x-kubernetes-validations:
                 - message: placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom
                   rule: has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')
+                - message: gridId cannot change once set
+                  rule: '!has(oldSelf.gridId) || oldSelf.gridId == '''' || (has(self.gridId) && self.gridId == oldSelf.gridId)'
+                - message: membership.mode Local requires signalTransport.mode poll
+                  rule: '!has(self.membership) || self.membership.mode != ''Local'' || (has(self.signalTransport) && self.signalTransport.mode == ''poll'')'
                 - message: set only `gatewayRefs` or `consumerGateways`, not both
                   rule: '!(has(self.gatewayRefs) && has(self.consumerGateways))'
             status:
@@ -2170,6 +2349,10 @@ spec:
                         type: string
                       status:
                         description: '`True`, `False`, or `Unknown`.'
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
                         type: string
                       type:
                         description: Condition type, such as `Ready`.
@@ -2247,35 +2430,6 @@ spec:
                   default: ""
                   description: The negotiated grid ID.
                   type: string
-                identity:
-                  description: 'This site''s identity certificate: when it expires and when rotation is due.'
-                  nullable: true
-                  properties:
-                    fingerprint:
-                      description: SHA-256 of the certificate DER, the digest peers pin.
-                      type: string
-                    message:
-                      description: How to recover.
-                      type: string
-                    notAfter:
-                      description: When the certificate expires, RFC 3339.
-                      type: string
-                    reason:
-                      description: |-
-                        `IdentityExpired` once the certificate has expired, `IdentityUnreadable` when the
-                        Secret holds no usable certificate.
-                      pattern: ^(IdentityExpired|IdentityUnreadable)$
-                      type: string
-                    rotateAfter:
-                      description: |-
-                        When rotation is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
-                        under pin peer trust, or when this site's operator does not rotate.
-                      type: string
-                  required:
-                    - fingerprint
-                    - notAfter
-                    - rotateAfter
-                  type: object
                 mountReconciliationStatus:
                   description: |-
                     Per-gateway Secret requirements and optional mount reconciliation status.

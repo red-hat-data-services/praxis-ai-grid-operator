@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{crd::inference_provider::Condition, signals::Observation};
+use crate::{
+    crd::inference_provider::{Condition, ConditionStatus},
+    signals::Observation,
+};
 
 /// Metric names that count a pool's ready endpoints, preferred first.
 pub(crate) const DEFAULT_READY_ENDPOINTS: [&str; 2] = ["llm_d_epp_ready_endpoints", "inference_pool_ready_pods"];
@@ -118,20 +121,29 @@ impl Reason {
 
     /// The condition status: `True`, `False`, or `Unknown`.
     #[must_use]
-    pub const fn status(self) -> &'static str {
+    pub const fn status(self) -> ConditionStatus {
         match self {
-            Self::Ready => "True",
-            Self::MetricsNotConfigured
-            | Self::AwaitingFirstScrape
-            | Self::NoLivenessCheck
-            | Self::MetricsBodyTooLarge => "Unknown",
+            // Routing serves an answered endpoint with no liveness series, so Ready says so.
+            Self::Ready | Self::NoLivenessCheck | Self::MetricsBodyTooLarge => ConditionStatus::True,
+            Self::MetricsNotConfigured | Self::AwaitingFirstScrape => ConditionStatus::Unknown,
             Self::NoEndpointsReady
             | Self::MetricsStale
             | Self::ScrapeTimedOut
             | Self::ScrapeUnauthorized
             | Self::TlsHandshakeFailed
             | Self::ScrapeFailed
-            | Self::ProviderUnavailable => "False",
+            | Self::ProviderUnavailable => ConditionStatus::False,
+        }
+    }
+
+    /// The reason the `Ready` condition carries: `NotEvaluated` without a metrics endpoint,
+    /// since `Unknown` names only a condition the operator does not evaluate.
+    #[must_use]
+    pub const fn condition_reason(self) -> &'static str {
+        if matches!(self, Self::MetricsNotConfigured) {
+            "NotEvaluated"
+        } else {
+            self.as_str()
         }
     }
 
@@ -139,11 +151,8 @@ impl Reason {
     #[must_use]
     pub const fn display(self) -> &'static str {
         match self {
-            Self::Ready => "Ready",
-            Self::MetricsNotConfigured
-            | Self::AwaitingFirstScrape
-            | Self::NoLivenessCheck
-            | Self::MetricsBodyTooLarge => "Unknown",
+            Self::Ready | Self::NoLivenessCheck | Self::MetricsBodyTooLarge => "Ready",
+            Self::MetricsNotConfigured | Self::AwaitingFirstScrape => "Unknown",
             Self::NoEndpointsReady
             | Self::MetricsStale
             | Self::ScrapeTimedOut
@@ -572,7 +581,7 @@ pub(crate) fn ready_condition(
     let held = current.iter().find(|c| c.type_ == READY_CONDITION);
     let state = (
         verdict.reason.status(),
-        verdict.reason.as_str(),
+        verdict.reason.condition_reason(),
         verdict.message.as_str(),
     );
     changed(READY_CONDITION, held, state, now_rfc3339, generation)
@@ -580,8 +589,9 @@ pub(crate) fn ready_condition(
 
 /// The `MetricsAvailable` condition to write, or `None` when `current` already says the same.
 ///
-/// True once a scrape succeeds, whatever the endpoints say; False with the scrape's failure, or
-/// when the provider declares no metrics; Unknown while it awaits its first scrape.
+/// True once a scrape succeeds, whatever the endpoints say; False with the scrape's failure;
+/// Unknown while it awaits its first scrape, and `NotEvaluated` when the provider declares no
+/// metrics.
 pub(crate) fn metrics_condition(
     current: &[Condition],
     verdict: &Verdict,
@@ -591,27 +601,109 @@ pub(crate) fn metrics_condition(
     let held = current.iter().find(|c| c.type_ == METRICS_CONDITION);
     let state = match verdict.reason {
         Reason::Ready | Reason::NoEndpointsReady | Reason::NoLivenessCheck => {
-            ("True", "ScrapeSucceeded", "metrics scraped")
+            (ConditionStatus::True, "ScrapeSucceeded", "metrics scraped")
         },
-        Reason::AwaitingFirstScrape | Reason::ProviderUnavailable => {
-            ("Unknown", verdict.reason.as_str(), verdict.message.as_str())
-        },
+        Reason::AwaitingFirstScrape | Reason::ProviderUnavailable | Reason::MetricsNotConfigured => (
+            ConditionStatus::Unknown,
+            verdict.reason.condition_reason(),
+            verdict.message.as_str(),
+        ),
         Reason::MetricsStale
         | Reason::ScrapeTimedOut
         | Reason::ScrapeUnauthorized
         | Reason::TlsHandshakeFailed
         | Reason::MetricsBodyTooLarge
-        | Reason::ScrapeFailed
-        | Reason::MetricsNotConfigured => ("False", verdict.reason.as_str(), verdict.message.as_str()),
+        | Reason::ScrapeFailed => (
+            ConditionStatus::False,
+            verdict.reason.as_str(),
+            verdict.message.as_str(),
+        ),
     };
     changed(METRICS_CONDITION, held, state, now_rfc3339, generation)
+}
+
+/// Whether the provider's endpoints answer, gating `Available`.
+pub const ENDPOINT_LIVE_CONDITION: &str = "EndpointLive";
+
+/// Whether the provider's metrics endpoint is scraped, a concern that never gates.
+pub const METRICS_REACHABLE_CONDITION: &str = "MetricsReachable";
+
+/// What a provider without a metrics endpoint stands on for liveness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Fallback {
+    /// The provider is `Unavailable`, by its health check or its credentials.
+    Unavailable,
+    /// A health check passes.
+    HealthChecked,
+    /// Nothing checks liveness.
+    Unchecked,
+}
+
+/// `EndpointLive` for `verdict` as `(status, reason, message)`. `fallback` stands in when the
+/// provider declares no metrics. A provider routing serves without a check reads the
+/// informational `True` `NoHealthSignal`.
+pub(crate) fn endpoint_live(verdict: &Verdict, fallback: Fallback) -> (ConditionStatus, &'static str, String) {
+    let message = || verdict.message.clone();
+    match verdict.reason {
+        Reason::Ready => (ConditionStatus::True, ENDPOINT_LIVE_CONDITION, String::new()),
+        Reason::NoLivenessCheck | Reason::MetricsBodyTooLarge => (ConditionStatus::True, "NoHealthSignal", message()),
+        Reason::NoEndpointsReady | Reason::ProviderUnavailable => {
+            (ConditionStatus::False, "NoEndpointsReady", message())
+        },
+        Reason::MetricsStale
+        | Reason::ScrapeTimedOut
+        | Reason::ScrapeUnauthorized
+        | Reason::TlsHandshakeFailed
+        | Reason::ScrapeFailed => (ConditionStatus::False, "LivenessStale", message()),
+        Reason::AwaitingFirstScrape => (ConditionStatus::Unknown, "AwaitingFirstCheck", message()),
+        Reason::MetricsNotConfigured => match fallback {
+            Fallback::Unavailable => (
+                ConditionStatus::False,
+                "NoEndpointsReady",
+                "the provider is Unavailable".to_owned(),
+            ),
+            Fallback::HealthChecked => (ConditionStatus::True, ENDPOINT_LIVE_CONDITION, String::new()),
+            Fallback::Unchecked => (
+                ConditionStatus::True,
+                "NoHealthSignal",
+                "metrics.endpoint and healthCheck are not set, so liveness is not checked".to_owned(),
+            ),
+        },
+    }
+}
+
+/// `MetricsReachable` for `verdict` as `(status, reason, message)`, `None` when the provider
+/// declares no metrics endpoint.
+pub(crate) fn metrics_reachable(verdict: &Verdict) -> Option<(ConditionStatus, &'static str, String)> {
+    Some(match verdict.reason {
+        Reason::Ready | Reason::NoEndpointsReady | Reason::NoLivenessCheck => {
+            (ConditionStatus::True, METRICS_REACHABLE_CONDITION, String::new())
+        },
+        Reason::AwaitingFirstScrape => (
+            ConditionStatus::Unknown,
+            verdict.reason.as_str(),
+            verdict.message.clone(),
+        ),
+        Reason::ProviderUnavailable => (
+            ConditionStatus::Unknown,
+            "NotEvaluated",
+            "metrics are not judged while the provider is Unavailable".to_owned(),
+        ),
+        Reason::MetricsStale
+        | Reason::ScrapeTimedOut
+        | Reason::ScrapeUnauthorized
+        | Reason::TlsHandshakeFailed
+        | Reason::MetricsBodyTooLarge
+        | Reason::ScrapeFailed => (ConditionStatus::False, verdict.reason.as_str(), verdict.message.clone()),
+        Reason::MetricsNotConfigured => return None,
+    })
 }
 
 /// The condition `type_` in `(status, reason, message)`, or `None` when `held` already says so.
 fn changed(
     type_: &str,
     held: Option<&Condition>,
-    (status, reason, message): (&str, &str, &str),
+    (status, reason, message): (ConditionStatus, &str, &str),
     now_rfc3339: &str,
     generation: Option<i64>,
 ) -> Option<Condition> {
@@ -623,7 +715,7 @@ fn changed(
         .map_or_else(|| now_rfc3339.to_owned(), |c| c.last_transition_time.clone());
     Some(Condition {
         type_: type_.to_owned(),
-        status: status.to_owned(),
+        status,
         reason: reason.to_owned(),
         message: message.to_owned(),
         last_transition_time,
@@ -749,6 +841,70 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    fn verdict(reason: Reason) -> Verdict {
+        Verdict {
+            reason,
+            message: "detail".to_owned(),
+        }
+    }
+
+    #[test]
+    fn endpoint_live_agrees_with_routing() {
+        // Routing serves what excludes() keeps, so EndpointLive is True exactly there.
+        let every = [
+            Reason::Ready,
+            Reason::NoEndpointsReady,
+            Reason::NoLivenessCheck,
+            Reason::MetricsStale,
+            Reason::ScrapeTimedOut,
+            Reason::ScrapeUnauthorized,
+            Reason::TlsHandshakeFailed,
+            Reason::MetricsBodyTooLarge,
+            Reason::ScrapeFailed,
+            Reason::ProviderUnavailable,
+        ];
+        for reason in every {
+            let (status, ..) = endpoint_live(&verdict(reason), Fallback::Unchecked);
+            assert_eq!(status == ConditionStatus::True, !reason.excludes(), "{reason:?}");
+        }
+        let awaiting = endpoint_live(&verdict(Reason::AwaitingFirstScrape), Fallback::Unchecked);
+        assert_eq!(
+            (awaiting.0, awaiting.1),
+            (ConditionStatus::Unknown, "AwaitingFirstCheck")
+        );
+        assert_eq!(
+            endpoint_live(&verdict(Reason::Ready), Fallback::Unchecked).1,
+            ENDPOINT_LIVE_CONDITION
+        );
+        assert_eq!(
+            endpoint_live(&verdict(Reason::MetricsStale), Fallback::Unchecked).1,
+            "LivenessStale"
+        );
+        assert_eq!(
+            endpoint_live(&verdict(Reason::NoLivenessCheck), Fallback::Unchecked).1,
+            "NoHealthSignal"
+        );
+    }
+
+    #[test]
+    fn without_metrics_endpoint_live_stands_on_the_fallback() {
+        let none = verdict(Reason::MetricsNotConfigured);
+        assert_eq!(endpoint_live(&none, Fallback::Unchecked).1, "NoHealthSignal");
+        assert_eq!(endpoint_live(&none, Fallback::HealthChecked).1, ENDPOINT_LIVE_CONDITION);
+        let down = endpoint_live(&none, Fallback::Unavailable);
+        assert_eq!((down.0, down.1), (ConditionStatus::False, "NoEndpointsReady"));
+    }
+
+    #[test]
+    fn metrics_reachable_is_absent_without_an_endpoint_and_names_a_failed_scrape() {
+        assert_eq!(metrics_reachable(&verdict(Reason::MetricsNotConfigured)), None);
+        let reached = metrics_reachable(&verdict(Reason::NoEndpointsReady)).map(|(status, reason, _)| (status, reason));
+        assert_eq!(reached, Some((ConditionStatus::True, METRICS_REACHABLE_CONDITION)));
+        let failed =
+            metrics_reachable(&verdict(Reason::TlsHandshakeFailed)).map(|(status, reason, _)| (status, reason));
+        assert_eq!(failed, Some((ConditionStatus::False, "TLSHandshakeFailed")));
+    }
 
     const STALE: Duration = Duration::from_secs(15);
 
@@ -1060,7 +1216,11 @@ mod tests {
             .verdict("p", false, STALE, start + STALE + Duration::from_secs(1))
             .expect("judged");
         assert_eq!(verdict.reason, Reason::MetricsBodyTooLarge);
-        assert_eq!(verdict.reason.status(), "Unknown");
+        assert_eq!(
+            verdict.reason.status(),
+            ConditionStatus::True,
+            "routing serves it, so Ready says so"
+        );
         assert!(!verdict.reason.excludes(), "an answered endpoint is not down");
         assert!(verdict.message.ends_with("body_cap"), "{}", verdict.message);
     }
@@ -1131,7 +1291,7 @@ mod tests {
         assert_eq!(Reason::Ready.display(), "Ready");
         assert_eq!(Reason::MetricsNotConfigured.display(), "Unknown");
         assert_eq!(Reason::AwaitingFirstScrape.display(), "Unknown");
-        assert_eq!(Reason::NoLivenessCheck.display(), "Unknown");
+        assert_eq!(Reason::NoLivenessCheck.display(), "Ready");
         for reason in [
             Reason::NoEndpointsReady,
             Reason::MetricsStale,
@@ -1192,15 +1352,16 @@ mod tests {
 
     #[test]
     fn statuses_match_the_condition_contract() {
-        assert_eq!(Reason::Ready.status(), "True");
-        assert_eq!(Reason::MetricsNotConfigured.status(), "Unknown");
+        assert_eq!(Reason::Ready.status(), ConditionStatus::True);
+        assert_eq!(Reason::MetricsNotConfigured.status(), ConditionStatus::Unknown);
         assert!(!Reason::MetricsNotConfigured.excludes(), "unknown is not down");
-        assert_eq!(Reason::AwaitingFirstScrape.status(), "Unknown");
+        assert_eq!(Reason::AwaitingFirstScrape.status(), ConditionStatus::Unknown);
         assert!(!Reason::AwaitingFirstScrape.excludes(), "waiting is not down");
-        assert_eq!(Reason::NoLivenessCheck.status(), "Unknown");
+        assert_eq!(Reason::MetricsNotConfigured.condition_reason(), "NotEvaluated");
+        assert_eq!(Reason::NoLivenessCheck.status(), ConditionStatus::True);
         assert!(
             !Reason::NoLivenessCheck.excludes(),
-            "a scrape carrying no ready-endpoint series leaves readiness unknown, not false"
+            "a scrape carrying no ready-endpoint series is served, so Ready reads True"
         );
         for reason in [
             Reason::NoEndpointsReady,
@@ -1211,7 +1372,7 @@ mod tests {
             Reason::ScrapeFailed,
             Reason::ProviderUnavailable,
         ] {
-            assert_eq!(reason.status(), "False");
+            assert_eq!(reason.status(), ConditionStatus::False);
             assert!(reason.excludes());
         }
     }

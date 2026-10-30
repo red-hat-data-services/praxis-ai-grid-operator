@@ -33,6 +33,9 @@ use crate::{
 /// certificate, never the path, so no second path can widen a caller's view.
 pub const SIGNALS_PATH: &str = "/v1/site/signals";
 
+/// Response header naming the serving site's membership source, `Swim` or `Local`.
+pub const MEMBERSHIP_HEADER: &str = "x-grid-membership";
+
 /// Label naming the site a sample was observed at.
 pub const SITE_LABEL: &str = "grid_site";
 
@@ -400,6 +403,66 @@ impl LoadHeard {
 #[derive(Clone, Debug, Default)]
 pub struct PeerRounds(Arc<RwLock<BTreeMap<String, SystemTime>>>);
 
+/// How far each polled peer is from caught up after a restart: whether its catalog is held,
+/// and how many rounds in a row it has gone unanswered. `None` before the first round.
+#[derive(Clone, Debug, Default)]
+pub struct CatchUp(Arc<RwLock<Option<HashMap<String, PeerCatchUp>>>>);
+
+/// One polled peer's standing in [`CatchUp`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeerCatchUp {
+    /// Whether this site holds the peer's catalog.
+    pub held: bool,
+    /// Rounds in a row the peer has not answered.
+    pub unanswered: u32,
+}
+
+impl CatchUp {
+    /// Record a round over `polled`; a peer not in it is no longer polled.
+    pub fn record<Answered: Fn(&str) -> bool, Held: Fn(&str) -> bool>(
+        &self,
+        polled: &[String],
+        answered: Answered,
+        held: Held,
+    ) {
+        let Ok(mut standing) = self.0.write() else {
+            return;
+        };
+        let previous = standing.take().unwrap_or_default();
+        *standing = Some(
+            polled
+                .iter()
+                .map(|peer| {
+                    let before = previous.get(peer).copied().unwrap_or_default();
+                    let unanswered = if answered(peer) {
+                        0
+                    } else {
+                        before.unanswered.saturating_add(1)
+                    };
+                    (
+                        peer.clone(),
+                        PeerCatchUp {
+                            held: held(peer),
+                            unanswered,
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    /// Whether every polled peer's catalog is held, or it has gone `rounds` rounds unanswered.
+    /// False before the first round, true for a round that polled no one.
+    #[must_use]
+    pub fn caught_up(&self, rounds: u32) -> bool {
+        self.0.read().is_ok_and(|standing| {
+            standing
+                .as_ref()
+                .is_some_and(|peers| peers.values().all(|peer| peer.held || peer.unanswered >= rounds))
+        })
+    }
+}
+
 impl PeerRounds {
     /// Record that a round polling `peers` ended `at`; a peer not in it is no longer polled.
     pub fn record(&self, peers: &[String], at: SystemTime) {
@@ -456,6 +519,8 @@ pub struct SignalStore {
     /// because a policy changes only when its provider is edited, samples every
     /// scrape.
     access: Arc<RwLock<AccessMap>>,
+    /// Set once the first refresh lands.
+    published: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 /// SHA-256 of a DER certificate, lowercase hex.
@@ -496,6 +561,51 @@ pub struct PeerRecord {
     /// Empty means unenrolled, and the serve and poll paths refuse it rather
     /// than falling back to a certificate name.
     pub pins: Vec<String>,
+
+    /// Where this peer serves its signals, derived from the local object's gateway endpoint.
+    pub signals: Option<DeclaredSignals>,
+}
+
+/// The server name `site`'s gateway is reached and verified under, the DNS name its leaf carries.
+#[must_use]
+pub fn gateway_server_name(site: &str) -> String {
+    certs::site_dns_name(site)
+}
+
+/// The server name `site`'s signals listener is reached under, beside its gateway's own.
+#[must_use]
+pub fn signals_server_name(site: &str) -> String {
+    format!("{site}-signals.{}", certs::SPIFFE_TRUST_DOMAIN)
+}
+
+/// Where a `GridSite` says its site serves signals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredSignals {
+    /// Where to connect.
+    pub endpoint: SignalsEndpoint,
+    /// The TLS server name presented, when a router in front selects on one.
+    pub server_name: Option<String>,
+}
+
+impl DeclaredSignals {
+    /// The poll target for `name`: the endpoint, under the server name when one is declared.
+    #[must_use]
+    pub fn peer_site(&self, name: String) -> Option<PeerSite> {
+        let (url, alias) = match &self.server_name {
+            Some(server_name) => (
+                SignalsEndpoint::url_at("https", &format!("{server_name}:{}", self.endpoint.port))?,
+                Some((server_name.clone(), self.endpoint.host().into_owned())),
+            ),
+            None => (self.endpoint.url("https")?, None),
+        };
+        Some(PeerSite {
+            name,
+            url,
+            pins: Vec::new(),
+            answering: true,
+            alias,
+        })
+    }
 }
 
 /// Who may read, keyed by site name.
@@ -531,6 +641,12 @@ impl PeerIdentities {
         self.loaded.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// How many peers are held.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.inner.read().map_or(0, |guard| guard.len())
+    }
+
     /// Whether a record is held for `site`.
     #[must_use]
     pub fn knows(&self, site: &str) -> bool {
@@ -555,6 +671,30 @@ impl PeerIdentities {
             return true;
         };
         held.get(site).is_none_or(|record| record.pins.is_empty())
+    }
+
+    /// Each known peer with no signals endpoint to poll it at, never `local_site`, whose own
+    /// record this site is not a peer of.
+    #[must_use]
+    pub fn without_endpoint(&self, local_site: &str) -> Vec<String> {
+        let Ok(held) = self.inner.read() else {
+            return Vec::new();
+        };
+        held.iter()
+            .filter(|(site, record)| record.signals.is_none() && *site != local_site)
+            .map(|(site, _)| site.clone())
+            .collect()
+    }
+
+    /// Each peer whose local object declares its signals endpoint.
+    #[must_use]
+    pub fn declared_endpoints(&self) -> Vec<(String, DeclaredSignals)> {
+        let Ok(held) = self.inner.read() else {
+            return Vec::new();
+        };
+        held.iter()
+            .filter_map(|(site, record)| Some((site.clone(), record.signals.clone()?)))
+            .collect()
     }
 
     /// Labels held for `site`, whether or not it declared pins.
@@ -652,6 +792,14 @@ impl SignalStore {
             );
         }
         guard.retain(|_, held| held.expires_at > now);
+        drop(guard);
+        self.published
+            .send_if_modified(|published| !std::mem::replace(published, true));
+    }
+
+    /// Resolve once the first refresh has landed, at once if one already has.
+    pub async fn published(&self) {
+        drop(self.published.subscribe().wait_for(|published| *published).await);
     }
 
     /// Targets this reader may not be served.
@@ -773,15 +921,28 @@ impl SignalStore {
     /// Every sample still served, across targets.
     #[must_use]
     pub fn current(&self) -> Vec<Observation> {
+        let mut current = Vec::new();
+        self.for_each_current(|sample| current.push(sample.clone()));
+        current
+    }
+
+    /// Visit every sample still served, across targets, in the order [`current`] returns
+    /// them, without cloning any.
+    ///
+    /// `visit` runs under the store's read lock, so it must not call back into this store's
+    /// writers; a refresh waits until the visit ends.
+    ///
+    /// [`current`]: Self::current
+    pub fn for_each_current<F: FnMut(&Observation)>(&self, mut visit: F) {
         let Ok(guard) = self.inner.read() else {
-            return Vec::new();
+            return;
         };
         let now = Instant::now();
         guard
             .values()
             .filter(|held| held.expires_at > now)
-            .flat_map(|held| held.samples.iter().cloned())
-            .collect()
+            .flat_map(|held| held.samples.iter())
+            .for_each(&mut visit);
     }
 
     /// Targets currently held and unexpired.
@@ -868,9 +1029,66 @@ pub struct PeerSite {
     /// name (which need not match the advertised address anyway).
     pub pins: Vec<String>,
 
-    /// Whether the site answered when last polled, or has not been polled. One that did not
-    /// gets [`UNANSWERED_PEER_BUDGET`], so a peer that cannot answer frees its slot quickly.
+    /// Whether the site gets the full budget: it answered when last polled, has not been
+    /// polled, or is due a full retry. Any other gets [`UNANSWERED_PEER_BUDGET`], so a peer that
+    /// cannot answer frees its slot quickly.
     pub answering: bool,
+
+    /// `(server name, host)` when `url` names the TLS server name a router in front of the
+    /// peer selects on and the host is what is dialled; `None` dials the host in `url`.
+    pub alias: Option<(String, String)>,
+}
+
+impl PeerSite {
+    /// The alias as borrowed parts.
+    #[must_use]
+    pub fn alias(&self) -> Option<(&str, &str)> {
+        self.alias.as_ref().map(|(name, host)| (name.as_str(), host.as_str()))
+    }
+}
+
+/// What bounds one peer request's attempts.
+#[derive(Clone, Copy, Debug)]
+struct Attempt {
+    /// When the request began.
+    started: Instant,
+    /// The most it may take, attempts included.
+    budget: Duration,
+    /// Whether its retries count in the peer-poll metrics.
+    counted: Counted,
+    /// The largest body read.
+    max_body: usize,
+}
+
+impl Attempt {
+    /// A signals poll, counted in the peer-poll metrics.
+    const fn signals(started: Instant, budget: Duration) -> Self {
+        Self {
+            started,
+            budget,
+            counted: Counted::Yes,
+            max_body: crate::metrics_scraper::MAX_RESPONSE_BODY_BYTES,
+        }
+    }
+
+    /// A catalog read, not counted.
+    const fn catalog(started: Instant, budget: Duration) -> Self {
+        Self {
+            started,
+            budget,
+            counted: Counted::No,
+            max_body: crate::site_providers::MAX_BODY_BYTES,
+        }
+    }
+}
+
+/// Whether a request's retries count in the peer-poll metrics, which track signals only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Counted {
+    /// A signals poll.
+    Yes,
+    /// A catalog read, visible in its log line by path.
+    No,
 }
 
 /// The most one poll of a peer that did not answer last time may take, attempts included.
@@ -894,6 +1112,7 @@ where
                 url: dialable_signals_endpoint(member, fallback_port)?.url(scheme)?,
                 pins: Vec::new(),
                 answering: true,
+                alias: None,
             })
         })
         .collect()
@@ -965,12 +1184,26 @@ impl SignalsEndpoint {
         }
     }
 
+    /// The host half as text.
+    #[must_use]
+    pub fn host(&self) -> std::borrow::Cow<'_, str> {
+        match &self.host {
+            EndpointHost::Ip(ip) => std::borrow::Cow::Owned(ip.to_string()),
+            EndpointHost::Dns(name) => std::borrow::Cow::Borrowed(name),
+        }
+    }
+
     /// The signals URL under `scheme`, built from validated parts.
     #[must_use]
     pub fn url(&self, scheme: &str) -> Option<String> {
+        Self::url_at(scheme, &self.authority())
+    }
+
+    /// The signals URL under `scheme` at `authority`.
+    fn url_at(scheme: &str, authority: &str) -> Option<String> {
         http::Uri::builder()
             .scheme(scheme)
-            .authority(self.authority())
+            .authority(authority)
             .path_and_query(SIGNALS_PATH)
             .build()
             .ok()
@@ -1090,26 +1323,22 @@ fn classify(error: &MetricsScrapeError) -> RequestOutcome {
 /// is worth retrying and the other will fail identically until a certificate is
 /// replaced. The chain is walked rather than the message matched, because an
 /// error string is not an interface.
-#[expect(clippy::wildcard_enum_match_arm, reason = "std::io::ErrorKind is non_exhaustive")]
 fn classify_transport(error: &(dyn std::error::Error + 'static)) -> RequestOutcome {
-    let mut current = Some(error);
-    while let Some(err) = current {
-        if tls_backend::is_tls_error(err) {
-            return RequestOutcome::Tls;
-        }
-        if let Some(io) = err.downcast_ref::<std::io::Error>() {
-            return match io.kind() {
-                std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::HostUnreachable
-                | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::ConnectionReset => RequestOutcome::Refused,
-                std::io::ErrorKind::TimedOut => RequestOutcome::Timeout,
-                _ => RequestOutcome::Transport,
-            };
-        }
-        current = err.source();
+    let (tls, io_kind) = tls_backend::transport_error_details(error);
+    if tls {
+        return RequestOutcome::Tls;
     }
-    RequestOutcome::Transport
+
+    match io_kind {
+        Some(
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::ConnectionReset,
+        ) => RequestOutcome::Refused,
+        Some(std::io::ErrorKind::TimedOut) => RequestOutcome::Timeout,
+        Some(_) | None => RequestOutcome::Transport,
+    }
 }
 
 /// Delay before attempt `attempt`, counting the first retry as zero.
@@ -1139,10 +1368,8 @@ fn peer_client_config(
     let cert = material.identity.as_ref().map(|id| id.cert.as_slice());
     let key = material.identity.as_ref().map(|id| id.key.as_slice());
     match mode {
-        PeerTrustMode::Pin => crate::metrics_scraper::build_pinned_client_config(&material.ca, cert, key, pins),
-        PeerTrustMode::Spiffe => {
-            crate::metrics_scraper::build_spiffe_client_config(&material.ca, cert, key, &certs::spiffe_id(peer))
-        },
+        PeerTrustMode::Pin => crate::metrics_scraper::build_pinned_client_config(&material.ca, cert, key, peer, pins),
+        PeerTrustMode::Spiffe => crate::metrics_scraper::build_spiffe_client_config(&material.ca, cert, key, peer),
     }
 }
 
@@ -1193,6 +1420,21 @@ const PEER_POOL_IDLE: Duration = Duration::from_secs(8);
 /// expired certificate stays reachable.
 const PEER_TRANSPORT_MAX_AGE: Duration = Duration::from_mins(1);
 
+/// Most peers dialled at once, whatever the configured concurrency.
+const MAX_PEER_CONCURRENCY: usize = 32;
+
+/// `peer`'s transport age bound: [`PEER_TRANSPORT_MAX_AGE`] spread by up to a fifth either
+/// way, fixed per peer, so a fleet's rebuilds and their handshakes do not all land at once.
+fn transport_max_age(local: &str, peer: &str) -> Duration {
+    // Seeded with both ends, so the sites polling one peer do not rebuild toward it together.
+    let spread = local
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(peer.bytes())
+        .fold(0_u32, |acc, b| acc.wrapping_mul(31).wrapping_add(u32::from(b)));
+    PEER_TRANSPORT_MAX_AGE.saturating_mul(80 + spread % 41) / 100
+}
+
 /// Per-peer transports, with the pins each was built for.
 ///
 /// Held across rounds because building one parses a private key and opens a
@@ -1207,6 +1449,8 @@ pub struct PeerTransports(Mutex<HashMap<String, HeldTransport>>);
 struct HeldTransport {
     /// The pins the transport verifies against.
     pins: Vec<String>,
+    /// The `(server name, host)` it dials under, when not the URL host.
+    alias: Option<(String, String)>,
     /// The client, whose pool outlives a round.
     transport: Arc<PeerTransport>,
     /// When it was built, which bounds how long a connection may live.
@@ -1260,6 +1504,10 @@ pub struct PollPeers {
     pub shutdown: crate::shutdown::Shutdown,
     /// How each peer's certificate is authorized.
     pub trust: PeerTrustMode,
+    /// Why each peer's signals endpoint last failed to answer.
+    pub failures: PeerFailures,
+    /// This site's name, which spreads its transport rebuilds apart from other sites'.
+    pub local_site: String,
 }
 
 impl Default for PollPeers {
@@ -1277,7 +1525,94 @@ impl Default for PollPeers {
             shutdown: crate::shutdown::Shutdown::never(),
             trust: PeerTrustMode::Pin,
             transports: PeerTransports::default(),
+            failures: PeerFailures::default(),
+            local_site: String::new(),
         }
+    }
+}
+
+/// Why a peer's signals endpoint did not answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Unreachable {
+    /// It answered 404: something listens there, but not this endpoint's signals.
+    NotFound,
+    /// It did not answer in time.
+    Timeout,
+    /// The TLS handshake or the peer's identity was refused.
+    Tls,
+    /// The connection was refused or never established.
+    Refused,
+    /// This site's round ran out before the peer could be polled in full.
+    RoundDeadline,
+    /// Any other failure, by its outcome.
+    Failed(RequestOutcome),
+}
+
+impl Unreachable {
+    /// The failure for a poll that ended in `outcome`, with the last HTTP `status` it read.
+    #[must_use]
+    pub const fn of(outcome: RequestOutcome, status: Option<u16>) -> Self {
+        match (outcome, status) {
+            (_, Some(404)) => Self::NotFound,
+            (RequestOutcome::Deadline, _) => Self::RoundDeadline,
+            (RequestOutcome::Timeout, _) => Self::Timeout,
+            (RequestOutcome::Tls, _) => Self::Tls,
+            (RequestOutcome::Refused, _) => Self::Refused,
+            (other, _) => Self::Failed(other),
+        }
+    }
+
+    /// The condition reason naming it.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NotFound => "NotFound",
+            Self::Timeout => "Timeout",
+            Self::Tls => "TLSRefused",
+            Self::Refused => "ConnectionRefused",
+            Self::RoundDeadline => "RoundDeadline",
+            Self::Failed(_) => "RequestFailed",
+        }
+    }
+
+    /// What an admin is told about it.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::NotFound => "answered 404: check its signals endpoint and port".to_owned(),
+            Self::Timeout => "timed out".to_owned(),
+            Self::Tls => "TLS handshake or identity refused".to_owned(),
+            Self::Refused => "connection refused".to_owned(),
+            Self::RoundDeadline => {
+                "not polled in full: this site's poll round ran out first, so lengthen the round or raise \
+                 the dial concurrency"
+                    .to_owned()
+            },
+            Self::Failed(outcome) => format!("failed: {}", outcome.as_str()),
+        }
+    }
+}
+
+/// Why each polled peer's signals endpoint last failed, until it answers again.
+#[derive(Clone, Debug, Default)]
+pub struct PeerFailures(Arc<RwLock<HashMap<String, Unreachable>>>);
+
+impl PeerFailures {
+    /// Record a poll of `peer`: forgotten when it `answered`, else failed for `why`.
+    fn observe(&self, peer: &str, answered: bool, why: Unreachable) {
+        if let Ok(mut failures) = self.0.write() {
+            if answered {
+                failures.remove(peer);
+            } else {
+                failures.insert(peer.to_owned(), why);
+            }
+        }
+    }
+
+    /// Why `peer` last failed, `None` once it answered.
+    #[must_use]
+    pub fn of(&self, peer: &str) -> Option<Unreachable> {
+        self.0.read().ok()?.get(peer).copied()
     }
 }
 
@@ -1289,21 +1624,21 @@ impl PollPeers {
     /// distinguishable from one that has nothing to say.
     async fn poll_one(
         &self,
-        peer: &str,
-        url: &str,
-        pins: &[String],
+        target: &Target<'_>,
         (budget, cut): (Duration, bool),
-    ) -> Option<(String, Option<SystemTime>)> {
+    ) -> Option<(String, crate::metrics_scraper::Stamp)> {
+        let Target { peer, url, pins, .. } = target;
         // The guard owns the accounting, including the drop-mid-await path that
         // used to leave the in-flight gauge counting a poll that had ended.
         let mut guard = PollGuard::enter(peer, self.slow_after);
         // A peer the round has no time left for is not dialled at all.
         if budget.is_zero() {
             guard.finish(RequestOutcome::Deadline, 0);
+            self.failures.observe(peer, false, Unreachable::RoundDeadline);
             return None;
         }
 
-        let transport = match self.peer_transport(peer, pins) {
+        let transport = match self.peer_transport(peer, pins, target.alias) {
             Ok(transport) => transport,
             Err(error) => {
                 tracing::warn!(peer, %error, "peer client config unusable; not polling");
@@ -1316,30 +1651,54 @@ impl PollPeers {
         } else {
             RequestOutcome::Timeout
         };
-        let (outcome, result) = tokio::time::timeout(
+        let (outcome, result, status) = tokio::time::timeout(
             budget,
-            self.attempt_until(peer, url, &transport, (guard.started, budget)),
+            self.attempt_until(peer, url, &transport, Attempt::signals(guard.started, budget)),
         )
         .await
-        .unwrap_or((ran_out, None));
+        .unwrap_or((ran_out, None, None));
         guard.finish(outcome, result.as_ref().map_or(0, |(body, _)| body.len()));
+        self.failures
+            .observe(peer, result.is_some(), Unreachable::of(outcome, status));
         result
     }
 
-    /// The transport for `peer`, built on first use and rebuilt when its pins
-    /// change or it reaches [`PEER_TRANSPORT_MAX_AGE`].
-    ///
-    /// The build runs outside the lock; concurrent callers may keep different
-    /// usable transports for their rounds, and the last insert stays cached.
-    fn peer_transport(&self, peer: &str, pins: &[String]) -> Result<Arc<PeerTransport>, MetricsScrapeError> {
-        let held = self
-            .transports
+    /// Peers dialled at once for `peers` targets: the configured concurrency, at most 32, and
+    /// never more than there are peers.
+    #[must_use]
+    pub fn dial_concurrency(&self, peers: usize) -> usize {
+        self.concurrency.min(MAX_PEER_CONCURRENCY).min(peers).max(1)
+    }
+
+    /// `peer`'s held transport while it still fits `pins` and `alias` and is under its age.
+    fn held_transport(&self, peer: &str, pins: &[String], alias: Option<(&str, &str)>) -> Option<Arc<PeerTransport>> {
+        let max_age = transport_max_age(&self.local_site, peer);
+        let fresh = |held: &&HeldTransport| {
+            held.pins == pins
+                && held.alias.as_ref().map(|(name, host)| (name.as_str(), host.as_str())) == alias
+                && held.built.elapsed() < max_age
+        };
+        self.transports
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(peer)
-            .filter(|held| held.pins == pins && held.built.elapsed() < PEER_TRANSPORT_MAX_AGE)
-            .map(|held| Arc::clone(&held.transport));
+            .filter(fresh)
+            .map(|held| Arc::clone(&held.transport))
+    }
+
+    /// The transport for `peer`, built on first use and rebuilt when its pins
+    /// or alias change or it reaches [`PEER_TRANSPORT_MAX_AGE`].
+    ///
+    /// The build runs outside the lock; concurrent callers may keep different
+    /// usable transports for their rounds, and the last insert stays cached.
+    fn peer_transport(
+        &self,
+        peer: &str,
+        pins: &[String],
+        alias: Option<(&str, &str)>,
+    ) -> Result<Arc<PeerTransport>, MetricsScrapeError> {
+        let held = self.held_transport(peer, pins, alias);
         if let Some(transport) = held {
             return Ok(transport);
         }
@@ -1347,11 +1706,12 @@ impl PollPeers {
             Some(material) => Some(peer_client_config(material, self.trust, peer, pins)?),
             None => None,
         };
-        let transport = Arc::new(PeerTransport::new(config.as_ref(), Some(PEER_POOL_IDLE))?);
+        let transport = Arc::new(PeerTransport::new(config.as_ref(), Some(PEER_POOL_IDLE), alias)?);
         self.transports.0.lock().unwrap_or_else(PoisonError::into_inner).insert(
             peer.to_owned(),
             HeldTransport {
                 pins: pins.to_vec(),
+                alias: alias.map(|(name, host)| (name.to_owned(), host.to_owned())),
                 transport: Arc::clone(&transport),
                 built: Instant::now(),
             },
@@ -1363,12 +1723,12 @@ impl PollPeers {
     ///
     /// Without this a departed peer keeps its material for the life of the
     /// process.
-    fn retain_transports(&self, current: &[(String, String, Vec<String>, bool)]) {
+    fn retain_transports(&self, current: &[Target<'_>]) {
         self.transports
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|peer, _| current.iter().any(|(name, ..)| name == peer));
+            .retain(|peer, _| current.iter().any(|target| target.peer == peer));
     }
 
     /// How many peer transports are held.
@@ -1386,12 +1746,12 @@ impl PollPeers {
         &self,
         url: &str,
         transport: &PeerTransport,
-        timeout: Duration,
-    ) -> Option<Result<(String, Option<SystemTime>), MetricsScrapeError>> {
+        (timeout, max_body): (Duration, usize),
+    ) -> Option<Result<(String, crate::metrics_scraper::Stamp), MetricsScrapeError>> {
         tokio::select! {
             biased;
             () = self.shutdown.triggered() => None,
-            result = scrape_peer(url, timeout, transport) => Some(result),
+            result = scrape_peer(url, timeout, transport, max_body) => Some(result),
         }
     }
 
@@ -1410,22 +1770,29 @@ impl PollPeers {
     }
 
     /// Attempt until one succeeds, the budget from `started` runs out, or retrying is pointless.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one retry loop with its budget, backoff and stand-down"
-    )]
     async fn attempt_until(
         &self,
         peer: &str,
         url: &str,
         transport: &PeerTransport,
-        (started, budget): (Instant, Duration),
-    ) -> (RequestOutcome, Option<(String, Option<SystemTime>)>) {
+        bounds: Attempt,
+    ) -> (
+        RequestOutcome,
+        Option<(String, crate::metrics_scraper::Stamp)>,
+        Option<u16>,
+    ) {
+        let Attempt {
+            started,
+            budget,
+            counted,
+            max_body,
+        } = bounds;
         let attempts = self.attempts.max(1);
         let mut outcome = RequestOutcome::Transport;
+        let mut status = None;
         for attempt in 0..attempts {
             if self.shutdown.is_triggered() {
-                return (RequestOutcome::Cancelled, None);
+                return (RequestOutcome::Cancelled, None, status);
             }
             if started.elapsed() >= budget {
                 break;
@@ -1434,26 +1801,33 @@ impl PollPeers {
             // Each attempt may use what the budget has left, up to the configured timeout, so a slow
             // peer on a short budget is not timed out sooner than it would answer.
             let timeout = self.timeout.min(budget.saturating_sub(started.elapsed()));
-            let Some(scrape) = self.scrape_or_stand_down(url, transport, timeout).await else {
-                return (RequestOutcome::Cancelled, None);
+            let Some(scrape) = self.scrape_or_stand_down(url, transport, (timeout, max_body)).await else {
+                return (RequestOutcome::Cancelled, None, status);
             };
 
             match scrape {
-                Ok(pair) => return (RequestOutcome::Ok, Some(pair)),
+                Ok(pair) => return (RequestOutcome::Ok, Some(pair), None),
                 Err(error) => {
                     outcome = classify(&error);
+                    status = if let MetricsScrapeError::NonOkStatus { status: code, .. } = &error {
+                        Some(*code)
+                    } else {
+                        None
+                    };
                     if attempt + 1 >= attempts || !outcome.is_retryable() {
                         tracing::warn!(site = %peer, %url, outcome = outcome.as_str(), %error, "peer poll failed");
                         break;
                     }
-                    crate::metrics::record_peer_retry(peer, outcome.as_str());
+                    if counted == Counted::Yes {
+                        crate::metrics::record_peer_retry(peer, outcome.as_str());
+                    }
                     if !self.wait_before_retry(peer, attempt, started, budget).await {
-                        return (RequestOutcome::Cancelled, None);
+                        return (RequestOutcome::Cancelled, None, status);
                     }
                 },
             }
         }
-        (outcome, None)
+        (outcome, None, status)
     }
 
     /// Observations for each site, keyed by site name.
@@ -1462,7 +1836,7 @@ impl PollPeers {
     /// tell silence from a site that genuinely has nothing to report.
     pub async fn collect(&self, sites: &[PeerSite]) -> BTreeMap<String, Vec<Observation>> {
         let mut collected = BTreeMap::new();
-        self.collect_each(sites, |peer, observations, _| {
+        self.collect_each(sites, |peer, observations, _, _| {
             collected.insert(peer, observations);
         })
         .await;
@@ -1471,13 +1845,9 @@ impl PollPeers {
 
     /// Hand each site's observations to `publish` as its poll completes, with how
     /// many of its rows were dropped for an implausible age.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one round: targets, budgets, then each answer as it lands"
-    )]
     pub async fn collect_each<Publish>(&self, sites: &[PeerSite], mut publish: Publish)
     where
-        Publish: FnMut(String, Vec<Observation>, usize),
+        Publish: FnMut(String, Vec<Observation>, usize, crate::metrics_scraper::Stamp),
     {
         let collect_query = self
             .collect
@@ -1489,8 +1859,8 @@ impl PollPeers {
         let targets = peer_urls(sites, &collect_query);
         self.retain_transports(&targets);
         let deadline = Instant::now() + self.round;
-        let fetches = targets.into_iter().map(|(peer, url, pins, answering)| async move {
-            let budget = if answering {
+        let fetches = targets.into_iter().map(|target| async move {
+            let budget = if target.answering {
                 self.budget
             } else {
                 self.budget.min(UNANSWERED_PEER_BUDGET)
@@ -1502,23 +1872,78 @@ impl PollPeers {
             } else {
                 left
             };
-            let (body, date) = self
-                .poll_one(&peer, &url, &pins, (budget.min(left), left < budget))
-                .await?;
+            let (body, stamp) = self.poll_one(&target, (budget.min(left), left < budget)).await?;
+            let peer = target.peer.to_owned();
             // Ages first, so a row dropped for its age never takes a provider slot.
-            let (aged, rejected) = reexpress_peer_ages(stamp_origin(parse(&body), &peer), date, &peer);
+            let (aged, rejected) = reexpress_peer_ages(stamp_origin(parse(&body), &peer), stamp.date, &peer);
             let observations = bound_peer(aged, &peer);
-            Some((peer, observations, rejected))
+            Some((peer, observations, rejected, stamp))
         });
 
         // A failed peer is absent, not empty, so silence stays distinct from nothing to report.
-        let mut done = futures::stream::iter(fetches).buffer_unordered(self.concurrency.max(1));
+        let mut done = futures::stream::iter(fetches).buffer_unordered(self.dial_concurrency(sites.len()));
         while let Some(result) = done.next().await {
-            if let Some((peer, observations, rejected)) = result {
-                publish(peer, observations, rejected);
+            if let Some((peer, observations, rejected, stamp)) = result {
+                publish(peer, observations, rejected, stamp);
             }
         }
     }
+
+    /// The providers `site` serves this one, over the transport and trust its signals are polled on.
+    ///
+    /// `None` for a peer that did not answer or answered with a body a reader refuses, so a
+    /// caller keeps what it last held rather than reading silence as no providers.
+    pub async fn fetch_providers(
+        &self,
+        site: &PeerSite,
+    ) -> Option<(Vec<crate::site_providers::WireProvider>, Option<String>)> {
+        let url = with_path(&site.url, crate::site_providers::PROVIDERS_PATH)?;
+        let transport = self
+            .peer_transport(&site.name, &site.pins, site.alias())
+            .inspect_err(
+                |error| tracing::warn!(peer = %site.name, %error, "peer client config unusable; not reading providers"),
+            )
+            .ok()?;
+        let budget = if site.answering {
+            self.budget
+        } else {
+            self.budget.min(UNANSWERED_PEER_BUDGET)
+        };
+        let started = Instant::now();
+        let (_, answer, _) = tokio::time::timeout(
+            budget,
+            self.attempt_until(&site.name, &url, &transport, Attempt::catalog(started, budget)),
+        )
+        .await
+        .ok()?;
+        let (body, stamp) = answer?;
+        read_catalog(&site.name, &body, stamp.providers_contract.as_deref())
+            .map(|providers| (providers, stamp.providers_version))
+    }
+}
+
+/// `peer`'s providers from `body`, `None` for an unsupported contract or a body the reader refuses.
+fn read_catalog(peer: &str, body: &str, contract: Option<&str>) -> Option<Vec<crate::site_providers::WireProvider>> {
+    if !crate::site_providers::reads_contract(contract) {
+        tracing::warn!(
+            peer,
+            ?contract,
+            "peer providers contract unsupported; keeping what is held"
+        );
+        return None;
+    }
+    let providers = crate::site_providers::parse(body);
+    if providers.is_none() {
+        tracing::warn!(peer, bytes = body.len(), "peer providers body refused");
+    }
+    providers
+}
+
+/// `url` with its path replaced by `path` and no query, rebuilt through the URI parser.
+fn with_path(url: &str, path: &'static str) -> Option<String> {
+    let mut parts = url.parse::<http::Uri>().ok()?.into_parts();
+    parts.path_and_query = Some(http::uri::PathAndQuery::from_static(path));
+    http::Uri::from_parts(parts).ok().map(|uri| uri.to_string())
 }
 
 /// Owns the accounting for one poll, however that poll ends.
@@ -1581,12 +2006,26 @@ impl Drop for PollGuard<'_> {
     }
 }
 
+/// One peer's request, as a round makes it.
+struct Target<'sites> {
+    /// Site name.
+    peer: &'sites str,
+    /// What is asked for.
+    url: String,
+    /// Fingerprints the peer is verified against.
+    pins: &'sites [String],
+    /// Whether it answered last round.
+    answering: bool,
+    /// `(server name, host)` when the peer is dialled under another name.
+    alias: Option<(&'sites str, &'sites str)>,
+}
+
 /// Build the request URL for each peer.
 ///
 /// No `target`: it names a provider, not a site, so passing a site name matches
 /// nothing and the peer answers empty. Scoping a peer's answer is the
 /// publisher's job; the reader re-checks the site label on receipt.
-fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Vec<String>, bool)> {
+fn peer_urls<'sites>(sites: &'sites [PeerSite], collect_query: &str) -> Vec<Target<'sites>> {
     sites
         .iter()
         .filter_map(|site| {
@@ -1595,7 +2034,13 @@ fn peer_urls(sites: &[PeerSite], collect_query: &str) -> Vec<(String, String, Ve
             } else {
                 with_query(&site.url, collect_query)?
             };
-            Some((site.name.clone(), url, site.pins.clone(), site.answering))
+            Some(Target {
+                peer: &site.name,
+                url,
+                pins: &site.pins,
+                answering: site.answering,
+                alias: site.alias(),
+            })
         })
         .collect()
 }
@@ -1829,10 +2274,6 @@ fn render_contract_block(
 }
 
 /// Render whole provider batches, retaining metadata through metric selection.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one atomic provider render keeps filtering, row counts, and the line budget together"
-)]
 fn render_batches(
     samples: &[Observation],
     collect: &[String],
@@ -1940,10 +2381,6 @@ const MAX_RELAY_AGE_MS: i64 = 86_400_000; // one day
 /// the sample from its own clock reading and this age, so no wall time of this
 /// site's is stored. A missing `Date` or stamp leaves the row aged from its
 /// collection here, never from the peer's absolute clock.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one age conversion keeps invalidations and payload freshness together"
-)]
 fn reexpress_peer_ages(
     observations: Vec<Observation>,
     date: Option<SystemTime>,
@@ -2012,6 +2449,25 @@ fn relay_age(date_ms: i64, stamp_ms: i64) -> Option<Duration> {
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+    use crate::crd::inference_provider::ConditionStatus;
+
+    #[test]
+    fn a_restarted_site_catches_up_once_every_peer_is_held_or_long_silent() {
+        let catch_up = CatchUp::default();
+        assert!(!catch_up.caught_up(3), "not before the first round");
+        let polled = ["east".to_owned(), "west".to_owned()];
+        catch_up.record(&polled, |_| true, |site| site == "east");
+        assert!(!catch_up.caught_up(3), "west answered, but its catalog is not held yet");
+        catch_up.record(&polled, |site| site == "east", |site| site == "east");
+        catch_up.record(&polled, |site| site == "east", |site| site == "east");
+        assert!(!catch_up.caught_up(3), "west silent for two rounds");
+        catch_up.record(&polled, |site| site == "east", |site| site == "east");
+        assert!(catch_up.caught_up(3), "west silent for three rounds is not waited on");
+        catch_up.record(&polled, |_| true, |site| site == "east");
+        assert!(!catch_up.caught_up(3), "an answer resets the count");
+        catch_up.record(&[], |_| true, |_| true);
+        assert!(catch_up.caught_up(3), "a site with no peers has nothing to wait for");
+    }
 
     #[test]
     fn an_unlabeled_series_belongs_to_no_named_pool() {
@@ -2124,7 +2580,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one table of accepted and refused samples")]
     fn a_hub_refuses_peer_names_providers_and_values_outside_the_contract() {
         let cases = [
             (
@@ -2255,6 +2710,7 @@ mod tests {
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
             answering: true,
+            alias: None,
         }
     }
 
@@ -2265,6 +2721,7 @@ mod tests {
             url: serve_once(body).await,
             pins: Vec::new(),
             answering: true,
+            alias: None,
         }
     }
 
@@ -2333,7 +2790,7 @@ mod tests {
         };
         let mut release_slow = Some(release_slow);
         let mut order = Vec::new();
-        let round = poll.collect_each(&sites, |peer, observations, _| {
+        let round = poll.collect_each(&sites, |peer, observations, _, _| {
             assert_eq!(observations.len(), 1, "{peer}");
             if let Some(release) = release_slow.take() {
                 release.send(()).unwrap_or(());
@@ -2367,6 +2824,7 @@ mod tests {
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
             answering: true,
+            alias: None,
         }
     }
 
@@ -2394,7 +2852,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "a peer that answers late, served inline")]
     async fn a_slow_peer_that_missed_a_round_still_answers_inside_its_short_budget() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         crate::init_process_crypto();
@@ -2406,7 +2863,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut request = [0_u8; 1024];
             drop(stream.read(&mut request).await);
-            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let response = format!("HTTP/1.1 200 OK\r\n{date}Content-Length: {}\r\n\r\n{body}", body.len());
             drop(stream.write_all(response.as_bytes()).await);
         });
@@ -2415,6 +2872,7 @@ mod tests {
             url: format!("http://{addr}{SIGNALS_PATH}"),
             pins: Vec::new(),
             answering: false,
+            alias: None,
         };
         let poll = PollPeers {
             timeout: Duration::from_secs(5),
@@ -2425,7 +2883,7 @@ mod tests {
         let round = poll.collect(&[slow]).await;
         assert!(
             round.contains_key("east"),
-            "1.5 s fits the 2 s budget of one that missed a round"
+            "a peer that answers inside the short budget is included in the round"
         );
     }
 
@@ -2587,7 +3045,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one table of ages either side of each bound")]
     fn reexpress_peer_ages_keeps_plausible_ages_and_drops_the_rest() {
         let date_ms = 5_000_000_000_000;
         let stamped = |stamp: Option<i64>| Observation {
@@ -2703,7 +3160,7 @@ mod tests {
         }
         let mut answered = BTreeMap::new();
         one_attempt()
-            .collect_each(&sites, |peer, _, rejected| {
+            .collect_each(&sites, |peer, _, rejected, _| {
                 answered.insert(peer, rejected);
             })
             .await;
@@ -2713,7 +3170,7 @@ mod tests {
             &answered,
         );
         let condition = ages.condition(&[], "t0", Some(1)).expect("raised");
-        assert_eq!(condition.status, "False", "{condition:?}");
+        assert_eq!(condition.status, ConditionStatus::False, "{condition:?}");
         assert!(
             condition.message.contains("from ahead, ancient:"),
             "the peers stamping past their Date and a day behind it are named, the clean one is not: {}",
@@ -2869,6 +3326,7 @@ mod tests {
             url: serve_once_with(body, headers).await,
             pins: Vec::new(),
             answering: true,
+            alias: None,
         }
     }
 
@@ -3060,10 +3518,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exercise HTTP projection, relay and guarded consumption together"
-    )]
     async fn a_default_peer_poll_projects_custom_metrics_without_losing_revision() {
         crate::init_process_crypto();
         let body = format!(
@@ -3076,6 +3530,7 @@ mod tests {
             url: serve_once_with(body, headers).await,
             pins: Vec::new(),
             answering: true,
+            alias: None,
         };
         let collected = one_attempt().collect(&[peer]).await;
         let hub = SignalStore::new();
@@ -3103,10 +3558,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "invalidation, replay rejection and recovery share one receiver"
-    )]
     fn relay_invalidation_fences_old_data_and_allows_later_learning() {
         let old = revision_text();
         let new = old
@@ -3272,7 +3723,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "one polled row rendered at three wall readings")]
     async fn a_wall_step_between_poll_and_render_leaves_relayed_ages_alone() {
         let peers = relayed_through_a_poll(30_000).await;
         let later = Instant::now() + Duration::from_secs(5);
@@ -3319,10 +3769,11 @@ mod tests {
             url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
             answering: true,
+            alias: None,
         }];
         let urls = peer_urls(&sites, "");
         assert_eq!(
-            urls.first().map(|(_, u, ..)| u.as_str()),
+            urls.first().map(|target| target.url.as_str()),
             Some("http://10.0.0.2:9091/v1/site/signals"),
             "the whole site is asked for, with no target"
         );
@@ -3335,10 +3786,11 @@ mod tests {
             url: "http://10.0.0.2:9091/v1/site/signals".to_owned(),
             pins: Vec::new(),
             answering: true,
+            alias: None,
         }];
         let urls = peer_urls(&sites, "collect[]=queue");
         assert_eq!(
-            urls.first().map(|(_, u, ..)| u.as_str()),
+            urls.first().map(|target| target.url.as_str()),
             Some("http://10.0.0.2:9091/v1/site/signals?collect[]=queue")
         );
     }
@@ -3374,10 +3826,9 @@ mod tests {
         assert!(!client.is_retryable() && server.is_retryable());
     }
 
+    /// Peer polling separates retryable refusal from a non-retryable trust failure.
     #[test]
     fn a_refused_connection_is_told_apart_from_a_trust_failure() {
-        // Both arrive as transport errors and call for opposite responses, so
-        // the chain is walked rather than the message matched.
         let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
         assert_eq!(classify_transport(&refused), RequestOutcome::Refused);
 
@@ -3385,7 +3836,12 @@ mod tests {
         let tls_err = rustls::Error::DecryptError;
         #[cfg(feature = "fips")]
         let tls_err = openssl::error::ErrorStack::get();
-        assert_eq!(classify_transport(&tls_err), RequestOutcome::Tls);
+        let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, tls_err);
+        assert_eq!(
+            classify_transport(&wrapped),
+            RequestOutcome::Tls,
+            "the wrapped TLS failure should remain distinguishable from transport I/O"
+        );
     }
 
     /// Peer TLS material from a throwaway CA, for the config cache tests.
@@ -3411,8 +3867,8 @@ mod tests {
             ..PollPeers::default()
         };
         let pins = vec!["a".repeat(64)];
-        let first = poll.peer_transport("east", &pins).expect("built");
-        let again = poll.peer_transport("east", &pins).expect("built");
+        let first = poll.peer_transport("east", &pins, None).expect("built");
+        let again = poll.peer_transport("east", &pins, None).expect("built");
         assert!(
             Arc::ptr_eq(&first, &again),
             "building twice parses the private key and reopens the connection"
@@ -3422,7 +3878,7 @@ mod tests {
         // A rotation replaces the entry rather than adding one, and takes the
         // old pool with it.
         let rotated = vec!["b".repeat(64)];
-        let after = poll.peer_transport("east", &rotated).expect("built");
+        let after = poll.peer_transport("east", &rotated, None).expect("built");
         assert!(!Arc::ptr_eq(&first, &after), "rotated pins must not reuse the socket");
         assert_eq!(poll.held_transports(), 1, "keyed by peer, not by pin set");
     }
@@ -3436,17 +3892,17 @@ mod tests {
             ..PollPeers::default()
         };
         let pins = vec!["a".repeat(64)];
-        let first = poll.peer_transport("east", &pins).expect("built");
+        let first = poll.peer_transport("east", &pins, None).expect("built");
 
         // Age the entry past the bound without waiting for it.
         let aged = Instant::now()
-            .checked_sub(PEER_TRANSPORT_MAX_AGE + Duration::from_secs(1))
+            .checked_sub(transport_max_age("", "east") + Duration::from_secs(1))
             .expect("a time before the bound");
         let mut held = poll.transports.0.lock().unwrap_or_else(PoisonError::into_inner);
         held.get_mut("east").expect("an entry").built = aged;
         drop(held);
 
-        let after = poll.peer_transport("east", &pins).expect("built");
+        let after = poll.peer_transport("east", &pins, None).expect("built");
         assert!(
             !Arc::ptr_eq(&first, &after),
             "an aged transport must be rebuilt, or a pooled connection is never verified again"
@@ -3467,11 +3923,17 @@ mod tests {
             ..PollPeers::default()
         };
         let pins = vec!["a".repeat(64)];
-        drop(poll.peer_transport("east", &pins).expect("built"));
-        drop(poll.peer_transport("west", &pins).expect("built"));
+        drop(poll.peer_transport("east", &pins, None).expect("built"));
+        drop(poll.peer_transport("west", &pins, None).expect("built"));
         assert_eq!(poll.held_transports(), 2);
 
-        poll.retain_transports(&[("east".to_owned(), String::new(), pins, true)]);
+        poll.retain_transports(&[Target {
+            peer: "east",
+            url: String::new(),
+            pins: &pins,
+            answering: true,
+            alias: None,
+        }]);
         assert_eq!(poll.held_transports(), 1, "west left the grid and took its material");
     }
 
@@ -3486,6 +3948,48 @@ mod tests {
         assert_eq!(RequestOutcome::ClientError.as_str(), "client_error");
         assert_eq!(RequestOutcome::ServerError.as_str(), "server_error");
         assert_eq!(RequestOutcome::Throttled.as_str(), "throttled");
+    }
+
+    #[test]
+    fn transport_ages_spread_within_a_fifth_and_hold_per_peer() {
+        let ages: Vec<Duration> = ["east", "west", "north", "south", "hub"]
+            .iter()
+            .map(|peer| transport_max_age("hub", peer))
+            .collect();
+        for age in &ages {
+            assert!(
+                *age >= Duration::from_secs(48) && *age <= Duration::from_secs(72),
+                "{age:?}"
+            );
+        }
+        assert!(
+            ages.iter().any(|age| Some(age) != ages.first()),
+            "peers spread: {ages:?}"
+        );
+        assert_eq!(
+            transport_max_age("hub", "east"),
+            transport_max_age("hub", "east"),
+            "fixed per peer"
+        );
+        let toward_east: Vec<Duration> = ["hub", "west", "north", "south"]
+            .iter()
+            .map(|local| transport_max_age(local, "east"))
+            .collect();
+        assert!(
+            toward_east.iter().any(|age| Some(age) != toward_east.first()),
+            "the sites polling one peer spread too: {toward_east:?}"
+        );
+    }
+
+    #[test]
+    fn dial_concurrency_is_the_peers_up_to_the_cap() {
+        let poll = PollPeers {
+            concurrency: 100,
+            ..PollPeers::default()
+        };
+        assert_eq!(poll.dial_concurrency(3), 3);
+        assert_eq!(poll.dial_concurrency(500), MAX_PEER_CONCURRENCY);
+        assert_eq!(poll.dial_concurrency(0), 1);
     }
 
     #[test]
@@ -3642,6 +4146,7 @@ mod tests {
             PeerRecord {
                 labels: gold(),
                 pins: Vec::new(),
+                signals: None,
             },
         )]));
         assert_eq!(
@@ -3660,6 +4165,7 @@ mod tests {
             PeerRecord {
                 labels: gold(),
                 pins: vec!["ab".repeat(32)],
+                signals: None,
             },
         )]));
         assert_eq!(
@@ -3683,6 +4189,7 @@ mod tests {
                 PeerRecord {
                     labels: gold(),
                     pins: vec!["cc".repeat(32)],
+                    signals: None,
                 },
             ),
             (
@@ -3690,6 +4197,7 @@ mod tests {
                 PeerRecord {
                     labels: BTreeMap::from([("tier".to_owned(), "silver".to_owned())]),
                     pins: vec!["bb".repeat(32)],
+                    signals: None,
                 },
             ),
         ]));
@@ -3717,6 +4225,7 @@ mod tests {
             PeerRecord {
                 labels: gold(),
                 pins: vec!["ab".repeat(32), "cd".repeat(32)],
+                signals: None,
             },
         )]));
         assert_eq!(identities.resolve_by_key(&"ab".repeat(32)), Some(gold()), "the old key");
@@ -3741,6 +4250,7 @@ mod tests {
                 PeerRecord {
                     labels: gold(),
                     pins: Vec::new(),
+                    signals: None,
                 },
             ),
             (
@@ -3748,6 +4258,7 @@ mod tests {
                 PeerRecord {
                     labels: gold(),
                     pins: vec!["cd".repeat(32)],
+                    signals: None,
                 },
             ),
         ]));
@@ -3796,6 +4307,7 @@ mod tests {
         let record = PeerRecord {
             labels: BTreeMap::from([("tier".to_owned(), "gold".to_owned())]),
             pins: vec![canonical_fingerprint(&declared)],
+            signals: None,
         };
         let identities = PeerIdentities::new();
         identities.set(BTreeMap::from([("peer".to_owned(), record)]));
@@ -4029,6 +4541,27 @@ mod tests {
         );
         assert_eq!(store.targets().len(), 2, "one failed scrape must not erase a target");
     }
+
+    #[tokio::test]
+    async fn visiting_the_current_samples_sees_what_current_returns_and_skips_the_expired() {
+        let store = SignalStore::new();
+        let mut visited = Vec::new();
+        store.for_each_current(|sample| visited.push(sample.clone()));
+        assert!(visited.is_empty(), "an empty store visits nothing");
+        store.refresh(
+            BTreeMap::from([("pool-a".to_owned(), scraped()), ("pool-b".to_owned(), scraped())]),
+            Duration::from_secs(60),
+        );
+        store.refresh(
+            BTreeMap::from([("pool-c".to_owned(), scraped())]),
+            Duration::from_millis(20),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        store.for_each_current(|sample| visited.push(sample.clone()));
+        assert_eq!(visited.len(), 2, "pool-c expired while still held: {visited:?}");
+        assert_eq!(visited, store.current(), "the same samples, in the same order");
+    }
+
     #[test]
     fn non_finite_values_never_reach_the_store() {
         let scraped = "\

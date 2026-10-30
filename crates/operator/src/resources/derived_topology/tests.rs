@@ -69,6 +69,7 @@ fn decl<'decl>(
         from_providers: &ALLOWED,
         transport: None,
         signal: SignalMode::Gossip,
+        peer_catalog: None,
     }
 }
 
@@ -99,6 +100,20 @@ fn resolve_local(endpoint: &str, tls: Option<serde_json::Value>) -> Resolved {
     let candidates = vec![candidate("prov-a", "site-a")];
     let resolved = resolve(&candidates, &[], &decl(&providers, &sites, "site-a"));
     resolved.get("prov-a").cloned().expect("a local provider resolves")
+}
+
+#[test]
+fn a_local_endpoint_keeps_its_path_for_the_dial() {
+    let got = resolve_local(
+        "https://inference.openshift-ingress.svc.cluster.local/publishers/p/models/m",
+        None,
+    );
+    assert_eq!(got.endpoint_path.as_deref(), Some("/publishers/p/models/m"));
+    assert_eq!(
+        resolve_local("http://model.svc/", None).endpoint_path,
+        None,
+        "the root is no path"
+    );
 }
 
 #[test]
@@ -465,6 +480,7 @@ fn decl_allowing<'decl>(
         from_providers: allowed,
         transport: None,
         signal: SignalMode::Gossip,
+        peer_catalog: None,
     }
 }
 
@@ -523,7 +539,6 @@ fn a_discovered_site_is_found_by_the_id_it_speaks_for() {
 
 /// Every refusal names its reason.
 #[test]
-#[expect(clippy::too_many_lines, reason = "one row per refusal reason")]
 fn each_refusal_is_named() {
     let unavailable = {
         let mut p = provider("prov-down", "https://down.example.invalid", None);
@@ -565,7 +580,6 @@ fn each_refusal_is_named() {
     .map(|s| (*s).to_owned())
     .collect();
     let cases = [
-        ("prov-a", "site-a", Refusal::NotAllowlisted),
         ("prov-twin", "site-a", Refusal::Ambiguous),
         ("prov-port", "site-a", Refusal::EndpointPort),
         ("prov-ip", "site-a", Refusal::ServerNameNeeded),
@@ -595,37 +609,6 @@ fn each_refusal_is_named() {
             && resolution.refused.len() == 2,
         "one cluster at two sites refuses both: {:?}",
         resolution.refused
-    );
-}
-
-#[test]
-fn a_provider_the_gateway_did_not_allowlist_derives_nothing() {
-    // Registering a cluster-scoped CR is not permission to be dialled.
-    let providers = vec![provider("prov-a", "https://a.example.invalid", None)];
-    let sites = vec![site("site-a", None)];
-    let candidates = vec![candidate("prov-a", "site-a")];
-    let resolved = resolve(&candidates, &[], &decl_allowing(&providers, &sites, &[]));
-    assert!(
-        resolved.is_empty(),
-        "an empty allowlist must derive nothing, not everything"
-    );
-}
-
-#[test]
-fn a_provider_outside_a_named_allowlist_derives_nothing() {
-    // Naming prov-b admits prov-b and nothing else.
-    let providers = vec![
-        provider("prov-a", "https://a.example.invalid", None),
-        provider("prov-b", "https://b.example.invalid", None),
-    ];
-    let sites = vec![site("site-a", None)];
-    let candidates = vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")];
-    let allowed = vec!["prov-b".to_owned()];
-    let resolved = resolve(&candidates, &[], &decl_allowing(&providers, &sites, &allowed));
-    assert_eq!(
-        resolved.keys().collect::<Vec<_>>(),
-        ["prov-b"],
-        "a registered provider the gateway did not name is not derived"
     );
 }
 
@@ -967,18 +950,56 @@ fn an_mcp_tool_candidate_is_neither_resolved_nor_refused() {
 /// Contract fixture the gateway crate loads through Praxis.
 const DERIVED_RENDER_GOLDEN: &str = include_str!("../../../../gateway/tests/testdata/consumer-config-derived.yaml");
 
-#[test]
-#[expect(clippy::too_many_lines, reason = "the render takes every renderer input")]
-fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
-    let providers = vec![
+/// The overlay envelope published for the same gateway, which the gateway
+/// crate builds together with [`DERIVED_RENDER_GOLDEN`].
+const DERIVED_OVERLAY_GOLDEN: &str = include_str!("../../../../gateway/tests/testdata/routing-overlay-derived.json");
+
+/// The providers both derived fixtures are rendered from.
+fn derived_providers() -> Vec<InferenceProvider> {
+    vec![
         provider("prov-a", "https://model-a.models.svc:8443", None),
         provider("prov-b", "https://model-b.models.svc:8443", None),
-    ];
-    let sites = vec![site("site-a", None)];
-    let candidates = vec![candidate("prov-a", "site-a"), candidate("prov-b", "site-a")];
+    ]
+}
+
+/// The one site both derived fixtures place every candidate at.
+fn derived_sites() -> Vec<GridSite> {
+    vec![site("site-a", None)]
+}
+
+/// The routing overlay both derived fixtures are produced from, rendered the
+/// way the controller renders it so every candidate carries the admission
+/// state, locality tier and stable id that Praxis validates at load.
+fn derived_overlay() -> crate::resources::routing_overlay::RoutingOverlay {
+    let network: crate::crd::grid_network::GridNetwork = serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": "net" },
+        "spec": { "seeds": [] }
+    }))
+    .expect("network");
+    crate::resources::routing_overlay::render_routing_overlay(
+        &network,
+        &derived_sites(),
+        &derived_providers(),
+        &[],
+        &[],
+        "site-a",
+        None,
+        None,
+        &scoring::ScoringWeights::default(),
+    )
+    .expect("overlay")
+}
+
+#[test]
+fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
+    let providers = derived_providers();
+    let sites = derived_sites();
+    let overlay = derived_overlay();
     let transport = declared(None, Some("models-ca"));
     let resolution = resolve(
-        &candidates,
+        &overlay.candidates,
         &[],
         &Declarations {
             transport: Some(&transport),
@@ -987,14 +1008,6 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
     );
     assert!(resolution.refused.is_empty(), "{:?}", resolution.refused);
     let endpoints: Vec<ClusterEndpointConfig> = resolution.resolved.values().map(|r| r.endpoint.clone()).collect();
-    let overlay = crate::resources::routing_overlay::RoutingOverlay {
-        network: "net".to_owned(),
-        local_site: "site-a".to_owned(),
-        candidates,
-        excluded: Vec::new(),
-        selection_policy: None,
-        generated_at: None,
-    };
     let rendered = crate::resources::consumer_config::render_consumer_config_with_projected(
         &overlay,
         "/run/secrets/grid-credentials",
@@ -1007,6 +1020,7 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
         None,
         false,
         false,
+        crate::crd::grid_network::SiteRouter::IntelligentRoute,
     )
     .expect("render");
     assert_eq!(rendered.config_yaml, DERIVED_RENDER_GOLDEN, "golden drifted");
@@ -1018,4 +1032,399 @@ fn a_derived_tls_render_matches_the_fixture_praxis_loads() {
         (ca.secret.namespace.as_str(), ca.secret.name.as_str()),
         ("praxis-system", "models-ca")
     );
+}
+
+/// The envelope is pinned exactly as `build_overlay_configmap` serialises it,
+/// except for `producer_version`: provenance is evidence outside the semantic
+/// digest, and pinning the crate version would make every release bump drift
+/// the fixture.
+#[test]
+fn the_overlay_shipped_with_the_derived_render_matches_the_fixture_praxis_loads() {
+    let built = crate::resources::overlay_envelope::build_overlay_envelope(
+        &derived_overlay(),
+        "inference-gw",
+        "praxis-system",
+        "0f6c1b2e-5a3d-4c7e-9b1a-2d4f6e8a0c13",
+        1,
+        "2026-07-29T00:00:00Z",
+    )
+    .expect("envelope");
+    let mut envelope = built.envelope;
+    assert_eq!(envelope.provenance.producer_version, env!("CARGO_PKG_VERSION"));
+    envelope.provenance.producer_version = "fixture".to_owned();
+    let json = serde_json::to_string_pretty(&envelope).expect("serialise");
+    assert_eq!(json, DERIVED_OVERLAY_GOLDEN.trim_end(), "golden drifted");
+}
+
+#[test]
+fn a_remote_hop_naming_another_sites_server_name_derives_nothing() {
+    let sites = vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(mutual_egress(
+                "site-b.grid.example.invalid:8443",
+                "site-c.grid.internal",
+            )),
+        ),
+    ];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let resolution = resolve(&candidates, &[], &decl(&[], &sites, "site-a"));
+    assert!(resolution.get("prov-b").is_none(), "the hop would verify site-c's leaf");
+    assert_eq!(
+        resolution.refused.first().map(|refused| refused.reason),
+        Some(Refusal::ServerNameNotSite)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Derivation without names
+// ---------------------------------------------------------------------------
+
+/// Declarations naming nothing, with the given catalog, at `site-a`.
+fn unnamed<'decl>(
+    providers: &'decl [InferenceProvider],
+    sites: &'decl [GridSite],
+    peer_catalog: Option<&'decl PeerCatalog<'decl>>,
+) -> Declarations<'decl> {
+    Declarations {
+        peer_catalog,
+        ..decl_allowing(providers, sites, &[])
+    }
+}
+
+/// A catalog in which `site` offers `clusters`.
+fn catalog<'name>(site: &'name str, clusters: &[&'name str]) -> PeerCatalog<'name> {
+    PeerCatalog::from([(site, clusters.iter().copied().collect())])
+}
+
+/// `site-a` and a probed, mutual-TLS `site-b`.
+fn member_sites_ab() -> Vec<GridSite> {
+    vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(mutual_egress(
+                "site-b.grid.example.invalid:8443",
+                "site-b.grid.internal",
+            )),
+        ),
+    ]
+}
+
+/// The refusal reasons `resolution` carries.
+fn reasons(resolution: &Resolution) -> Vec<Refusal> {
+    resolution.refused.iter().map(|refused| refused.reason).collect()
+}
+
+#[test]
+fn an_unnamed_local_provider_derives() {
+    let providers = vec![provider("a1b2c3d4", "http://pool.models.svc:8000", None)];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("a1b2c3d4", "site-a")];
+    let resolution = resolve(&candidates, &[], &unnamed(&providers, &sites, None));
+    let got = resolution.get("a1b2c3d4").expect("an unnamed local provider derives");
+    assert_eq!(got.origin, Origin::DerivedLocal);
+    assert_eq!(got.endpoint.address, "pool.models.svc:8000");
+}
+
+#[test]
+fn two_providers_claiming_one_identity_never_derive() {
+    let mut twin = provider("zzz-shadow", "http://attacker.models.svc:8000", None);
+    twin.spec.cluster_name = Some("a1b2c3d4".to_owned());
+    let providers = vec![provider("a1b2c3d4", "http://pool.models.svc:8000", None), twin];
+    let sites = vec![site("site-a", None)];
+    let candidates = vec![candidate("a1b2c3d4", "site-a")];
+    let resolution = resolve(&candidates, &[], &unnamed(&providers, &sites, None));
+    assert!(resolution.is_empty(), "an ambiguous identity never picks an endpoint");
+    assert_eq!(reasons(&resolution), [Refusal::Ambiguous]);
+}
+
+#[test]
+fn without_a_catalog_an_unnamed_remote_candidate_keeps_the_name_gate() {
+    let sites = member_sites_ab();
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, None));
+    assert_eq!(
+        reasons(&resolution),
+        [Refusal::NotAllowlisted],
+        "SWIM reads no verified catalog, so an unnamed remote candidate needs a name"
+    );
+}
+
+#[test]
+fn a_catalog_candidate_derives_at_a_probed_member_site() {
+    let sites = member_sites_ab();
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, Some(&offered)));
+    let got = resolution
+        .get("e5f6a7b8")
+        .expect("a member site's catalog candidate derives");
+    assert_eq!(got.origin, Origin::DerivedRemote);
+    assert_eq!(got.endpoint.address, "site-b.grid.example.invalid:8443");
+    assert_eq!(
+        got.endpoint.transport.as_ref().map(|transport| transport.mode.clone()),
+        Some(TransportMode::MutualTls)
+    );
+}
+
+#[test]
+fn a_candidate_the_member_never_offered_is_refused() {
+    let sites = member_sites_ab();
+    let elsewhere = PeerCatalog::from([
+        ("site-b", BTreeSet::from(["e5f6a7b8"])),
+        ("site-c", BTreeSet::from(["prov-local"])),
+    ]);
+    let candidates = vec![candidate("prov-local", "site-b")];
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, Some(&elsewhere)));
+    assert!(
+        resolution.is_empty(),
+        "a local selector placing a candidate at a peer is not that peer's catalog"
+    );
+    assert_eq!(reasons(&resolution), [Refusal::NotOffered]);
+}
+
+#[test]
+fn a_member_hop_refuses_a_site_two_grid_sites_key_to() {
+    let egress = mutual_egress("site-b.grid.example.invalid:8443", "site-b.grid.internal");
+    let sites = vec![
+        site("site-a", None),
+        site("site-b", Some(egress.clone())),
+        discovered_site("net-site-b-7f3a", "site-b", &egress),
+    ];
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, Some(&offered)));
+    assert!(resolution.is_empty(), "first match must not pick the hop");
+    assert_eq!(reasons(&resolution), [Refusal::SiteKeyAmbiguous]);
+}
+
+#[test]
+fn a_member_hop_refuses_a_site_not_probed_at_its_generation_or_not_active() {
+    let egress = mutual_egress("site-b.grid.example.invalid:8443", "site-b.grid.internal");
+    let changed: GridSite = serde_json::from_value(serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": "site-b", "generation": 2 },
+        "spec": { "gridNetworkRef": "net", "egress": egress },
+        "status": { "phase": "Active", "capabilities": {}, "message": "", "observedGeneration": 1, "reason": "" }
+    }))
+    .expect("site probed at an older generation");
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    for (member, want) in [
+        (changed, Refusal::SiteNotProbed),
+        (
+            site_in_phase("site-b", Some(egress), "Connecting"),
+            Refusal::SiteNotActive,
+        ),
+    ] {
+        let sites = vec![site("site-a", None), member];
+        let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, Some(&offered)));
+        assert!(
+            resolution.is_empty(),
+            "{want:?}: an unprobed address is not a member hop"
+        );
+        assert_eq!(reasons(&resolution), [want]);
+    }
+}
+
+#[test]
+fn a_member_hop_refuses_plaintext() {
+    let sites = vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(serde_json::json!({ "address": "site-b:8080", "tls": { "mode": "Plaintext" } })),
+        ),
+    ];
+    let offered = catalog("site-b", &["e5f6a7b8"]);
+    let candidates = vec![candidate("e5f6a7b8", "site-b")];
+    let resolution = resolve(&candidates, &[], &unnamed(&[], &sites, Some(&offered)));
+    assert!(resolution.is_empty(), "plaintext reaches an unverified peer");
+    assert_eq!(reasons(&resolution), [Refusal::MemberHopNotMutual]);
+}
+
+#[test]
+fn a_named_remote_candidate_keeps_todays_checks() {
+    let sites = vec![
+        site("site-a", None),
+        site(
+            "site-b",
+            Some(serde_json::json!({ "address": "site-b:8080", "tls": { "mode": "Plaintext" } })),
+        ),
+    ];
+    let allowed = vec!["prov-b".to_owned()];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let offered = PeerCatalog::new();
+    let declarations = Declarations {
+        peer_catalog: Some(&offered),
+        ..decl_allowing(&[], &sites, &allowed)
+    };
+    let resolution = resolve(&candidates, &[], &declarations);
+    assert!(
+        resolution.contains_key("prov-b"),
+        "a name keeps today's checks; the member guards apply to unnamed candidates"
+    );
+}
+
+#[test]
+fn the_peer_catalog_keys_clusters_by_the_site_the_record_names() {
+    let record = |site: &str, cluster: &str| crdt::ProviderState {
+        network_id: "net".to_owned(),
+        site_id: site.to_owned(),
+        provider_id: cluster.to_owned(),
+        routing_cluster: cluster.to_owned(),
+        models: vec!["model-x".to_owned()],
+        tools: Vec::new(),
+        backend_kind: "local".to_owned(),
+        capacity_weight: 1,
+        phase: crdt::ProviderPhase::Available,
+        metrics: crdt::ProviderMetricsSnapshot::default(),
+        access_policy: crdt::ProviderAccessPolicy::default(),
+        revision: 1,
+        writer_id: site.to_owned(),
+    };
+    let records = [record("site-b", "x"), record("site-b", "y"), record("site-c", "x")];
+    assert_eq!(
+        peer_catalog(&records),
+        PeerCatalog::from([
+            ("site-b", BTreeSet::from(["x", "y"])),
+            ("site-c", BTreeSet::from(["x"]))
+        ])
+    );
+}
+
+/// Resolve `candidates` for a gateway that dials them from the serving config.
+fn resolve_dialed(
+    candidates: &[RoutingCandidate],
+    explicit: &[ClusterEndpointConfig],
+    sites: &[GridSite],
+    allowed: &[String],
+) -> Resolution {
+    let declarations = decl_allowing(&[], sites, allowed);
+    let mut resolution = resolve(candidates, explicit, &declarations);
+    refuse_undialable(&mut resolution, &declarations);
+    resolution
+}
+
+/// An explicit entry with `mode` and `sni`.
+fn explicit(cluster: &str, mode: TransportMode, sni: Option<&str>) -> ClusterEndpointConfig {
+    ClusterEndpointConfig {
+        cluster: cluster.to_owned(),
+        address: "peer.example.invalid:8443".to_owned(),
+        transport: Some(EndpointTransport {
+            mode,
+            sni: sni.map(str::to_owned),
+            ca_secret_ref: None,
+        }),
+    }
+}
+
+/// What a dialed resolution refused, by cluster.
+fn dial_refusals(resolution: &Resolution) -> Vec<(&str, Refusal)> {
+    resolution
+        .refused
+        .iter()
+        .map(|refused| (refused.cluster.as_str(), refused.reason))
+        .collect()
+}
+
+#[test]
+fn a_dialed_gateway_refuses_a_site_only_gossip_vouches_for() {
+    let egress = mutual_egress("site-b.grid.example.invalid:8443", "site-b.grid.internal");
+    let allowed = vec!["prov-b".to_owned()];
+    let candidates = vec![candidate("prov-b", "site-b")];
+    let stub = vec![discovered_site("net-site-b-7f3a", "site-b", &egress)];
+    let resolution = resolve_dialed(&candidates, &[], &stub, &allowed);
+    assert_eq!(
+        dial_refusals(&resolution),
+        [("prov-b", Refusal::SiteNotEnrolled)],
+        "a stub's address came from gossip"
+    );
+    assert!(resolution.resolved.is_empty(), "refused, so not dialed");
+
+    let mut unannotated = discovered_site("site-b", "site-b", &egress);
+    unannotated.metadata.annotations = None;
+    let unannotated_resolution = resolve_dialed(&candidates, &[], &[unannotated], &allowed);
+    assert_eq!(
+        dial_refusals(&unannotated_resolution),
+        [("prov-b", Refusal::SiteNotEnrolled)],
+        "a stub that lost its id annotation is still a stub"
+    );
+
+    let enrolled = vec![site("site-b", Some(egress))];
+    let enrolled_resolution = resolve_dialed(&candidates, &[], &enrolled, &allowed);
+    assert!(
+        enrolled_resolution.refused.is_empty(),
+        "{:?}",
+        enrolled_resolution.refused
+    );
+    assert_eq!(enrolled_resolution.resolved["prov-b"].site, "site-b");
+}
+
+#[test]
+fn a_dialed_mutual_tls_entry_must_verify_its_own_site_exactly() {
+    let candidates = vec![candidate("peer", "site-b")];
+    let cases = [
+        (Some("site-b.grid.internal"), None),
+        (Some(" site-b.grid.internal "), None),
+        (Some("site-c.grid.internal"), Some(Refusal::ServerNameNotSite)),
+        (Some("Site-B.grid.internal"), Some(Refusal::ServerNameNotSite)),
+        (Some("peer.example.invalid"), Some(Refusal::ServerNameNotSite)),
+        (Some(" "), Some(Refusal::NoServerName)),
+        (None, Some(Refusal::NoServerName)),
+    ];
+    for (sni, want) in cases {
+        let entry = explicit("peer", TransportMode::MutualTls, sni);
+        let resolution = resolve_dialed(&candidates, &[entry], &[], &[]);
+        let got: Vec<Refusal> = resolution.refused.iter().map(|refused| refused.reason).collect();
+        assert_eq!(got, want.into_iter().collect::<Vec<_>>(), "sni {sni:?}");
+    }
+}
+
+#[test]
+fn a_dialed_gateway_never_sends_plaintext_off_its_site() {
+    let entries = [
+        explicit("remote", TransportMode::Plaintext, None),
+        explicit("local", TransportMode::Plaintext, None),
+        explicit("remote-tls", TransportMode::Tls, Some("peer.example.invalid")),
+    ];
+    let candidates = vec![
+        candidate("remote", "site-b"),
+        candidate("local", "site-a"),
+        candidate("remote-tls", "site-b"),
+    ];
+    let resolution = resolve_dialed(&candidates, &entries, &[], &[]);
+    assert_eq!(dial_refusals(&resolution), [("remote", Refusal::PlaintextOffSite)]);
+    assert!(
+        resolution.resolved.contains_key("local"),
+        "plaintext stays on this site"
+    );
+    assert!(
+        resolution.resolved.contains_key("remote-tls"),
+        "server TLS verifies the peer, so it may leave"
+    );
+}
+
+#[test]
+fn a_rendered_gateway_keeps_what_a_dialed_one_refuses() {
+    let entries = [
+        explicit("remote", TransportMode::Plaintext, None),
+        explicit("peer", TransportMode::MutualTls, Some("site-c.grid.internal")),
+    ];
+    let candidates = vec![candidate("remote", "site-b"), candidate("peer", "site-b")];
+    let resolution = resolve(&candidates, &entries, &decl_allowing(&[], &[], &[]));
+    assert!(
+        resolution.refused.is_empty(),
+        "the praxis.yaml path is unchanged: {:?}",
+        resolution.refused
+    );
+}
+
+#[test]
+fn dial_refusals_are_named() {
+    assert_eq!(Refusal::SiteNotEnrolled.as_str(), "site not enrolled");
+    assert_eq!(Refusal::PlaintextOffSite.as_str(), "plaintext off this site");
 }

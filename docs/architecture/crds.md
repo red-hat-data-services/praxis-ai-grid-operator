@@ -8,6 +8,33 @@ unchanged by the project-name update.
 
 All CRDs are cluster-scoped and served at `v1alpha1`.
 
+## Status conditions
+
+`GridNetwork`, `GridSite`, `InferenceProvider` and `SiteInvite` each carry
+`Available`, `Progressing` and `Degraded` after their first reconcile, so one
+client reads any of them the same way.
+
+- `Available` is `True` with reason `Available` when every gating condition of
+  the kind is `True`. Otherwise it copies the status, reason and message of the
+  first gating condition, in the kind's order, that is not.
+- `Degraded` is `True` when a non-gating condition is bad, and copies its reason
+  and message. Otherwise it is `False` with reason `AsExpected`.
+- `Progressing` is `True` with reason `NewGeneration` while a gating condition
+  describes an older `metadata.generation`, or with a reason naming a change the
+  operator expects to finish without a person. Otherwise it is `False` with
+  reason `AsExpected`.
+- A positive condition's `True` reason is its own type name. `Unknown` means only
+  that the operator has not evaluated the condition: `AwaitingFirstCheck` or
+  `AwaitingFirstScrape` before the first evaluation, or `NotEvaluated`.
+
+Available `True` and Degraded `False` is healthy. Progressing `True` means wait.
+Available `False` with Progressing `False` means act, on the reason given.
+
+Every kind prints the same status columns: AVAILABLE, PROGRESSING and DEGRADED
+read those conditions, and SINCE is when Available last changed. `-o wide` adds
+MESSAGE, the Available message, then PHASE, kept while v1alpha1 has it, and on
+`InferenceProvider` READY.
+
 ## SiteInvite
 
 Declares an invitation on the signer cluster. The signer pins the site name and
@@ -35,6 +62,25 @@ referenced Secret as a credential and deliver it and the grid CA bundle to the
 joining site's operator namespace out of band. The token itself is never
 published in status.
 
+**Conditions**: `Minted`, `Redeemed` and `Issued` are the facts, and
+`Available` says whether the token can still be presented. An invite is one-shot,
+like a Job, so a spent invite reads `Available` `False` and stays not `Degraded`.
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Minted` | `True` | `Minted` | The signer recorded the token. |
+| `Minted` | `False` | `Minting` | The token is checkpointed and the mint is in flight. `Progressing` is `True` with `Minting`. |
+| `Minted` | `False` | `NameTaken`, `TokenOutstanding`, `NameDeleted` | The signer refused the mint. The message names the fix. |
+| `Redeemed` | `True` | `Redeemed` | A site spent the token. |
+| `Redeemed` | `False` | `AwaitingRequest`, `Expired`, `Revoked` | No site has spent it, its lifetime ended, or it was revoked. |
+| `Issued` | `True` | `Issued` | The site's certificate was issued, today in the same step as redemption. |
+| `Issued` | `False` | `AwaitingRequest`, `Expired`, `InviteRevoked` | No certificate was issued. |
+| `Available` | `False` | `Redeemed`, `Expired`, `Revoked`, or the `Minted` reason | The token cannot be presented. |
+
+`Ready` stays for v1alpha1 readers and follows `Available` under its earlier
+reasons: `True` `Ready` while the token can be presented, `False` `Pending` until
+it is minted, and `False` `Redeemed`, `Expired` or `Revoked` after.
+
 In Kubernetes, the controller reads SiteInvite objects, stores each token in a
 Secret, and revokes unused tokens when an admin deletes an invite.
 Standalone enrollment does not start the controller. Enrollment enforces an
@@ -58,19 +104,37 @@ cluster-scoped CRD. The current AGN deployment supports only one
 `GridNetwork` in the cluster. The operator fails startup when it finds more
 than one; adding another after startup is not supported.
 
+It carries this cluster's own conditions. `Accepted`, `ResolvedRefs`, `Enrolled` and
+`IdentityValid` gate its roll-up, in that order. `RotationOnSchedule` `False`, a
+`PeerTimeValid` of `False`, or a `GatewayAgesRejected` of `True` sets `Degraded` with
+that condition's reason, and after them, under Local membership, a `False`
+`PeerSignalsReachable`, `PeerCatalogsAccepted`, `PeerMembership` or `PeerPollsComplete`.
+None of the peer conditions gates `Available`, and a site switched to Swim drops them. Each condition type has one writer, and the controller alone
+writes `Available`, `Progressing` and `Degraded`. Every reason is listed in
+[Site Enrollment](../installation/enrollment.md#3-enroll-the-site).
+
+`spec.gridId` is the grid the network belongs to, set once: a DNS label of at most 63
+characters, and a change is refused. `status.gridId` mirrors it. Bootstrap owns
+ID generation and persists it independently of the CA; the operator never mints
+an ID. Every installation waits with `Accepted=False`, reason `GridIdUnset`,
+until `spec.gridId` is set. During migration, bootstrap adopts an existing
+declared or legacy status ID rather than creating another one. Moving a cluster
+to another grid means deleting and recreating its GridNetwork, and its identity with it.
+
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
 kind: GridNetwork
 metadata:
   name: production
 spec:
-  gridId: ""                    # auto-generated on first join
+  gridId: "production-grid"     # the stable ID supplied by bootstrap
   seeds:
     - "10.0.0.5:7946"
   consumerGateways:
     - name: inference-gw
       namespace: praxis-system
       siteName: cluster-east   # optional; defaults to network name
+      modelDiscoveryContractVersion: v1 # only after the running gateway implements the model-discovery contract
       praxisConfig:               # optional; opt-in consumer Praxis config generation
         generate: true
         enableProjectedCredentials: true  # generate filter, then roll out consumer
@@ -102,6 +166,9 @@ spec:
     probeInterval: 5s           # WAN probe interval
     suspicionTimeout: 10s       # before declaring dead
     gossipNodes: 3              # indirect probe fanout
+  peerTrust:
+    mode: pin                    # pin (default) or spiffe
+    signedState: "off"           # off (default) or enforce
   tls:
     caSecretRef:
       name: grid-ca
@@ -119,6 +186,21 @@ spec:
       - tenantId: tenant-b
         capUsd: 250.0
 ```
+
+`peerTrust.mode` controls how this grid accepts peer signing identities for
+SWIM state gossip. `pin` (the default) requires the peer certificate's
+canonical DER SHA-256 fingerprint to appear in that peer's
+`GridSite.spec.trust.canonicalFingerprints`. It still verifies the certificate
+against this grid's CA and expected site identity. `spiffe` also verifies the
+grid CA and site identity, requires the site's SPIFFE URI, and does not read
+fingerprints. See [Signed gossip trust](signed-gossip-trust.md) for how those
+identities gate signed CRDT state and how the certificate bootstrap works.
+
+`peerTrust.signedState` gates that signing. `off` (the default) gossips state
+unsigned, as before. `enforce` signs this site's state and refuses peer state
+without a verified signature. Switch every site together: an enforcing site
+drops state from peers still at `off`. Setting `off` again removes the signer
+and pins on the next reconcile.
 
 ### Routing policy fields
 
@@ -157,6 +239,103 @@ means no polled peer has a rejected timestamp; `False` means at least one does.
 |---|---|---|
 | `False` | `TimestampOutOfRange` | A polled peer's latest answer carried a row stamped more than a second past its `Date`, or more than a day before it. The message names those peers (the first ten, then a count): check their clocks. |
 | `True` | `PeerTimestampsValid` | No polled peer's latest answer was rejected for its age. |
+
+Under Local membership the poller also writes three conditions, each under its own field
+manager. Which peers, and why, is on each peer's `GridSite`, as described in
+[Peer conditions under Local membership](#peer-conditions-under-local-membership).
+
+`PeerSignalsReachable` (`grid-operator-peer-reach`) counts the peers whose signals
+endpoint did not answer. A peer not yet checked, an egress-only peer, and a peer the
+round had no time for are not counted.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PeersUnreachable` | A checked peer's signals endpoint did not answer. The message counts them, for example `2 of 5 peers unreachable`. |
+| `True` | `PeerSignalsReachable` | Every polled peer's signals endpoint answered. |
+
+`PeerCatalogsAccepted` (`grid-operator-peer-catalogs`) counts the peers whose catalog,
+or part of it, was refused, out of the peers whose catalog is held.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `CatalogsRefused` | A peer's catalog was refused. The message counts them, for example `1 of 5 peers' catalogs refused`. |
+| `True` | `PeerCatalogsAccepted` | Every peer catalog read is accepted. |
+
+`PeerPollsComplete` (`grid-operator-peer-polls`) says whether each round had time to poll
+every peer. A peer the round had no time for keeps its last `SignalsReachable` verdict, so
+the overrun is this site's, never the peer's.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PollRoundOverrun` | The last round ran out before it polled some peers. The message counts them, for example `2 of 40 peers not polled within the round`. |
+| `True` | `PeerPollsComplete` | The last round polled every peer. |
+
+A `Swim` condition, under its own field manager (`grid-operator-swim`), reads `True`
+with reason `Swim` while SWIM runs, and `False` when it is configured but cannot start,
+with a reason naming the cause and the detail in the message. The operator
+keeps running without membership gossip, rather than exiting into a restart loop. It
+restarts itself once a late advertise address appears, and 300 s after a failure that
+may clear on another try: `AdvertiseAddressUnresolved`, `RevisionLeaseFailed` or
+`StartFailed`. A setting that is wrong waits for a rollout that fixes it. Under Local
+membership the operator removes the condition, since SWIM never runs there.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `AdvertiseAddressPending` | No advertise address within 180 s; the operator restarts once one appears. |
+| `False` | `AdvertiseAddressUnresolved` | The advertise address could not be resolved; retried after 300 s. |
+| `False` | `AdvertiseAddressUnspecified` | The address to advertise is unspecified; set `GRID_SWIM_ADVERTISE_ADDR`. |
+| `False` | `BindAddressInvalid` | `GRID_SWIM_BIND_ADDR` is not a socket address. |
+| `False` | `KeyInvalid` | `GRID_SWIM_ENCRYPT_KEY` does not parse. |
+| `False` | `RevisionLeaseFailed` | The signal revision lease could not be reserved; retried after 300 s. |
+| `False` | `StartFailed` | The runtime failed to start, binding its socket included; retried after 300 s. |
+| `True` | `Swim` | SWIM runs. |
+
+**Membership mode:** `spec.membership.mode` selects how a site learns its
+members. `Swim` discovers members by SWIM gossip. `Local` uses the site's
+declared `GridSite` objects and requires `spec.signalTransport.mode: poll`:
+
+```yaml
+spec:
+  membership:
+    mode: Local
+  signalTransport:
+    mode: poll
+```
+
+An explicit mode overrides the install's `GRID_MEMBERSHIP_SOURCE`. When the
+field is absent, the install setting applies, defaulting to `Swim`. Changing
+the mode, including removing an override, gracefully restarts the operator
+to apply the new selection. A declared `Local` mode disables SWIM even when
+the platform Deployment still sets `GRID_SWIM_BIND_ADDR`; the Deployment
+does not need to change. Local requires reachable peer signals endpoints
+and matching identities, independently of how those resources are delivered.
+
+The `grid-operator` and `grid-site` charts write this field from their existing
+`grid.membership.source` value. Under `Local` they also default signals to
+poll and reject contradictory gossip settings. Install-only Local mode
+continues to reject an explicitly configured SWIM bind address.
+
+Local assumes something outside the grid delivers every site's `GridSite` records, the
+same set to every member. The operator discovers no peers in this mode. It polls the
+sites its own configuration lists, so a member missing from a site's records is a member
+that site never reaches.
+[Open Cluster Management](https://open-cluster-management.io/) is the reference example,
+placing the records on each cluster in a cluster set. Argo CD or plain GitOps deliver the
+same records just as well. Red Hat Advanced Cluster Management is the product built on
+Open Cluster Management.
+
+A `PeerMembership` condition, under its own field manager
+(`grid-operator-peer-membership`), compares the `X-Grid-Membership` header each
+polled peer answers with against this site's `GRID_MEMBERSHIP_SOURCE`. A peer that sends
+no header is an older release and is judged by nothing. A grid that mixes sources is
+not supported: polling goes on so the direction that works still routes, but a
+Swim site never reads a Local site's catalog, and the condition stays False
+until every site names one source.
+
+| Status | Reason | When |
+|---|---|---|
+| `False` | `PeerMembershipMismatch` | A polled peer names a different membership source. The message names those peers and their sources: set `grid.membership.source` alike on every site. |
+| `True` | `PeerMembership` | Every polled peer that names a mode names this site's. |
 
 A relayed age survives a clock step on every hop, so a step alone never makes
 this condition false: it points at a peer whose clock or stamping is wrong.
@@ -414,6 +593,13 @@ This field is independent of `praxisConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
 
+### GatewayRef.modelDiscoveryContractVersion
+
+Set `spec.consumerGateways[].modelDiscoveryContractVersion: v1` only after the
+running gateway image understands and enforces the `expires_at` field on local
+discovered-model candidates. Missing or unknown versions cause Grid to omit
+discovered candidates for that gateway while keeping static candidates.
+
 ### GatewayRef.praxisConfig
 
 `spec.consumerGateways[].praxisConfig` opts a gateway into operator-managed consumer
@@ -495,8 +681,9 @@ embedded gateway's serving config is controlled separately by
 
 ## GridSite
 
-Represents another site in the grid. Created manually
-for seed peers or automatically by SWIM discovery.
+Represents a site in the grid. A peer is created manually for seed peers or
+automatically by SWIM discovery. This cluster's own site is the GridSite named
+after its identity, and before it has one, the GridSite named in the operator config.
 
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
@@ -511,7 +698,7 @@ spec:
     address: egress.cluster-b.example.com:8443
     tls:
       mode: Mutual
-      serverName: egress.cluster-b.example.com
+      serverName: cluster-b.grid.internal
   trust:
     canonicalFingerprints:
       - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -522,9 +709,70 @@ spec:
 
 **Phases**: Pending → Discovered → Connecting → Active → Unreachable → Left
 
-**Status fields**: `phase`, `reason`, `message`, `observedGeneration`,
+**Status fields**: `conditions`, `phase`, `reason`, `message`, `observedGeneration`,
 `publicCertPem`, `capabilities` (inference, agentTools, agentToAgent),
-`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only)
+`lastProbeTime`, `lastTransitionTime`, `absentSince` (auto-discovered sites only).
+Status is membership only, each cluster's view of one site, this cluster's own site
+included. The own site's identity conditions live on the GridNetwork.
+
+### This cluster's own site
+
+This cluster's own GridSite is declared like any peer, by the grid-site chart, by
+`grid.id` on the grid-operator chart, by GitOps or by hand: named after the site the
+identity names and labelled `grid.praxis.fast/provider-site`. If nothing declares one,
+the operator creates it from the identity, as it does the GridNetwork, under
+`--grid-create-local-records`, on by default. It never overwrites a GridSite something
+else declared, and enrollment does not wait for it. The own GridSite carries no local
+config. How this site enrolls and renews lives in
+the operator config: the ConfigMap `grid-operator-config` in the operator namespace,
+key `config.yaml`, which the grid-operator chart renders from its `enrollment` values
+(`operatorConfig.name` renames it). The operator reads it through the API and watches
+it, so an edit applies without a restart. It holds only this operator's or this site's
+own settings. Grid-wide settings stay on the GridNetwork, and credentials stay in
+Secrets it names.
+
+```yaml
+site:
+  name: east2
+  signerEndpoint:
+    url: https://enrollment.apps.example.com
+    caBundleRef: {kind: Secret, name: grid-ca-bundle, key: ca.crt}
+    gridCaBundleRef: {kind: Secret, name: grid-ca-anchor, key: ca.crt}
+    rotation: Enabled
+  inviteSecretRef: {name: grid-invite-east2, key: token}
+```
+
+| Field | Meaning |
+|---|---|
+| `site` | This cluster's own site. Optional, like every section. Unset, the site does not enroll itself. |
+| `site.name` | The site name, and the name of its GridSite. Required. The invite label and the issued certificate must match it. |
+| `site.signerEndpoint.url` | The base URL of the signer the site enrolls and renews through. https, naming a host with an optional numeric port, without credentials, query or fragment, and not a host under `grid.internal`. |
+| `site.signerEndpoint.caBundleRef` | A `Secret` in the operator namespace pinning the signer to enroll, and by default the grid CA it returns. `kind` is required, and `Secret` is the only kind, so whoever can edit this config cannot pin a CA of their own. Required with `inviteSecretRef`. Renewal trusts the grid CA the site holds together with this bundle. Pin the issuing intermediate or the signer's serving certificate, never a public root. The object must carry `grid.praxis.fast/signer-bundle=true`, as must the `gridCaBundleRef` object. |
+| `site.signerEndpoint.gridCaBundleRef` | The grid CA the returned CA must match: a bootstrap override for a signer that cannot serve its own bundle, such as one behind a certificate from another CA. |
+| `site.signerEndpoint.rotation` | Whether this operator renews the identity through the signer. `Enabled` (default) renews when a third of its lifetime remains, and is refused under pin peer trust with `Accepted` `False` and `RotationUnsupportedUnderPinTrust`. `Disabled` uses the signer to enroll only. Enrollment runs whatever this says. |
+| `site.inviteSecretRef` | The Secret holding the one-time invite token, an opaque credential the signer issued, read once while the site has no identity. `key` defaults to `token`. The Secret must carry `grid.praxis.fast/site=<site.name>`. |
+
+An optional top-level `version` says which document this is. Absent reads as `1`, the
+only version this operator reads, and any other refuses the document. A top-level
+section the operator does not read is ignored and the rest applies, so an operator
+older than a new section keeps running through a rollout. It logs the section, records
+an `OperatorConfigSectionIgnored` Warning Event on the ConfigMap and counts it in
+`grid_operator_config_ignored_sections`. Inside a section it reads, the operator refuses
+the whole document: an unknown key, a bad URL or a missing field reports `Accepted`
+`False` with `OperatorConfigInvalid` on the GridNetwork, the message naming the field,
+and no section of it is acted on. A `site.name` other than the site the held identity
+names reports `SiteNameMismatch`. Before the GridNetwork exists, the operator sends
+nothing, logs why and records an `AwaitingGridNetwork` Event on the ConfigMap, once. Under pin peer trust,
+`rotation: Enabled` reports `Accepted` `False` with `RotationUnsupportedUnderPinTrust`
+and nothing renews. Every condition and reason is listed in
+[Site Enrollment](../installation/enrollment.md#3-enroll-the-site). A local site may
+exist before its GridNetwork, and the GridSite controller waits for the network
+without reporting an error.
+
+The operator self-signs a grid CA and site identity for a GridNetwork that names TLS
+Secrets neither of which exists. It never does while the operator config names this
+site, or is refused, since enrollment writes both. It waits 30 seconds after the
+GridNetwork is created, so an operator config applied with it is seen first.
 
 ### GridSite lifecycle
 
@@ -542,7 +790,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 |---|---|---|
 | `Pending` | Resource created (manually or by auto-discovery) | Initial default |
 | `Discovered` | SWIM peer observed as Alive | `GridNetwork` controller writes on first observation |
-| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered; performs identity-aware probe |
+| `Connecting` | Gateway address known (`spec.gatewayEndpoint.address` non-empty) | `GridSite` controller advances from Discovered, or from Pending for a declared site with both endpoints; performs identity-aware probe |
 | `Active` | `TlsVerified` | `GridSite` controller promotes from Connecting only after identity-verified TLS succeeds |
 | `Unreachable` | Connectivity failure while Active | `GridSite` controller moves Active → Unreachable when the endpoint cannot be reached |
 | `Left` | Set on graceful site departure | Preserved by operator once set |
@@ -554,6 +802,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 | `AwaitingDiscovery` | Pending | Site record exists; SWIM has not yet observed the peer as Alive |
 | `SWIMDiscovered` | Discovered | Peer observed as Alive in SWIM membership; gateway address propagating |
 | `GatewayAddressKnown` | Connecting | Gateway address received; advancing to Connecting |
+| `EndpointsDeclared` | Connecting | Declared site names a dialable gateway endpoint, which also gives its signals endpoint; advancing without discovery |
 | `GatewayAddressMissing` | Discovered, Connecting, or Unreachable | No gateway address known (see `GRID_GATEWAY_ADDRESS`), or a previously probed site lost it |
 | `TlsVerified` | Active | TLS handshake succeeded; certificate chain, identity, and configured pin verified |
 | `IdentityVerificationRequired` | Connecting | TCP endpoint is reachable, but plaintext cannot establish the gateway identity |
@@ -573,6 +822,9 @@ A discovered SWIM peer is not automatically authorized for routing.
 - Pending → Discovered: the `GridNetwork` controller writes `Discovered` when a remote SWIM
   peer is first observed as Alive (requires `grid.praxis.fast/auto-discover-sites: "true"`
   label on the `GridNetwork`).
+- Pending → Connecting: the `GridSite` controller advances a declared site (one without
+  the `grid.praxis.fast/auto-discovered` label) that sets a dialable
+  `spec.gatewayEndpoint.address`, so it does not wait on SWIM.
 - Discovered → Connecting: the `GridSite` controller advances automatically when
   `spec.gatewayEndpoint.address` is non-empty. For auto-discovered sites, the egress address comes from
   the remote operator's `GRID_GATEWAY_ADDRESS` env var, propagated via SWIM state broadcast.
@@ -592,7 +844,7 @@ A discovered SWIM peer is not automatically authorized for routing.
 **Metrics:** `grid_site_phase{site,phase}` reports each `GridSite`'s phase as a state
 set, the shape of kube-state-metrics' `kube_pod_status_phase`. The series for the
 current phase is 1 and the other five are 0, so a site is ready when
-`grid_site_phase{phase="Active"} == 1`. It follows the phase the printer column shows,
+`grid_site_phase{phase="Active"} == 1`. It follows the phase the wide PHASE column shows,
 updates on every `GridNetwork` reconcile, and drops a site's series once its `GridSite`
 is gone. Cardinality is six series per site. `grid_site_phase_transition_total`
 still counts the transitions by phase and reason.
@@ -620,6 +872,26 @@ structural check passed.  It does **not** mean:
 Private keys, bearer tokens, provider credentials, and Kubernetes Secret contents must never
 be written to status.
 
+**Signals endpoint:** under Local membership a site serves its signals by default at its
+gateway endpoint's host, under the TLS server name `<site>-signals.grid.internal`, where `<site>` is
+the GridSite name. The port is the gateway's own, for a site whose one router selects the
+signals listener by server name, such as an OpenShift passthrough Route. The operator flag
+`GRID_SIGNALS_PEER_ENDPOINT_PORT` (chart `signals.peerEndpointPort`) sets one port for the
+grid instead, for sites whose one load balancer carries both. A site whose signals sit
+elsewhere sets the optional `spec.signalsEndpoint`, and each field it sets replaces the
+derived one. Loopback, link-local, and cloud metadata hosts are not dialled.
+
+**`spec.signalsEndpoint` fields**, all optional:
+
+| Field | Meaning |
+|---|---|
+| `address` | Signals listener `host:port`. Absent, the gateway endpoint's host |
+| `serverName` | TLS server name sent to the listener. Absent, `<site>-signals.grid.internal` |
+
+The address carries the port. Without one, the gateway endpoint's host is dialled at the
+operator's signals port setting, or at the gateway's own port. The poller verifies the peer
+by pin or SPIFFE ID, so the server name need not appear in the peer's certificate.
+
 **`spec.gatewayEndpoint.tls` fields:**
 
 | Field | Meaning |
@@ -633,6 +905,11 @@ be written to status.
 |---|---|
 | `canonicalFingerprints` | Required DER-certificate SHA-256 pins (`hex(sha256(der_bytes))`), one or two entries for bounded rotation overlap |
 | `certFingerprint` | **Deprecated.** Legacy PEM-based fingerprint; rejected at runtime with `TrustMaterialInvalid`; migrate to `canonicalFingerprints` |
+
+The same `GridSite.spec.trust.canonicalFingerprints` policy is used by
+`peerTrust.mode: pin` to verify a site's signing identity for SWIM/CRDT state.
+The certificate must also chain to the grid CA and identify the expected site;
+the fingerprint is an additional exact-certificate check.
 
 **Routing eligibility:** `GridSite.status.phase == Active` is the control-plane eligibility
 gate for remote CRDT provider records. Active means the control plane has
@@ -664,6 +941,44 @@ and its mTLS gateway probe (`spec.gatewayEndpoint` + `spec.trust`) apply to reac
 [Architecture Overview -> Single-Site and Combined Deployments](overview.md#single-site-and-combined-deployments).
 
 See [Routing eligibility](routing.md#routing-eligibility) for the full gating rule.
+
+### Peer conditions under Local membership
+
+Under Local membership the lease holder writes two conditions on each peer's
+`GridSite`, each under its own field manager. They are this site's view of the peer.
+Neither gates the phase or `Available`. A `False` one raises the peer's `Degraded`,
+`SignalsReachable` first, then `CatalogAccepted`. `Degraded` copies its reason, and its
+message names the condition. The GridSite controller writes `Degraded` on the reconcile
+that the poller's write triggers.
+
+`SignalsReachable` (`grid-operator-peer-reach`) says whether the peer's signals endpoint
+answered the last poll. The message carries the polled address and the detail.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `SignalsReachable` | The peer's signals endpoint answered. |
+| `Unknown` | `AwaitingFirstCheck` | The peer has not yet answered or failed a poll. |
+| `False` | `NotFound` | It answered 404: check its signals endpoint and port. |
+| `False` | `Timeout` | It did not answer in time. |
+| `False` | `TLSRefused` | The TLS handshake or the peer's identity was refused. |
+| `False` | `ConnectionRefused` | The connection was refused or never established. |
+| `False` | `RequestFailed` | Any other failure, named in the message. |
+| `False` | `EgressOnly` | The peer declares no signals endpoint, so it is not polled: set `spec.signalsEndpoint`, or a dialable `spec.gatewayEndpoint`, to poll it. It raises neither the peer's `Degraded` nor the `GridNetwork` count. |
+
+`CatalogAccepted` (`grid-operator-peer-catalogs`) says whether the peer's catalog was
+accepted in the last rendering. It is written once a catalog is held.
+
+| Status | Reason | When |
+|---|---|---|
+| `True` | `CatalogAccepted` | The peer's catalog is accepted, in full or up to what it may contribute. Each declared peer is owed the overlay's 1024-candidate ceiling divided by the peers, one candidate per model; what is left once every peer has its share goes to the peers over theirs in the order their catalogs first arrived. A peer is never refused for its size: past what it may contribute, the rest of its catalog waits, models in name order, and the message counts how many of its candidates wait and names who took the rest. The message also names what the peer holds that another peer also names, and the peers it leaves short by taking the remainder. |
+| `False` | `OwnCluster` | A record names one of this site's own clusters. |
+| `False` | `HopClaimed` | A record names a cluster bound to another site's gateway hop. The message names that site. |
+| `False` | `ClusterClaimed` | A record names a cluster another peer holds by declaration: the cluster is bound to that peer's gateway hop, or carries that peer's name. The message names the holder. |
+| `False` | `ClusterContested` | A record names a cluster another peer also names, and nothing declares whose it is, so no peer routes it until the names differ. The message names the other peers. |
+
+A peer that leaves the Local peer set loses both conditions on the next round, and an
+operator that starts under Swim removes them once. Either way the peer's `Degraded`
+returns to `False` on its next reconcile.
 
 Example status (Mutual TLS verified):
 
@@ -697,32 +1012,37 @@ status:
   observedGeneration: 2
 ```
 
-### Status conditions (acceptance criterion open)
+### Status conditions
 
-The current `GridSite` status uses a flat
-`phase`/`reason`/`message` model rather than a
-Kubernetes-style `conditions[]` array.
+The operator writes `Connected` and the roll-up beside the phase, which stays for
+v1alpha1 readers. On a peer, `Connected` is the only gate. Under Local membership, a
+`False` `SignalsReachable` or `CatalogAccepted` raises `Degraded`, as
+[Peer conditions under Local membership](#peer-conditions-under-local-membership) lists.
 
-Issue #11's acceptance criteria include a conditions-based
-status contract.  That criterion is **not yet resolved**:
-it requires either (a) implementing a `conditions[]` array
-or (b) formally amending the issue to accept the
-`phase`/`reason`/`message` model as the replacement.
-Neither has happened at the time of writing.
+A peer's `GridSite` is a local object, and its conditions record what this site
+observes of that peer. Status is never shared between sites, so two sites can
+disagree about one peer during a partition. The peer's own health is in its own
+`GridSite` and its signals.
 
-The flat model is the current contract:
+| Status | Reason | When |
+|---|---|---|
+| `True` | `Connected` | The TLS handshake verified the chain, identity and pin. |
+| `Unknown` | `AwaitingFirstCheck` | An address is known and the first probe has not run. `Progressing` is `True` with `Probing`. |
+| `False` | `AwaitingDiscovery` | The record waits for discovery to supply its address. |
+| `False` | `AddressMissing` | No gateway address is configured. |
+| `False` | `AddressRefused` | The gossiped address is not a dialable literal `IP:port`. |
+| `False` | `Unreachable` | The TCP connect was refused or timed out. The message names which. After an address edit, `Progressing` is `True` with `Probing`. |
+| `False` | `TLSProtocolError` | The TLS handshake failed or timed out at the protocol level. |
+| `False` | `UntrustedIssuer`, `IdentityMismatch`, `CertificateExpired`, `CertificateNotYetValid`, `PinMismatch`, `TrustMaterialMissing`, `TrustMaterialInvalid`, `IdentityVerificationRequired` | The probe's trust failure, named as the probe reports it. |
 
-- `phase` provides the primary lifecycle state;
-  `reason` encodes the machine-readable probe outcome;
-  `message` gives a bounded human-readable explanation.
-- Richer conditions (e.g. `Reachable`, `IdentityVerified`,
-  `CertificatePinned`) may be added when multi-signal
-  readiness is needed (see `docs/architecture/overview.md`,
-  Trust and Readiness section).
+`Connected` and the roll-up have separate writers. The phase stays a merge patch.
 
-Tools and automation **must not** depend on a
-`conditions[]` field existing.  Match on `phase` for
-coarse state and on `reason` for specific probe outcomes.
+This cluster's own site rolls up the same way, from a probe of its own gateway, and
+its GridSite says nothing about its identity. The identity conditions live on the
+GridNetwork, where `Accepted`, `ResolvedRefs`, `Enrolled` and `IdentityValid` gate the
+roll-up in that order. There `Degraded` is `True` while `RotationOnSchedule` is `False`,
+the early warning that the identity is about to expire, and `Progressing` is `True`
+while an enrollment is in flight or retried.
 
 ## InferenceProvider
 
@@ -791,7 +1111,8 @@ probe anonymously. Redirects are not followed; a 3xx response degrades health.
 **Phases**: Pending → Available → Degraded → Unavailable
 
 **Readiness**: `status.conditions` carries a `Ready` condition, written by the
-operator's signals loop from each scrape of the provider's metrics. Readiness is
+operator's signals loop from each scrape of the provider's metrics, in every
+signal mode. Readiness is
 a condition, not a phase: `phase` follows the provider's configuration only, and
 says nothing about whether it serves now.
 
@@ -799,16 +1120,16 @@ says nothing about whether it serves now.
 |---|---|---|
 | `True` | `Ready` | The latest scrape succeeded with at least one ready endpoint. |
 | `False` | `NoEndpointsReady` | Two consecutive scrapes counted zero ready endpoints, and the EPP recorded no engine answer in the last 30s. |
-| `Unknown` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). Readiness is unknown rather than false, so the provider is not excluded: a provider pointed at vLLM's own `/metrics` carries no such series. The message names what was missing. |
+| `True` | `NoLivenessCheck` | The scrape answered without the pool's ready-endpoint series (`llm_d_epp_ready_endpoints`, then `inference_pool_ready_pods`, for `poolName`). Routing serves the provider, so `Ready` reads `True`: a provider pointed at vLLM's own `/metrics` carries no such series. The message names what was missing. |
 | `False` | `ScrapeTimedOut` | No scrape succeeded within `staleMetricsSeconds` or the [readiness floor](polling-metrics.md#provider-readiness), if longer, and the latest timed out. |
 | `False` | `ScrapeUnauthorized` | As above, and the latest was refused with 401 or 403. |
 | `False` | `TLSHandshakeFailed` | As above, and the latest failed TLS, including the TLS material. |
-| `Unknown` | `MetricsBodyTooLarge` | The endpoint answered, but its metrics HTTP response body passed the operator's 1 MiB budget. Readiness is unknown rather than false, so the provider remains a routing candidate. |
+| `True` | `MetricsBodyTooLarge` | The endpoint answered, but its metrics HTTP response body passed the operator's 1 MiB budget. The provider remains a routing candidate, so `Ready` reads `True`, and `MetricsReachable` reports the failure. |
 | `False` | `ScrapeFailed` | As above, and the latest failed otherwise. The message names the class: `dns`, `connect`, `http`, `parse`, or `config`. |
 | `False` | `MetricsStale` | No scrape succeeded within `staleMetricsSeconds` or the [readiness floor](polling-metrics.md#provider-readiness), if longer, and none failed. |
 | `False` | `ProviderUnavailable` | The provider is `Unavailable`. |
 | `Unknown` | `AwaitingFirstScrape` | No scrape has succeeded yet, within the grace window. |
-| `Unknown` | `MetricsNotConfigured` | No `metricsConfig`, so readiness cannot be read. |
+| `Unknown` | `NotEvaluated` | No metrics endpoint is set, so readiness is not evaluated. `MetricsAvailable` reads the same. |
 
 The operator logs each change of reason once: at WARN when the provider turns not
 ready, at INFO when it returns to `Ready` or waits. Each scrape counts in
@@ -821,13 +1142,32 @@ A provider whose `Ready` is `False` is excluded from routing: its site publishes
 `grid_provider_ready 0`, and its serving config entry carries `admission: none`.
 See [Polling Cross-Site Load Signals](polling-metrics.md#provider-readiness).
 
-The READY column reads the condition's status directly, so no status field
-repeats it. `-o wide` adds REASON, the condition's reason, and PHASE.
+**Roll-up**: `Available` is gated by `Accepted`, `ResolvedRefs` and
+`EndpointLive`, in that order, and a `MetricsReachable` failure sets `Degraded`.
+The provider reconciler writes `Accepted`, `ResolvedRefs` and the roll-up. The
+signals loop writes `EndpointLive` and `MetricsReachable` with `Ready`.
+
+| Condition | Status | Reason | When |
+|---|---|---|---|
+| `Accepted` | `False` | `Invalid` | The endpoint or a model name is blank, or `spec.auth` does not parse. |
+| `ResolvedRefs` | `False` | `BackendNotFound` | The referenced `GridNetwork` does not exist. |
+| `ResolvedRefs` | `False` | `NoSitesMatched` | Sites exist and `siteSelector` matches none. |
+| `ResolvedRefs` | `Unknown` | `NotEvaluated` | An invalid spec or an unreadable credential stopped resolution first. |
+| `EndpointLive` | `True` | `EndpointLive` | The latest scrape counted ready endpoints, or, without metrics, the health check passes. |
+| `EndpointLive` | `True` | `NoHealthSignal` | Nothing checks liveness: no metrics endpoint and no health check, or metrics without a ready-endpoint series. Routing serves it, so the condition says so. |
+| `EndpointLive` | `False` | `NoEndpointsReady` | Scrapes count zero ready endpoints, or the provider is `Unavailable`. |
+| `EndpointLive` | `False` | `LivenessStale` | No scrape succeeded within the readiness window. `MetricsReachable` names why. |
+| `EndpointLive` | `Unknown` | `AwaitingFirstCheck` | No scrape has succeeded yet, within the grace window. |
+| `MetricsReachable` | `False` | The `Ready` scrape reason | The latest scrape failed. Absent when no metrics endpoint is set. |
+
+`Programmed`, from model discovery, joins the gates later. The phase is computed
+as before.
+
 
 ```text
-NAME           PROVIDER      READY   AGE
-qwen3-site-a   self_hosted   True    3d
-qwen3-site-b   self_hosted   False   3d
+NAME           PROVIDER      AVAILABLE   PROGRESSING   DEGRADED   SINCE   AGE
+qwen3-site-a   self_hosted   True        False         False      3d      3d
+qwen3-site-b   self_hosted   False       False         False      2m      3d
 ```
 
 `spec.capacityWeight` is an optional positive relative provider capacity from
@@ -1054,8 +1394,11 @@ as a normalized `0.0` to `1.0` gauge before the operator scrapes it.
 ### Model discovery
 
 `spec.modelDiscovery` makes the operator poll the backend for the models it
-serves. Discovery does not yet affect routing or gossip; `spec.models`
-remains the routing source.
+serves. Discovered model names can appear in local route candidates only for a
+gateway that declares `modelDiscoveryContractVersion: v1`. They remain
+withheld from provider records because the current provider-record format
+cannot carry expiry. A provider with discovery configured does not fall back to
+`spec.models`; providers without discovery continue to use `spec.models`.
 
 ```yaml
 spec:
@@ -1100,9 +1443,31 @@ require this timestamp to be in the future before using `servedModels`. The
 discovery loop may not clear the status until its next round after the TTL, so
 the presence of `servedModels` alone does not prove freshness. Failed polls do
 not extend the deadline. When the set is unknown, expired and cleared, or
-discovery is disabled, both fields are absent; readers must fail closed.
-Writing either field advances `metadata.resourceVersion`, so the CRDT revision
+discovery is disabled, these discovery inventory fields are absent; readers
+must fail closed.
+`status.servedModelsObservedGeneration` records the provider `metadata.generation`
+that produced the set. Readers must require it to equal the current generation;
+a spec change makes the prior inventory unusable until a successful poll writes
+a new set, expiry, and generation together.
+Updating these fields advances `metadata.resourceVersion`, so the CRDT revision
 of the gossiped provider record advances with discovery status changes.
+
+### Gateway model discovery contract
+
+The operator adds `expires_at` (RFC 3339 UTC) to each discovered local route
+candidate. A gateway may receive these candidates only when its `GatewayRef`
+declares `modelDiscoveryContractVersion: v1`, after the running image has
+implemented this contract. At request time the gateway must treat the candidate
+as expired once its UTC clock reaches `expires_at` minus 30 seconds. This
+conservative allowance covers gateways whose clocks are up to 30 seconds behind
+the operator; a gateway with a clock ahead may withdraw the route early. The
+gateway must never extend the deadline or apply a grace period after it.
+Gateways without the declaration receive no discovered candidates.
+
+The embedded gateway carries the same deadline in its watched serving config as
+`expires_at_ms`. It checks the deadline during route selection and pinned
+requests, using the same 30-second allowance; expiry therefore remains enforced
+even when operator reconciliation or config delivery stops.
 
 The bearer token comes from `spec.auth`. A model-discovery URL must use HTTPS
 when a bearer token is configured. With `auth.credentialsManagedExternally`, requests carry no

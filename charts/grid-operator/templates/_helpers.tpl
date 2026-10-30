@@ -81,11 +81,21 @@ repository@digest and ignores tag. Otherwise renders repository:tag
 Signals are reached through the SWIM Service.
 */}}
 {{- define "grid-operator.validateSignals" -}}
-{{- if and (.Values.signals).enabled (not .Values.swim.service.enabled) }}
+{{- /* Local membership serves signals on its own Service, which normalize requires. */}}
+{{- if eq (dig "membership" "source" "Swim" .Values.grid) "Local" }}
+{{- else if and (.Values.signals).enabled (not .Values.swim.service.enabled) }}
 {{- fail "signals.enabled needs swim.service.enabled: peers and the local gateway reach signals through the SWIM Service" }}
 {{- end }}
-{{- if and (.Values.signals).enabled (eq .Values.swim.service.type "LoadBalancer") (eq .Values.swim.service.externalTrafficPolicy "Cluster") }}
-{{- fail "signals on a LoadBalancer need swim.service.externalTrafficPolicy Local: the listener caps handshakes per source address" }}
+{{- /* Under Cluster every peer arrives from a node address and shares its handshake cap, so
+it needs the cap raised from the default 8. */}}
+{{- $capRaised := gt (int ((.Values.signals).maxHandshakesPerSource | default 8)) 8 }}
+{{- if and (.Values.signals).enabled (eq .Values.swim.service.type "LoadBalancer") (eq .Values.swim.service.externalTrafficPolicy "Cluster") (not $capRaised) }}
+{{- fail "signals on a LoadBalancer need swim.service.externalTrafficPolicy Local, or signals.maxHandshakesPerSource raised: the listener caps handshakes per source address" }}
+{{- end }}
+{{- /* The signals Service renders its own policy, so judge the one it renders. */}}
+{{- $signalsService := ((.Values.signals).service) | default dict }}
+{{- if and (.Values.signals).enabled $signalsService.enabled (eq ($signalsService.type | default .Values.swim.service.type) "LoadBalancer") (eq (toString $signalsService.externalTrafficPolicy) "Cluster") (not $capRaised) }}
+{{- fail "signals on a LoadBalancer need signals.service.externalTrafficPolicy Local, or signals.maxHandshakesPerSource raised: the listener caps handshakes per source address" }}
 {{- end }}
 {{- end }}
 
@@ -151,6 +161,16 @@ Service. Without enrollment nothing changes.
 {{- with ($v.site | default dict).name }}{{- if not $v.swim.siteName }}{{- $_ := set $v.swim "siteName" . }}{{- end }}{{- end }}
 {{- with $grid.seeds }}{{- $_ := set $grid "seeds" (include "grid-operator.seedList" (dict "raw" . "port" ($svc.port | default 7946) "key" "grid.seeds") | fromYamlArray) }}{{- end }}
 {{- with $grid.seeds }}{{- if not $v.swim.seeds }}{{- $_ := set $v.swim "seeds" (join "," .) }}{{- end }}{{- end }}
+{{- if eq (dig "membership" "source" "Swim" $grid) "Local" }}
+{{- if eq ($grid.signals | default "poll") "gossip" }}{{- fail "grid.membership.source Local polls signals: grid.signals gossip contradicts it" }}{{- end }}
+{{- if eq (toString $svc.enabled) "true" }}{{- fail "grid.membership.source Local runs no SWIM: unset swim.service.enabled" }}{{- end }}
+{{- if or $grid.seeds $v.swim.seeds }}{{- fail "grid.membership.source Local runs no SWIM: remove grid.seeds and swim.seeds" }}{{- end }}
+{{- if $v.swim.advertiseAddress }}{{- fail "grid.membership.source Local runs no SWIM: remove swim.advertiseAddress" }}{{- end }}
+{{- if not $v.signals.service.enabled }}{{- fail "grid.membership.source Local serves signals on the signals Service: set signals.service.enabled" }}{{- end }}
+{{- $_ := set $grid "signals" "poll" }}
+{{- $_ := set $v.signals "enabled" true }}
+{{- $_ := set $svc "enabled" false }}
+{{- end }}
 {{- if $grid.id }}
 {{- if eq ($grid.signals | default "") "poll" }}{{- $_ := set $v.signals "enabled" true }}{{- end }}
 {{- if kindIs "invalid" $svc.enabled }}
@@ -159,11 +179,18 @@ Service. Without enrollment nothing changes.
 {{- end }}
 {{- if not $v.gateway.serviceName }}{{- $_ := set $v.gateway "serviceName" "grid-gateway" }}{{- end }}
 {{- end }}
+{{- /* A hub names its in-cluster signer whether or not it enrolls through it: a hub whose
+     identity bootstrap issued still renews there. */}}
+{{- if or $e.enabled $e.hub }}
+{{- if not $v.rbac.enrollmentNamespace }}{{- $_ := set $v.rbac "enrollmentNamespace" "grid-enrollment" }}{{- end }}
+{{- end }}
+{{- if and $e.hub (not $e.url) }}
+{{- $_ := set $e "url" (printf "https://%s.%s.svc:%v" ($e.hubService | default "grid-enrollment") $v.rbac.enrollmentNamespace ($e.hubPort | default 8443)) }}
+{{- end }}
 {{- if $e.enabled }}
 {{- if not $e.siteName }}{{- $_ := set $e "siteName" $v.swim.siteName }}{{- end }}
 {{- if not $v.swim.siteName }}{{- $_ := set $v.swim "siteName" $e.siteName }}{{- end }}
-{{- if not $v.rbac.enrollmentNamespace }}{{- $_ := set $v.rbac "enrollmentNamespace" "grid-enrollment" }}{{- end }}
-{{- if not $e.url }}{{- $_ := set $e "url" (printf "https://grid-enrollment.%s.svc:8443" $v.rbac.enrollmentNamespace) }}{{- end }}
+{{- if not $e.url }}{{- fail "enrollment.url is required: name the hub's signer, or set enrollment.hub=true where grid-enrollment runs on this cluster" }}{{- end }}
 {{- if not $v.gateway.serviceName }}{{- $_ := set $v.gateway "serviceName" "grid-gateway" }}{{- end }}
 {{- if kindIs "invalid" $svc.enabled }}{{- $_ := set $svc "enabled" true }}{{- if not $svc.type }}{{- $_ := set $svc "type" "LoadBalancer" }}{{- end }}{{- end }}
 {{- end }}
@@ -175,6 +202,9 @@ Service. Without enrollment nothing changes.
 Refuse a grid the chart cannot render.
 */}}
 {{- define "grid-operator.validateGrid" -}}
+{{- if and (not .Values.grid.id) (eq .Values.grid.signedState "enforce") }}
+{{- fail "grid.signedState enforce requires grid.id; otherwise set peerTrust.signedState: enforce on the GridNetwork you manage" }}
+{{- end }}
 {{- if and .Values.grid.id (not .Values.swim.siteName) }}
 {{- fail "grid.id needs site.name: the GridSite and the SWIM identity are named after this site" }}
 {{- end }}
@@ -302,3 +332,90 @@ RUST_LOG for the chart's Rust binaries: log.filter when set, else log.level.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The PodDisruptionBudget's minAvailable and maxUnavailable as strings, empty when unset.
+*/}}
+{{- define "grid-operator.pdb.bounds" -}}
+{{- $pdb := .Values.podDisruptionBudget | default dict }}
+{{- $min := "" }}
+{{- if not (kindIs "invalid" $pdb.minAvailable) }}{{ $min = toString $pdb.minAvailable }}{{ end }}
+{{- $max := "" }}
+{{- if not (kindIs "invalid" $pdb.maxUnavailable) }}{{ $max = toString $pdb.maxUnavailable }}{{ end }}
+{{- dict "min" $min "max" $max | toJson }}
+{{- end }}
+
+{{/*
+"true" when the PodDisruptionBudget renders: enabled true, or auto with more than one replica.
+*/}}
+{{- define "grid-operator.pdb.renders" -}}
+{{- $enabled := toString ((.Values.podDisruptionBudget | default dict).enabled) }}
+{{- if or (eq $enabled "true") (and (eq $enabled "auto") (gt (int .Values.replicaCount) 1)) }}true{{ end }}
+{{- end }}
+
+{{/*
+Pods a bound of `value` covers out of `replicas`, rounding a percentage up as Kubernetes does.
+*/}}
+{{- define "grid-operator.pdb.pods" -}}
+{{- if hasSuffix "%" .value }}
+{{- div (add (mul (int (trimSuffix "%" .value)) .replicas) 99) 100 }}
+{{- else }}
+{{- int .value }}
+{{- end }}
+{{- end }}
+
+{{/*
+Refuse a PodDisruptionBudget that names both bounds, neither, or one no node drain can satisfy.
+*/}}
+{{- define "grid-operator.pdb.validate" -}}
+{{- $enabled := toString ((.Values.podDisruptionBudget | default dict).enabled) }}
+{{- if not (has $enabled (list "auto" "true" "false")) }}
+{{- fail (printf "podDisruptionBudget.enabled must be auto, true or false, not %q" $enabled) }}
+{{- end }}
+{{- if include "grid-operator.pdb.renders" . }}
+{{- $bounds := include "grid-operator.pdb.bounds" . | fromJson }}
+{{- $replicas := int .Values.replicaCount }}
+{{- if and $bounds.min $bounds.max }}
+{{- fail "set one of podDisruptionBudget.minAvailable and podDisruptionBudget.maxUnavailable, not both" }}
+{{- else if $bounds.min }}
+{{- if ge (int (include "grid-operator.pdb.pods" (dict "value" $bounds.min "replicas" $replicas))) $replicas }}
+{{- fail (printf "podDisruptionBudget.minAvailable %s with replicaCount %d would block node drains: no operator pod could ever be evicted" $bounds.min $replicas) }}
+{{- end }}
+{{- else if $bounds.max }}
+{{- if le (int (include "grid-operator.pdb.pods" (dict "value" $bounds.max "replicas" $replicas))) 0 }}
+{{- fail (printf "podDisruptionBudget.maxUnavailable %s would block node drains: no operator pod could ever be evicted" $bounds.max) }}
+{{- end }}
+{{- else }}
+{{- fail "set podDisruptionBudget.minAvailable or podDisruptionBudget.maxUnavailable" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+A PodDisruptionBudget bound as YAML: a percentage quoted, a count as a number.
+*/}}
+{{- define "grid-operator.pdb.value" -}}
+{{- if hasSuffix "%" . }}{{ quote . }}{{ else }}{{ int . }}{{ end }}
+{{- end }}
+
+{{/*
+The preStop delay: as set, else none. Under HA the holder withdraws its own EndpointSlices, so
+no selector Service waits on readiness for peers.
+*/}}
+{{- define "grid-operator.shutdownDelaySeconds" -}}
+{{- if kindIs "invalid" .Values.shutdownDelaySeconds }}0{{ else }}{{ int .Values.shutdownDelaySeconds }}{{ end }}
+{{- end }}
+
+{{/*
+The Services carrying signals that route to the lease holder alone.
+*/}}
+{{- define "grid-operator.holderSignalsServices" -}}
+{{- if and (.Values.signals).enabled .Values.signals.service.enabled }}{{ include "grid-operator.fullname" . }}-signals{{ end }}
+{{- end }}
+
+{{/*
+The Services carrying SWIM that route to the lease holder alone.
+*/}}
+{{- define "grid-operator.holderSwimServices" -}}
+{{- if .Values.swim.service.enabled }}{{ include "grid-operator.fullname" . }}-swim{{ end }}
+{{- end }}

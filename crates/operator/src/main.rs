@@ -64,7 +64,7 @@ use kube::{
     runtime::{controller::Controller, watcher},
 };
 use operator::{
-    cli::Cli,
+    cli::{Cli, Membership},
     controller::{
         agent_tool_provider,
         grid_network::{self, GridModes, OperatorCtx},
@@ -74,7 +74,7 @@ use operator::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{GridNetwork, SignalMode},
         grid_site::GridSite,
-        inference_provider::InferenceProvider,
+        inference_provider::{Condition, ConditionStatus, InferenceProvider},
     },
     error::OperatorError,
     gateway,
@@ -103,6 +103,11 @@ async fn main() {
 
     let mut config = Cli::parse();
     version::get().log_startup("grid-operator");
+    // A Local install names its site without the SWIM prefix; either name serves.
+    if let Some(site_name) = config.grid.site_name.take() {
+        config.swim.site_name.get_or_insert(site_name);
+    }
+    config.grid.signal_transport = config.grid.startup_signal_transport();
 
     let client = match Client::try_default().await {
         Ok(c) => c,
@@ -114,7 +119,7 @@ async fn main() {
 
     // Probes answer during enrollment and the LoadBalancer wait, except under site identity TLS, which waits for
     // enrollment.
-    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready = Arc::new(Readiness::default());
     let metrics_tls = match operator::metrics_tls::MetricsTls::from_args(
         config.metrics.cert.clone(),
         config.metrics.key.clone(),
@@ -132,34 +137,91 @@ async fn main() {
     // Watched before enrolling, because enrolling retries a retryable failure
     // for as long as it keeps failing and must still answer a SIGTERM.
     let (trigger, shutdown) = operator::shutdown::Trigger::new();
-    tokio::spawn(watch_for_termination(trigger));
-
-    if config.enrollment.enabled {
-        let enrolled = tokio::select! {
-            biased;
-            () = shutdown.triggered() => {
-                tracing::info!("stood down before enrolling");
-                return;
-            },
-            result = Box::pin(operator::enroll::ensure_enrolled(&client, &config.enrollment)) => result,
-        };
-        if let Err(error) = enrolled {
-            tracing::error!(%error, "site enrollment failed");
+    let trigger = Arc::new(trigger);
+    let routes = match holder_routes(&client, &config) {
+        Ok(routes) => routes,
+        Err(error) => {
+            tracing::error!(%error, "invalid leader election settings");
             std::process::exit(1);
-        }
-    }
+        },
+    };
+    tokio::spawn(watch_for_termination(StandDown {
+        trigger: Arc::clone(&trigger),
+        ready: Arc::clone(&ready),
+        routes: routes.clone(),
+    }));
+
+    // Everything below writes, so only the lease holder runs it.
+    let stand_down_on_loss = StandDown {
+        trigger: Arc::clone(&trigger),
+        ready: Arc::clone(&ready),
+        routes: routes.clone(),
+    };
+    let leadership = match elect(&client, &config.leader, &shutdown, stand_down_on_loss).await {
+        Ok(Some(leadership)) => leadership,
+        Ok(None) => {
+            tracing::info!("stood down before taking the operator lease");
+            return;
+        },
+        Err(error) => {
+            tracing::error!(%error, "invalid leader election settings");
+            std::process::exit(1);
+        },
+    };
+
     // The identity names the site, and without one the site idles.
+    let invalid_identity = |error: &str| -> SiteIdentity {
+        tracing::error!(error, "invalid site identity or name");
+        std::process::exit(1)
+    };
+    let mut found = site_from_identity(&client, &config)
+        .await
+        .unwrap_or_else(|error| invalid_identity(&error));
+    // The operator config names the site and its signer; an edit applies without a restart.
+    let signer_hosts = operator::operator_config::SignerHosts::from_list(&config.signer_hosts);
+    if signer_hosts.is_any() {
+        tracing::warn!(
+            "GRID_SIGNER_HOSTS is unset: the operator config may name any signer host; set it to the signers \
+             this install trusts"
+        );
+    }
+    let mut operator_config = operator::operator_config::ConfigWatch::spawn(
+        client.clone(),
+        client.default_namespace(),
+        &config.operator_config,
+        signer_hosts,
+    );
+    // The site enrolls now, else while it waits for an identity.
+    let mut enrollment = operator::enroll::local::Enrollment::default();
+    let identified_as = found.name.as_deref().filter(|_name| found.present);
+    let stepped = tokio::select! {
+        biased;
+        () = shutdown.triggered() => {
+            tracing::info!("stood down before enrolling");
+            return;
+        },
+        stepped = async {
+            let read = operator_config.read().await;
+            Box::pin(enrollment.step(&client, identified_as, &read)).await
+        } => stepped,
+    };
+    match stepped {
+        // The identity just written names the site, so this process serves under it.
+        Ok(operator::enroll::local::Step::Enrolled) => {
+            found = site_from_identity(&client, &config)
+                .await
+                .unwrap_or_else(|error| invalid_identity(&error));
+        },
+        Ok(_) => {},
+        Err(error) => {
+            tracing::warn!(%error, "listing GridSites to enroll failed, retrying while waiting for an identity");
+        },
+    }
     let SiteIdentity {
         at: identity,
         present: has_identity,
         name: site_name,
-    } = match site_from_identity(&client, &config).await {
-        Ok(found) => found,
-        Err(error) => {
-            tracing::error!(%error, "invalid site identity or name");
-            std::process::exit(1);
-        },
-    };
+    } = found;
     config.swim.site_name = site_name;
     let startup = SiteStartup::resolve(config.swim.site_name.is_some(), has_identity);
     match startup {
@@ -178,46 +240,78 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    let install_modes = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
-    let modes = match resolve_grid_modes(&client, config.enrollment.enabled, install_modes).await {
+    let install_modes = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust)
+        .with_membership(config.grid.membership);
+    let (modes, membership_declared) = match resolve_grid_modes(&client, has_identity, install_modes).await {
         Ok(modes) => modes,
         Err(error) => {
             tracing::error!(%error, "failed to resolve grid modes");
             std::process::exit(1);
         },
     };
+    config.grid.membership = modes.membership;
     let signal_mode = modes.signal;
     let trust = modes.trust;
     // The loop follows the declared peer trust, which may change after startup.
     let (declared_trust, trust_changes) = tokio::sync::watch::channel(trust);
-    let mut rotation_running = false;
-    if config.enrollment.renew {
-        match operator::enroll::renew::Settings::from_config(&config.enrollment) {
-            Ok(settings) => {
-                rotation_running = true;
-                let install = GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust);
-                let settings = settings
-                    .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
-                    .with_declared_trust(install, trust_changes);
-                drop(tokio::spawn(operator::enroll::renew::run(client.clone(), settings)));
-            },
-            Err(error) => tracing::error!(%error, "site identity rotation is off: misconfigured"),
+    // Renews through the signer the operator config names; an unidentified site restarts once enrolled.
+    // Released once the renewal loop has returned, after any write it had under way.
+    let (renewal_done_tx, renewal_done) = operator::shutdown::Trigger::new();
+    let mut renewal_done_tx = Some(renewal_done_tx);
+    if has_identity {
+        let settings = operator::enroll::renew::Settings::new()
+            .with_config(operator_config.clone())
+            .with_site(config.swim.site_name.clone())
+            .with_gateway(&config.gateway.namespace, &config.gateway.service_name)
+            .with_declared_trust(install_modes, trust_changes);
+        let (renewing, stop, done) = (client.clone(), shutdown.clone(), renewal_done_tx.take());
+        tokio::spawn(async move {
+            operator::enroll::renew::run(renewing, settings, stop).await;
+            drop(done);
+        });
+        // Enrolling runs only while unidentified: a site that loses its identity, with an
+        // invite to enroll again, stands down so its restart enrolls, rather than run on unidentified.
+        if let Some(site) = config.swim.site_name.clone() {
+            let stand_down = StandDown {
+                trigger: Arc::clone(&trigger),
+                ready: Arc::clone(&ready),
+                routes: routes.clone(),
+            };
+            let (watching, invites) = (client.clone(), operator_config.clone());
+            tokio::spawn(async move {
+                operator::enroll::local::lost_identity_with_invite(&watching, &site, invites).await;
+                stand_down.begin().await;
+            });
         }
     }
+    drop(renewal_done_tx);
     let signals_enabled = matches!(signal_mode, SignalMode::Poll);
     let peer_settings = grid_network::PeerSettings {
         local_signals_addr: config.signals.local_addr(),
         trust,
         peer_port: config.signals.peer_port,
+        signals_port: config.signals.peer_endpoint_port,
         peer_interval: std::time::Duration::from_secs(config.signals.peer_interval_secs),
         peer_budget: std::time::Duration::from_secs(config.signals.peer_budget_secs),
     };
+    let (mode_restart, mode_change) = tokio::sync::watch::channel(None);
+    tokio::spawn(restart_for_modes(
+        mode_change,
+        StandDown {
+            trigger: Arc::clone(&trigger),
+            ready: Arc::clone(&ready),
+            routes: routes.clone(),
+        },
+    ));
     let ctx = Arc::new(
         OperatorCtx::new(client.clone(), None, signal_mode)
             .with_peer_settings(peer_settings)
             .with_declared_trust(declared_trust)
-            .with_rotation(rotation_running)
+            .with_operator_config(operator_config.clone())
+            .with_mode_restart(mode_restart)
             .with_site_name(config.swim.site_name.clone())
+            .with_membership(config.grid.membership)
+            .with_membership_fallback(install_modes.membership)
             .with_scrape_interval(config.signals.scrape_interval())
             .hold_membership(),
     );
@@ -226,6 +320,7 @@ async fn main() {
 
     // Controllers run now. Only SWIM and what dials peers wait on the advertise address.
     let (swim_tx, swim_rx) = tokio::sync::watch::channel(SwimStage::Starting);
+    route_to_holder(&routes, signals_enabled.then(|| ctx.signals()), &leadership.holding());
 
     // Stop every state writer before leaving SWIM. Otherwise the leave event can
     // drive one last reconcile that publishes every peer as dead or tries to
@@ -236,11 +331,12 @@ async fn main() {
     let writer_ctx = Arc::clone(&ctx);
     let writer_swim = swim_rx.clone();
     let writer_site_name = ctx.site_name().map(str::to_owned);
-    let writer_scrape_interval = signals_enabled.then(|| config.signals.scrape_interval());
+    // Every mode scrapes for readiness; only Poll mode publishes what it scrapes.
+    let writer_scrape_interval = config.signals.scrape_interval();
     let writer_group = async move {
         tokio::try_join!(
             run_network_controller(writer_client.clone(), Arc::clone(&writer_ctx), writer_swim),
-            run_site_controller(writer_client.clone()),
+            run_site_controller(writer_client.clone(), writer_ctx.membership()),
             run_provider_controller(writer_client.clone(), writer_site_name),
             run_agent_tool_provider_controller(writer_client.clone()),
             run_local_scraper(writer_scrape_interval, Arc::clone(&writer_ctx), writer_client.clone()),
@@ -250,15 +346,30 @@ async fn main() {
     };
     let writers = stop_writers_on_shutdown(writers_shutdown, writers_done_tx, writer_group);
 
-    let standing_down = stand_down(shutdown.clone(), writers_done, swim_rx.clone());
+    // The lease goes once no writer runs and the site has left, before the drain grace.
+    let (left_tx, left) = operator::shutdown::Trigger::new();
+    let releasing = tokio::spawn(async move {
+        left.triggered().await;
+        leadership.finish().await;
+    });
+    let standing_down = stand_down(
+        shutdown.clone(),
+        (writers_done, renewal_done.clone()),
+        swim_rx.clone(),
+        left_tx,
+    );
     let serving = async {
         tokio::try_join!(
             start_swim(
-                client.clone(),
                 config.clone(),
                 Arc::clone(&ctx),
-                Arc::clone(&ready),
+                StandDown {
+                    trigger: Arc::clone(&trigger),
+                    ready: Arc::clone(&ready),
+                    routes: routes.clone(),
+                },
                 swim_tx,
+                membership_declared,
             ),
             writers,
             async { metrics_server.await? },
@@ -270,11 +381,14 @@ async fn main() {
                         site: ctx.signals(),
                         peers: ctx.peers(),
                         rounds: ctx.peer_rounds(),
+                        providers: ctx.local_providers(),
+                        membership: ctx.membership().as_str(),
                         feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                     },
                     peer_identities: ctx.peer_identities(),
                     trust,
                     max_per_peer: config.signals.max_per_peer,
+                    max_per_source: config.signals.max_per_source,
                 }),
                 swim_rx.clone(),
                 shutdown.clone(),
@@ -294,7 +408,7 @@ async fn main() {
     // it and creates its records.
     let identified = async {
         if startup.waits_for_identity() {
-            identity_appears(&client, &config).await;
+            identity_appears(&client, &config, &mut enrollment, &mut operator_config).await;
         } else {
             std::future::pending::<()>().await;
         }
@@ -308,17 +422,76 @@ async fn main() {
         () = identified => {
             // Exit 0 so the kubelet restarts the pod; its restart backoff still applies.
             tracing::info!("restarting under the site identity's name");
+            trigger.trigger();
+            wait_for_renewal(&renewal_done).await;
+            for routed in [&routes.signals, &routes.swim].into_iter().flatten() {
+                routed.withdraw().await;
+            }
+            drop(releasing.await);
             return;
         },
         result = serving => result,
     };
 
+    drop(releasing.await);
     if let Err(e) = result {
         tracing::error!(error = %e, "controller error");
         std::process::exit(1);
     }
     // The one line that distinguishes a clean exit from a SIGKILL in pod logs.
     tracing::info!("stood down");
+}
+
+/// Take the operator lease named in `args`, standing down if it is later lost.
+///
+/// `Ok(None)` when shutdown comes first. With no lease configured, this replica writes unelected.
+async fn elect(
+    client: &Client,
+    args: &operator::cli::LeaderArgs,
+    shutdown: &operator::shutdown::Shutdown,
+    on_loss: StandDown,
+) -> Result<Option<Leadership>, String> {
+    let Some(lease) = args.lease.as_deref() else {
+        tracing::info!("no operator lease configured; writing unelected");
+        return Ok(Some(Leadership(None)));
+    };
+    let identity = args
+        .identity
+        .clone()
+        .filter(|identity| !identity.is_empty())
+        .ok_or("GRID_LEADER_LEASE is set but GRID_LEADER_IDENTITY is not")?;
+    let store = operator::leader::KubeLease::new(client.clone(), client.default_namespace(), lease);
+    let elector = operator::leader::Elector::new(store, identity);
+    // A candidate is ready: peers reach only the holder, through the slices it writes.
+    on_loss.ready.mark_started();
+    let lost = move || {
+        // Restarting is the only way back to candidacy: SWIM starts once per process.
+        tracing::warn!("lost the operator lease; standing down to restart as a candidate");
+        tokio::spawn(on_loss.begin_lost());
+    };
+    let replicas = operator::unelected::Replicas::new(client, args.replica_selector.clone());
+    let held = Box::pin(operator::leader::lead(elector, &replicas, shutdown, lost)).await;
+    Ok(held.map(|held| Leadership(Some(held))))
+}
+
+/// The operator lease while held, or nothing when this replica writes unelected.
+struct Leadership(Option<operator::leader::Leadership<operator::leader::KubeLease>>);
+
+impl Leadership {
+    /// Whether this replica may still act as the holder; always, unelected.
+    fn holding(&self) -> operator::leader::Holding {
+        self.0.as_ref().map_or_else(
+            operator::leader::Holding::unelected,
+            operator::leader::Leadership::holding,
+        )
+    }
+
+    /// Stop renewing and release the lease, so a successor takes over without waiting it out.
+    async fn finish(self) {
+        if let Some(held) = self.0 {
+            held.finish().await;
+        }
+    }
 }
 
 /// Cancel every state writer on shutdown, then release the leave barrier.
@@ -344,11 +517,13 @@ async fn stop_writers_on_shutdown<E>(
 /// is what the inbound listener drains in.
 async fn stand_down(
     shutdown: operator::shutdown::Shutdown,
-    writers_done: operator::shutdown::Shutdown,
+    (writers_done, renewal_done): (operator::shutdown::Shutdown, operator::shutdown::Shutdown),
     swim: SwimStartup,
+    left_site: operator::shutdown::Trigger,
 ) {
     shutdown.triggered().await;
     writers_done.triggered().await;
+    wait_for_renewal(&renewal_done).await;
     let left = match settled(&swim) {
         Some(handle) => {
             handle.leave(LEAVE_WAIT).await;
@@ -356,6 +531,7 @@ async fn stand_down(
         },
         None => false,
     };
+    left_site.trigger();
     tokio::time::sleep(SHUTDOWN_GRACE).await;
     // The work is still polled through the grace, so SWIM can finish starting
     // and advertise this site after the read above. Leaving a runtime that
@@ -364,6 +540,21 @@ async fn stand_down(
         handle.leave(LEAVE_WAIT).await;
     }
 }
+
+/// Wait, up to [`RENEWAL_DRAIN`], for the identity renewal loop to stand down. It gives up a
+/// request to the signer at once and finishes only an identity write or gateway roll under way,
+/// so neither starts once the lease is released.
+async fn wait_for_renewal(renewal_done: &operator::shutdown::Shutdown) {
+    if tokio::time::timeout(RENEWAL_DRAIN, renewal_done.triggered())
+        .await
+        .is_err()
+    {
+        tracing::warn!("identity renewal still under way at the stand-down bound; releasing anyway");
+    }
+}
+
+/// How long a stand-down waits for an identity write or gateway roll under way.
+const RENEWAL_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The SWIM handle if one exists, read rather than awaited.
 ///
@@ -397,15 +588,24 @@ type SwimStartup = tokio::sync::watch::Receiver<SwimStage>;
 ///
 /// Returns the reason SWIM cannot start, which stops the operator.
 async fn start_swim(
-    client: Client,
     cli: Cli,
     ctx: Arc<OperatorCtx>,
-    ready: Arc<std::sync::atomic::AtomicBool>,
+    restart: StandDown,
     started: tokio::sync::watch::Sender<SwimStage>,
+    membership_declared: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let swim = Box::pin(maybe_start_swim(&client, &cli, ctx.signal_mode()))
-        .await
-        .map_err(|error| format!("SWIM startup failed: {error}"))?;
+    let client = ctx.client.clone();
+    let retry = restart.clone();
+    let ready = Arc::clone(&restart.ready);
+    let started_swim = Box::pin(maybe_start_swim(
+        &client,
+        &cli,
+        ctx.signal_mode(),
+        restart,
+        membership_declared,
+    ))
+    .await;
+    let swim = report_swim(&client, cli.grid.membership, started_swim, retry)?;
     if let Some(handle) = &swim {
         ctx.set_swim(Arc::clone(handle));
         tokio::spawn(gateway::run_discovery_poller(
@@ -415,10 +615,10 @@ async fn start_swim(
         ));
         tokio::spawn(release_membership_once_settled(Arc::clone(handle), Arc::clone(&ctx)));
     } else {
-        ctx.release_membership();
+        settle_without_swim(&client, cli.grid.membership, &ctx).await?;
     }
     started.send_replace(SwimStage::Settled(swim));
-    ready.store(true, std::sync::atomic::Ordering::Release);
+    ready.mark_started();
     Ok(())
 }
 
@@ -449,6 +649,46 @@ async fn release_membership_once_settled(handle: Arc<swim_runtime::SwimHandle>, 
     converged(settled, changes, MEMBERSHIP_GRACE).await;
     ctx.release_membership();
 }
+
+/// With no SWIM, reserve the signal revisions a Local site publishes under, and release
+/// membership-derived writes: under Local once peers catch up, otherwise at once.
+async fn settle_without_swim(client: &Client, membership: Membership, ctx: &Arc<OperatorCtx>) -> Result<(), String> {
+    if membership == Membership::Local
+        && let Some(site) = ctx.site_name()
+    {
+        let lease = reserve_revision_lease(client, site)
+            .await
+            .map_err(|error| format!("reserving signal revisions: {error}"))?;
+        ctx.set_publisher(grid_network::Publisher {
+            site: site.to_owned(),
+            reservation: (lease.first_node_generation, lease.last_node_generation),
+        });
+    }
+    if membership == Membership::Local {
+        tokio::spawn(release_membership_once_caught_up(Arc::clone(ctx)));
+        // A site that ran Swim before keeps a Swim condition that no longer says anything.
+        tokio::spawn(clear_swim_condition(client.clone()));
+    } else {
+        ctx.release_membership();
+    }
+    Ok(())
+}
+
+/// Release membership-derived writes once every polled peer's catalog is held, or it has gone
+/// [`UNANSWERED_ROUNDS`] rounds unanswered, or after the grace. Without it a restarted Local
+/// site's first serving write would carry no remote candidate.
+async fn release_membership_once_caught_up(ctx: Arc<OperatorCtx>) {
+    let catch_up = ctx.peer_catch_up();
+    let ticks = futures::stream::unfold((), |()| async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        Some(((), ()))
+    });
+    converged(|| catch_up.caught_up(UNANSWERED_ROUNDS), ticks, MEMBERSHIP_GRACE).await;
+    ctx.release_membership();
+}
+
+/// Rounds in a row a peer may go unanswered before the restart hold stops waiting on it.
+const UNANSWERED_ROUNDS: u32 = 3;
 
 /// Longest wait for peers' state before membership-derived writes run without it: one state
 /// republish, every 30 s, and the membership convergence before it.
@@ -504,30 +744,40 @@ async fn swim_settled(mut startup: SwimStartup) -> Option<Arc<swim_runtime::Swim
 
 /// Resolve the grid-wide modes from the sole `GridNetwork`, read once at startup, or
 /// `without_network` when none exists yet.
-async fn resolve_grid_modes(client: &Client, enrolled: bool, without_network: GridModes) -> Result<GridModes, String> {
+async fn resolve_grid_modes(
+    client: &Client,
+    enrolled: bool,
+    without_network: GridModes,
+) -> Result<(GridModes, bool), String> {
     let networks: Api<GridNetwork> = Api::all(client.clone());
     let items = networks
         .list(&kube::api::ListParams::default())
         .await
         .map_err(|e| format!("listing GridNetworks: {e}"))?
         .items;
-    match items.as_slice() {
+    let (modes, declared) = match items.as_slice() {
         [] => {
             let identity = if enrolled { " (enrolled identity)" } else { "" };
             tracing::info!(modes = ?without_network, "no GridNetwork yet; starting in the install's modes{identity}");
-            Ok(without_network)
+            (without_network, false)
         },
         [network] => {
-            let modes = GridModes::of(network);
+            let modes = GridModes::of(network, without_network.membership);
             tracing::info!(?modes, "resolved grid-wide modes");
-            Ok(modes)
+            (modes, network.spec.membership.is_some())
         },
-        many => Err(format!(
-            "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
+        many => {
+            return Err(format!(
+                "multiple GridNetworks unsupported: found {}; a process-global signals serve/poll path \
              cannot serve more than one grid mode",
-            many.len()
-        )),
+                many.len()
+            ));
+        },
+    };
+    if modes.membership == Membership::Local && modes.signal != SignalMode::Poll {
+        return Err("Local membership requires signalTransport.mode poll".to_owned());
     }
+    Ok((modes, declared))
 }
 
 // ---------------------------------------------------------------------------
@@ -554,23 +804,52 @@ async fn maybe_start_swim(
     client: &Client,
     cli: &Cli,
     signal_mode: SignalMode,
-) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
-    let Some(addr_str) = std::env::var("GRID_SWIM_BIND_ADDR").ok() else {
+    restart: StandDown,
+    membership_declared: bool,
+) -> Result<Option<Arc<swim_runtime::SwimHandle>>, SwimFailure> {
+    let bind = std::env::var("GRID_SWIM_BIND_ADDR").ok();
+    if !swim_requested(cli.grid.membership, membership_declared, bind.is_some())? {
+        return Ok(None);
+    }
+    let Some(addr_str) = bind else {
         return Ok(None);
     };
     let bind_addr: SocketAddr = match addr_str.parse() {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(addr = %addr_str, error = %e, "GRID_SWIM_BIND_ADDR not a valid socket address");
-            return Err(format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"));
+            return Err(SwimFailure::new(
+                "BindAddressInvalid",
+                format!("GRID_SWIM_BIND_ADDR is not a valid socket address: {e}"),
+            ));
         },
     };
     let Some(site_name) = cli.swim.site_name.clone() else {
         return Ok(None);
     };
-    let (advertise_addr, lb_watch) = swim_advertise_addr(client, bind_addr).await?;
+    let Ok(advertised) =
+        tokio::time::timeout(swim_advertise::LB_PATIENCE, swim_advertise_addr(client, bind_addr)).await
+    else {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let appeared = async { swim_advertise_addr(&client, bind_addr).await.is_ok() };
+            Box::pin(restart_when(appeared, restart)).await;
+        });
+        return Err(SwimFailure::new(
+            "AdvertiseAddressPending",
+            format!(
+                "no SWIM advertise address within {}s; waiting for one and restarting when it appears",
+                swim_advertise::LB_PATIENCE.as_secs()
+            ),
+        ));
+    };
+    let (advertise_addr, lb_watch) =
+        advertised.map_err(|cause| SwimFailure::new("AdvertiseAddressUnresolved", cause))?;
     if advertise_addr.unwrap_or(bind_addr).ip().is_unspecified() {
-        return Err("refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR".to_owned());
+        return Err(SwimFailure::new(
+            "AdvertiseAddressUnspecified",
+            "refusing to advertise an unspecified SWIM address; set GRID_SWIM_ADVERTISE_ADDR",
+        ));
     }
     let seed_values = std::env::var("GRID_SWIM_SEEDS").unwrap_or_default();
     let seed_values: Vec<String> = seed_values.split(',').map(str::to_owned).collect();
@@ -598,17 +877,14 @@ async fn maybe_start_swim(
             None
         },
     };
-    let (key, retry_key) = match parse_swim_key_env("GRID_SWIM_ENCRYPT_KEY")? {
-        Some(key) => (swim_runtime::KeyState::Key(Arc::new(key)), false),
-        None => startup_key_state(client, cli.swim.require_key).await,
-    };
-    let revision_lease = match reserve_revision_lease(client, &site_name).await {
-        Ok(lease) => lease,
-        Err(error) => {
-            tracing::error!(%error, "failed to reserve SWIM revisions; running in static mode");
-            return Ok(None);
-        },
-    };
+    let (key, retry_key) =
+        match parse_swim_key_env("GRID_SWIM_ENCRYPT_KEY").map_err(|cause| SwimFailure::new("KeyInvalid", cause))? {
+            Some(key) => (swim_runtime::KeyState::Key(Arc::new(key)), false),
+            None => startup_key_state(client, cli.swim.require_key).await,
+        };
+    let revision_lease = reserve_revision_lease(client, &site_name)
+        .await
+        .map_err(|error| SwimFailure::new("RevisionLeaseFailed", format!("reserving SWIM revisions: {error}")))?;
     let signals_address = match (&cli.signals.advertise_addr, &lb_watch) {
         (Some(explicit), _) => Some(explicit.clone()),
         (None, Some(watch)) => watch.signals.clone(),
@@ -647,10 +923,200 @@ async fn maybe_start_swim(
             }
             Ok(Some(handle))
         },
-        Err(e) => {
-            tracing::error!(error = %e, "SWIM runtime failed to start; running in static mode");
+        Err(e) => Err(SwimFailure::new(
+            "StartFailed",
+            format!("SWIM runtime failed to start: {e}"),
+        )),
+    }
+}
+
+/// Whether startup may open SWIM, preserving install validation while honoring a network override.
+fn swim_requested(membership: Membership, declared: bool, has_bind: bool) -> Result<bool, SwimFailure> {
+    match membership {
+        Membership::Local if has_bind && !declared => Err(SwimFailure::new(
+            "MembershipConflict",
+            "GRID_MEMBERSHIP_SOURCE Local runs no SWIM, but GRID_SWIM_BIND_ADDR is set",
+        )),
+        Membership::Local => Ok(false),
+        Membership::Swim => Ok(has_bind),
+    }
+}
+
+/// Why SWIM did not start: a reason naming the cause, for the `Swim` condition, and its detail.
+#[derive(Clone, Debug)]
+struct SwimFailure {
+    /// The `Swim` condition's `False` reason.
+    reason: &'static str,
+    /// What happened, in words.
+    cause: String,
+}
+
+impl SwimFailure {
+    /// Whether another start could succeed with nothing changed, so the site retries it. A
+    /// pending advertise address restarts on its own once it appears, and a bad setting waits
+    /// for a rollout that fixes it.
+    fn retried(&self) -> bool {
+        matches!(
+            self.reason,
+            "AdvertiseAddressUnresolved" | "RevisionLeaseFailed" | "StartFailed"
+        )
+    }
+
+    /// A failure for `reason`, described by `cause`.
+    fn new<Cause: Into<String>>(reason: &'static str, cause: Cause) -> Self {
+        Self {
+            reason,
+            cause: cause.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SwimFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.cause)
+    }
+}
+
+/// SWIM's startup outcome, reported: under Swim a failure is logged, counted and written
+/// as the `Swim` condition and the site runs on without it; under Local it stops startup.
+fn report_swim(
+    client: &Client,
+    membership: Membership,
+    started: Result<Option<Arc<swim_runtime::SwimHandle>>, SwimFailure>,
+    retry: StandDown,
+) -> Result<Option<Arc<swim_runtime::SwimHandle>>, String> {
+    match started {
+        // A Local install that sets SWIM contradicts itself, which only a fix to it resolves.
+        Err(error) if membership == Membership::Local => Err(format!("SWIM startup failed: {error}")),
+        Err(error) => {
+            tracing::error!(%error, "SWIM is unavailable; running without membership gossip");
+            operator::metrics::set_swim_unavailable(true);
+            if error.retried() {
+                tokio::spawn(retry_swim_later(retry));
+            }
+            tokio::spawn(write_swim_condition(client.clone(), Some(error)));
             Ok(None)
         },
+        Ok(swim) => {
+            if swim.is_some() {
+                operator::metrics::set_swim_unavailable(false);
+                tokio::spawn(write_swim_condition(client.clone(), None));
+            }
+            Ok(swim)
+        },
+    }
+}
+
+/// Once `appeared` says the advertise address the startup deadline gave up on exists, stand
+/// down so the kubelet restarts the pod and SWIM starts.
+async fn restart_when(appeared: impl Future<Output = bool>, stand_down: StandDown) {
+    if appeared.await {
+        tracing::info!("SWIM advertise address appeared; standing down to restart and start SWIM");
+        stand_down.begin().await;
+    }
+}
+
+/// Once a `GridNetwork` declares other modes, stand down so the restart starts in them.
+async fn restart_for_modes(mut owed: tokio::sync::watch::Receiver<Option<GridModes>>, stand_down: StandDown) {
+    let owed = owed.wait_for(Option::is_some).await.map(|next| *next);
+    if let Ok(next) = owed {
+        tracing::info!(?next, "standing down to restart in the declared modes");
+        stand_down.begin().await;
+    }
+}
+
+/// How long a site runs without SWIM after a start that may succeed on another try.
+const SWIM_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// After [`SWIM_RETRY`], stand down so the restart tries SWIM again.
+async fn retry_swim_later(stand_down: StandDown) {
+    tokio::time::sleep(SWIM_RETRY).await;
+    tracing::info!("standing down to restart and try SWIM again");
+    stand_down.begin().await;
+}
+
+/// Condition type naming whether SWIM runs on this site.
+const SWIM_CONDITION: &str = "Swim";
+
+/// Field manager for the [`SWIM_CONDITION`] condition, apart from every other `GridNetwork` writer.
+const SWIM_FIELD_MANAGER: &str = "grid-operator-swim";
+
+/// Write [`SWIM_CONDITION`] on the sole `GridNetwork`, `False` with `unavailable`'s cause,
+/// retrying until a network exists and the write lands.
+async fn write_swim_condition(client: Client, unavailable: Option<SwimFailure>) {
+    loop {
+        if let Some(network) = sole_network(&client).await
+            && let Some(name) = network.metadata.name.as_deref()
+            && let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)
+        {
+            let condition = swim_condition(unavailable.as_ref(), &now, network.metadata.generation);
+            let patch = serde_json::json!({
+                "apiVersion": "grid.praxis.fast/v1alpha1",
+                "kind": "GridNetwork",
+                "metadata": { "name": name },
+                "status": { "conditions": [condition] }
+            });
+            let api: Api<GridNetwork> = Api::all(client.clone());
+            let params = PatchParams::apply(SWIM_FIELD_MANAGER).force();
+            match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+                Ok(_) => return,
+                Err(error) => tracing::warn!(%error, "Swim condition not written; retrying"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+/// Remove [`SWIM_CONDITION`] from the sole `GridNetwork`, retrying until a network exists and
+/// the write lands. Conditions merge by type, so applying none under its field manager removes
+/// only the one it wrote.
+async fn clear_swim_condition(client: Client) {
+    loop {
+        if let Some(network) = sole_network(&client).await
+            && let Some(name) = network.metadata.name.as_deref()
+        {
+            let api: Api<GridNetwork> = Api::all(client.clone());
+            let params = PatchParams::apply(SWIM_FIELD_MANAGER).force();
+            match Box::pin(api.patch_status(name, &params, &Patch::Apply(swim_cleared(name)))).await {
+                Ok(_) => return,
+                Err(error) => tracing::warn!(%error, "Swim condition not cleared; retrying"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+/// The status patch that removes what [`SWIM_FIELD_MANAGER`] wrote on `name`.
+fn swim_cleared(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": name },
+        "status": { "conditions": [] }
+    })
+}
+
+/// The [`SWIM_CONDITION`] condition: `True` while SWIM runs, `False` with the cause when it cannot.
+fn swim_condition(unavailable: Option<&SwimFailure>, now: &str, generation: Option<i64>) -> Condition {
+    let (status, reason, message) = match unavailable {
+        Some(failure) => (
+            ConditionStatus::False,
+            failure.reason,
+            format!("SWIM is not running: {}", failure.cause),
+        ),
+        None => (
+            ConditionStatus::True,
+            SWIM_CONDITION,
+            "SWIM membership gossip is running".to_owned(),
+        ),
+    };
+    Condition {
+        type_: SWIM_CONDITION.to_owned(),
+        status,
+        reason: reason.to_owned(),
+        message,
+        last_transition_time: now.to_owned(),
+        observed_generation: generation,
     }
 }
 
@@ -999,7 +1465,6 @@ fn revision_renewer(client: Client, site_name: String) -> swim_runtime::Revision
 
 /// Persist the lease `plan` makes from the held revision and generation marks, before any of it is used.
 #[expect(
-    clippy::too_many_lines,
     clippy::large_stack_frames,
     reason = "the Kubernetes read/create/replace CAS loop keeps each conflict and fail-closed path explicit"
 )]
@@ -1225,11 +1690,24 @@ impl SiteStartup {
 /// How often a site without an identity checks for one.
 const IDENTITY_POLL: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Resolve once the site identity appears, warning once per distinct error.
-async fn identity_appears(client: &Client, config: &Cli) {
+/// Resolve once the site identity appears, enrolling the site meanwhile, at once on an edit to
+/// the operator config, and warning once per distinct error.
+async fn identity_appears(
+    client: &Client,
+    config: &Cli,
+    enrollment: &mut operator::enroll::local::Enrollment,
+    operator_config: &mut operator::operator_config::ConfigWatch,
+) {
     let mut last_error = None;
     loop {
-        tokio::time::sleep(IDENTITY_POLL).await;
+        tokio::select! {
+            () = tokio::time::sleep(IDENTITY_POLL) => {},
+            () = operator_config.changed() => {},
+        }
+        let read = operator_config.current();
+        if let Err(error) = Box::pin(enrollment.step(client, None, &read)).await {
+            tracing::debug!(%error, "listing GridSites to enroll failed");
+        }
         match site_from_identity(client, config).await {
             Ok(SiteIdentity { present: true, .. }) => return,
             Ok(_) => last_error = None,
@@ -1259,7 +1737,7 @@ async fn site_from_identity(client: &Client, config: &Cli) -> Result<SiteIdentit
         .identity_namespace
         .clone()
         .unwrap_or_else(|| client.default_namespace().to_owned());
-    let at = operator::site_name::locate(client, &namespace, &config.enrollment.identity_secret)
+    let at = operator::site_name::locate(client, &namespace, operator::enroll::IDENTITY_SECRET)
         .await
         .map_err(|e| e.to_string())?;
     let pem = operator::site_name::identity_pem(client, &at)
@@ -1286,12 +1764,17 @@ async fn create_local_records(
         network: config.grid.network.clone(),
         site: site.to_owned(),
         identity,
-        ca_secret: config.enrollment.ca_secret.clone(),
+        ca_secret: operator::enroll::CA_SECRET.to_owned(),
         swim_key_secret: None,
-        modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust),
+        modes: GridModes::without_network(config.grid.signal_transport, config.grid.peer_trust)
+            .with_membership(config.grid.membership),
     };
-    let outcome =
-        operator::local_records::create(client, client.default_namespace(), plan, &config.grid.swim_key_secret).await?;
+    // Without SWIM the network names no SWIM key.
+    let swim_key = match config.grid.membership {
+        Membership::Swim => config.grid.swim_key_secret.as_str(),
+        Membership::Local => "",
+    };
+    let outcome = operator::local_records::create(client, client.default_namespace(), plan, swim_key).await?;
     tracing::info!(?outcome, "local grid records checked");
     Ok(())
 }
@@ -1309,10 +1792,6 @@ async fn create_local_records(
 /// Metrics TLS rotation is detected by bounded requeue rather than a
 /// cluster-wide Secret watch; the operator only reads referenced
 /// Secrets by explicit namespace/name during reconciliation.
-#[expect(
-    clippy::too_many_lines,
-    reason = "controller builder chains three cross-resource watches plus SWIM event plumbing"
-)]
 async fn run_network_controller(
     client: Client,
     ctx: Arc<OperatorCtx>,
@@ -1343,8 +1822,10 @@ async fn run_network_controller(
     let swim_events = futures::stream::once(swim_settled(swim))
         .filter_map(std::future::ready)
         .flat_map(|handle| futures::stream::once(std::future::ready(())).chain(handle.reconciliation_events()));
+    // And whenever a polled peer's catalog changes, which no watched object reflects.
+    let catalog_events = ctx.peer_providers().changes();
     controller
-        .reconcile_all_on(swim_events)
+        .reconcile_all_on(futures::stream::select(swim_events, catalog_events))
         .run(grid_network::reconcile, grid_network::error_policy, ctx)
         .for_each(|result| async {
             match result {
@@ -1395,12 +1876,23 @@ fn watch_expired<R>(error: &kube::runtime::controller::Error<R, watcher::Error>)
 }
 
 /// Run the [`GridSite`] controller.
-async fn run_site_controller(client: Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_site_controller(
+    client: Client,
+    membership: Membership,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api = Api::<GridSite>::all(client.clone());
 
+    // Unfiltered: a status write from the peer poller reconciles, so Degraded follows it.
     Controller::new(api, watcher::Config::default())
         .with_config(kube::runtime::controller::Config::default().concurrency(16))
-        .run(grid_site::reconcile, grid_site::error_policy, Arc::new(client))
+        .run(
+            grid_site::reconcile,
+            grid_site::error_policy,
+            Arc::new(grid_site::SiteContext {
+                client: Arc::new(client),
+                membership,
+            }),
+        )
         .for_each(|result| async {
             match result {
                 Ok((obj, _action)) => tracing::debug!(%obj, "reconciled GridSite"),
@@ -1479,7 +1971,7 @@ async fn run_agent_tool_provider_controller(client: Client) -> Result<(), Box<dy
 
 /// Serve Prometheus metrics and health endpoints.
 async fn run_metrics_server(
-    ready: Arc<std::sync::atomic::AtomicBool>,
+    ready: Arc<Readiness>,
     tls: Option<operator::metrics_tls::MetricsTls>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::var("GRID_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_owned());
@@ -1488,7 +1980,7 @@ async fn run_metrics_server(
         .route("/healthz", axum::routing::get(health_handler))
         .route(
             "/readyz",
-            axum::routing::get(move || std::future::ready(readiness(&ready))),
+            axum::routing::get(move || std::future::ready(ready.status())),
         );
     if let Some(tls) = tls {
         return operator::metrics_tls::serve_metrics_tls(&addr, app, tls, METRICS_TLS_RELOAD).await;
@@ -1517,12 +2009,35 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
-/// Not ready until enrollment and SWIM startup, including any `LoadBalancer` wait, have finished.
-fn readiness(ready: &std::sync::atomic::AtomicBool) -> (http::StatusCode, &'static str) {
-    if ready.load(std::sync::atomic::Ordering::Acquire) {
-        (http::StatusCode::OK, "ok")
-    } else {
-        (http::StatusCode::SERVICE_UNAVAILABLE, "starting")
+/// Whether `/readyz` answers ready.
+#[derive(Debug, Default)]
+struct Readiness {
+    /// Enrollment and SWIM startup, including any `LoadBalancer` wait, have finished.
+    started: std::sync::atomic::AtomicBool,
+    /// A termination signal arrived; never cleared, so a late start cannot undo it.
+    stopping: std::sync::atomic::AtomicBool,
+}
+
+impl Readiness {
+    /// Startup finished.
+    fn mark_started(&self) {
+        self.started.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Standing down: not ready from now on, whatever startup does next.
+    fn mark_stopping(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The `/readyz` answer.
+    fn status(&self) -> (http::StatusCode, &'static str) {
+        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            (http::StatusCode::SERVICE_UNAVAILABLE, "stopping")
+        } else if self.started.load(std::sync::atomic::Ordering::Acquire) {
+            (http::StatusCode::OK, "ok")
+        } else {
+            (http::StatusCode::SERVICE_UNAVAILABLE, "starting")
+        }
     }
 }
 
@@ -1544,9 +2059,135 @@ fn readiness(ready: &std::sync::atomic::AtomicBool) -> (http::StatusCode, &'stat
 const SIGNALS_TLS_POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Trigger cooperative shutdown on the first termination signal.
-async fn watch_for_termination(trigger: operator::shutdown::Trigger) {
+async fn watch_for_termination(stand_down: StandDown) {
     let signal = first_termination_signal().await;
     tracing::info!(signal, "standing down");
+    stand_down.begin().await;
+}
+
+/// What standing down touches, in the order it touches them.
+#[derive(Clone)]
+struct StandDown {
+    /// Asks every worker to stop.
+    trigger: Arc<operator::shutdown::Trigger>,
+    /// Answers not ready.
+    ready: Arc<Readiness>,
+    /// Routes peers to this replica while it holds the lease.
+    routes: HolderRouting,
+}
+
+impl StandDown {
+    /// Route peers away first, then stop as [`begin_stand_down`] does.
+    async fn begin(self) {
+        for routes in [&self.routes.signals, &self.routes.swim].into_iter().flatten() {
+            routes.withdraw().await;
+        }
+        begin_stand_down(&self.trigger, &self.ready);
+    }
+
+    /// Stop every writer at once, then route peers away: having lost the lease, a successor
+    /// may take over before slow slice writes finish.
+    async fn begin_lost(self) {
+        begin_stand_down(&self.trigger, &self.ready);
+        for routes in [&self.routes.signals, &self.routes.swim].into_iter().flatten() {
+            routes.withdraw().await;
+        }
+    }
+}
+
+/// The Services peers reach the holder on, each routed to it alone.
+#[derive(Clone, Default)]
+struct HolderRouting {
+    /// Routed once the holder has signals to answer with.
+    signals: Option<Arc<operator::holder_route::HolderRoutes>>,
+    /// Routed at once: SWIM settles only once a `LoadBalancer` has an address, which some
+    /// publish only for a Service with an endpoint.
+    swim: Option<Arc<operator::holder_route::HolderRoutes>>,
+}
+
+/// The routes for the Services peers reach the holder on, none when unelected or none are named.
+fn holder_routes(client: &Client, config: &Cli) -> Result<HolderRouting, String> {
+    let args = &config.leader;
+    if args.lease.is_none() || (args.signals_services.is_empty() && args.swim_services.is_empty()) {
+        return Ok(HolderRouting::default());
+    }
+    let address = args.pod_ip.ok_or("holder Services are named but POD_IP is not set")?;
+    let pod = args
+        .identity
+        .clone()
+        .ok_or("holder Services are named but GRID_LEADER_IDENTITY is not set")?;
+    let me = operator::holder_route::Me {
+        address,
+        pod,
+        node: args.node_name.clone(),
+    };
+    let ports = holder_ports(config);
+    let routes = |names: &[String]| {
+        (!names.is_empty()).then(|| {
+            Arc::new(operator::holder_route::HolderRoutes::new(
+                client,
+                names.to_vec(),
+                me.clone(),
+                ports.clone(),
+            ))
+        })
+    };
+    Ok(HolderRouting {
+        signals: routes(&args.signals_services),
+        swim: routes(&args.swim_services),
+    })
+}
+
+/// Named target ports, resolved to the listeners this process binds.
+fn holder_ports(config: &Cli) -> BTreeMap<String, i32> {
+    let swim = std::env::var("GRID_SWIM_BIND_ADDR")
+        .ok()
+        .and_then(|bind| bind.parse::<SocketAddr>().ok())
+        .map(|bind| ("swim-udp".to_owned(), i32::from(bind.port())));
+    let signals = config.signals.addr.map_or(9091, |addr| addr.port());
+    std::iter::once(("signals".to_owned(), i32::from(signals)))
+        .chain(swim)
+        .collect()
+}
+
+/// Route the holder's Services to it: SWIM's at once, signals' once it has published or
+/// [`ROUTE_FALLBACK`] has passed, so a site with nothing to publish is still reachable. With
+/// no local signals collected, as under gossip, there is no publish to wait for.
+fn route_to_holder(
+    routes: &HolderRouting,
+    signals: Option<operator::signals::SignalStore>,
+    holding: &operator::leader::Holding,
+) {
+    if let Some(swim) = routes.swim.clone() {
+        let holding = holding.clone();
+        tokio::spawn(async move { swim.route_when(std::future::ready("holding the lease"), holding).await });
+    }
+    if let Some(routed) = routes.signals.clone() {
+        let holding = holding.clone();
+        tokio::spawn(async move {
+            let published = async {
+                let Some(signals) = signals else {
+                    return "no local signals to wait for";
+                };
+                tokio::select! {
+                    () = signals.published() => "signals published",
+                    () = tokio::time::sleep(ROUTE_FALLBACK) => {
+                        tracing::warn!("no signals published in time; routing peers to this holder anyway");
+                        "no signals published in time"
+                    },
+                }
+            };
+            routed.route_when(published, holding).await;
+        });
+    }
+}
+
+/// How long a holder waits for its first signals before peers are routed to it anyway.
+const ROUTE_FALLBACK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Answer not ready first, so nothing new is routed here, then ask every worker to stop.
+fn begin_stand_down(trigger: &operator::shutdown::Trigger, ready: &Readiness) {
+    ready.mark_stopping();
     trigger.trigger();
 }
 
@@ -1603,6 +2244,10 @@ struct Published {
     peers: operator::signals::SignalStore,
     /// When the poller last tried each peer, for this site's own gateway only.
     rounds: operator::signals::PeerRounds,
+    /// This site's providers, for peers building candidates.
+    providers: operator::site_providers::LocalProviders,
+    /// This site's membership mode, named on every answer.
+    membership: &'static str,
 }
 
 /// What the signals listener needs from startup.
@@ -1619,6 +2264,8 @@ struct SignalsListener {
     trust: operator::signals::PeerTrustMode,
     /// Authenticated connections one identity may hold.
     max_per_peer: usize,
+    /// Concurrent handshakes one source address may hold.
+    max_per_source: usize,
 }
 
 /// Serve the coarse signal rollup on the single mTLS wire path, fail closed.
@@ -1684,7 +2331,7 @@ impl SignalsListener {
             .local_addr()
             .map_or_else(|_| "unknown".to_owned(), |a| a.to_string());
         tracing::info!(addr = %bound, advertised = ?advertised, tls = true, "signals server serving; peers poll the advertised endpoint");
-        let admission = Admission::new(self.max_per_peer);
+        let admission = Admission::new(self.max_per_peer, self.max_per_source, self.peer_identities.clone());
         let changed = material_changed(self.client.clone(), own);
         let serving = Serving {
             tls,
@@ -1788,25 +2435,22 @@ struct Serving {
 }
 
 /// Accept signals connections, deciding scope from the certificate presented.
-#[expect(
-    clippy::too_many_lines,
-    reason = "accept, admission, shutdown drain, and task ownership form one connection lifecycle"
-)]
 async fn serve_signals_tls(
     listener: tokio::net::TcpListener,
     serving: Serving,
-    admission: Admission,
+    mut admission: Admission,
     changed: impl Future<Output = ()> + Send,
     shutdown: operator::shutdown::Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut changed = std::pin::pin!(changed);
-    let mut shed_warned: Option<std::time::Instant> = None;
     loop {
         let accepted = tokio::select! {
             biased;
             () = shutdown.triggered() => {
-                // Stop accepting, then let what is already answering finish.
-                drain_connections(&admission.slots).await;
+                // Close the socket, so a new connection is refused at once rather than left in
+                // the backlog until its client times out, then let open connections finish.
+                drop(listener);
+                drain_connections(&admission.slots, admission.capacity).await;
                 return Ok(());
             },
             () = &mut changed => return Ok(()),
@@ -1815,18 +2459,20 @@ async fn serve_signals_tls(
         let Some((stream, remote)) = accepted_or_backoff(accepted).await else {
             continue;
         };
-        let Some((slot, source)) = admission.admit(remote, &mut shed_warned) else {
+        let Some((slot, turn, source, silent)) = admission.admit(remote) else {
             continue;
-        };
-        let handshaking = Handshaking {
-            source,
-            peers: admission.peers.clone(),
         };
         let serve = Box::pin(serve_signals_connection(
             serving.clone(),
             stream,
             remote,
-            handshaking,
+            Handshaking {
+                turn,
+                source,
+                silent,
+                peers: admission.peers.clone(),
+                warned: Arc::clone(&admission.warned),
+            },
             shutdown.clone(),
         ));
         tokio::spawn(async move {
@@ -1841,8 +2487,8 @@ async fn serve_signals_tls(
 /// Holding every permit means nothing is being served, which is the only way
 /// to know no peer is mid-answer. A peer still answering at the end of the
 /// grace loses its connection when the process goes.
-async fn drain_connections(slots: &Arc<tokio::sync::Semaphore>) {
-    let all = u32::try_from(SIGNALS_MAX_CONNECTIONS).unwrap_or(u32::MAX);
+async fn drain_connections(slots: &Arc<tokio::sync::Semaphore>, capacity: usize) {
+    let all = u32::try_from(capacity).unwrap_or(u32::MAX);
     match tokio::time::timeout(SHUTDOWN_GRACE, slots.acquire_many(all)).await {
         Ok(Ok(permits)) => {
             drop(permits);
@@ -1853,16 +2499,20 @@ async fn drain_connections(slots: &Arc<tokio::sync::Semaphore>) {
     }
 }
 
-/// Concurrent signals connections, where a poll round is one per peer.
+/// Concurrent signals connections at least, however few members the grid declares.
 const SIGNALS_MAX_CONNECTIONS: usize = 256;
+
+/// Concurrent signals connections at most, however many members the grid declares.
+const SIGNALS_CONNECTIONS_CEILING: usize = 4096;
+
+/// Handshakes in progress across every source, so handshakes cannot hold the slots that
+/// authenticated connections need.
+const SIGNALS_MAX_HANDSHAKES: usize = 64;
 
 /// Connections peers can never hold, kept for the co-located gateway.
 const SIGNALS_LOCAL_RESERVE: usize = 8;
 
-/// Concurrent handshakes from one source.
-const SIGNALS_MAX_PER_SOURCE: usize = 8;
-
-/// Concurrent handshakes from one global unicast IPv6 /48, across its /64s.
+/// Concurrent handshakes from one global unicast IPv6 /48, across its /64s, at least.
 const SIGNALS_MAX_PER_SOURCE_48: usize = 32;
 
 /// Pause after a failed accept.
@@ -1872,7 +2522,12 @@ const SIGNALS_ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_mi
 const SIGNALS_SHED_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Bound on the TLS handshake.
-const SIGNALS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const SIGNALS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long an accepted connection may send nothing before it is dropped. A connection that
+/// has not begun its handshake costs a slot and proves nothing, and a source that opens many
+/// of them is the cheapest way to hold the share.
+const SIGNALS_SILENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Bound on reading request headers, including between keep-alive requests.
 const SIGNALS_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1902,60 +2557,129 @@ async fn accepted_or_backoff(
 struct Admission {
     /// Every open connection.
     slots: Arc<tokio::sync::Semaphore>,
+    /// The permits [`Self::slots`] was given.
+    capacity: usize,
+    /// Handshakes in progress, across every source.
+    handshakes: Arc<tokio::sync::Semaphore>,
     /// Handshakes in progress, per source.
     sources: SourceSlots,
+    /// Accepted connections that have sent nothing yet, per source. Separate from `sources`
+    /// and much tighter: behind a router every peer is one source, so the handshake cap has
+    /// to cover the whole peer set, while a source that sends nothing earns a quarter of it.
+    silent: SourceSlots,
     /// Authenticated peer connections, per site.
     peers: PeerSlots,
+    /// Connections one peer may hold.
+    per_peer: usize,
+    /// The declared members the caps are sized for.
+    members: operator::signals::PeerIdentities,
+    /// When a shed connection was last warned about, shared with every connection task.
+    warned: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl Admission {
-    /// Caps for one listener, `max_per_peer` connections per site.
-    fn new(max_per_peer: usize) -> Self {
-        Self {
+    /// Caps for one listener: `max_per_peer` connections per site, `max_per_source`
+    /// handshakes per source address, and room for every one of `members`.
+    fn new(max_per_peer: usize, max_per_source: usize, members: operator::signals::PeerIdentities) -> Self {
+        let share = SIGNALS_MAX_HANDSHAKES / 2;
+        let mut admission = Self {
             slots: Arc::new(tokio::sync::Semaphore::new(SIGNALS_MAX_CONNECTIONS)),
-            sources: SourceSlots::new(SIGNALS_MAX_PER_SOURCE, SIGNALS_MAX_PER_SOURCE_48),
+            capacity: SIGNALS_MAX_CONNECTIONS,
+            handshakes: Arc::new(tokio::sync::Semaphore::new(SIGNALS_MAX_HANDSHAKES)),
+            sources: SourceSlots::new(
+                max_per_source.min(share),
+                max_per_source.max(SIGNALS_MAX_PER_SOURCE_48).min(share),
+            ),
+            silent: SourceSlots::new((share / 4).max(1), (share / 4).max(1)),
             peers: PeerSlots::new(
                 max_per_peer,
-                SIGNALS_MAX_CONNECTIONS.saturating_sub(SIGNALS_LOCAL_RESERVE),
+                SIGNALS_MAX_CONNECTIONS.saturating_sub(SIGNALS_LOCAL_RESERVE + SIGNALS_MAX_HANDSHAKES),
             ),
+            per_peer: max_per_peer.max(1),
+            members,
+            warned: Arc::default(),
+        };
+        admission.size_for_members();
+        operator::metrics::set_signals_connection_cap(admission.capacity);
+        operator::metrics::set_signals_admission(operator::metrics::AdmissionHandles {
+            slots: Arc::clone(&admission.slots),
+            handshakes: Arc::clone(&admission.handshakes),
+            max_handshakes: SIGNALS_MAX_HANDSHAKES,
+            sources: Arc::clone(&admission.sources.pending),
+            source_cap: admission.sources.limit,
+        });
+        admission
+    }
+
+    /// Grow the caps to fit every declared member, never shrinking them under a held slot.
+    fn size_for_members(&mut self) {
+        let wanted = self
+            .members
+            .count()
+            .saturating_mul(self.per_peer)
+            .saturating_add(SIGNALS_LOCAL_RESERVE + SIGNALS_MAX_HANDSHAKES)
+            .clamp(SIGNALS_MAX_CONNECTIONS, SIGNALS_CONNECTIONS_CEILING);
+        let grow = wanted.saturating_sub(self.capacity);
+        if grow > 0 {
+            self.slots.add_permits(grow);
+            self.peers.total.add_permits(grow);
+            self.capacity = wanted;
+            operator::metrics::set_signals_connection_cap(wanted);
+            tracing::info!(cap = wanted, "signals connection cap grown for the declared members");
         }
     }
 
-    /// A connection slot and a handshake slot for `remote`, or `None` to shed it.
+    /// A connection slot, a handshake turn and a source slot for `remote`, or `None` to shed it.
     fn admit(
-        &self,
+        &mut self,
         remote: SocketAddr,
-        warned: &mut Option<std::time::Instant>,
-    ) -> Option<(tokio::sync::OwnedSemaphorePermit, SourceSlot)> {
-        let held = match Arc::clone(&self.slots).try_acquire_owned() {
-            Ok(slot) => self
-                .sources
-                .acquire(remote.ip())
-                .map(|source| (slot, source))
-                .ok_or("source"),
-            Err(_) => Err("total"),
-        };
-        held.inspect_err(|limit| shed(remote, limit, warned)).ok()
+    ) -> Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+        SourceSlot,
+        SourceSlot,
+    )> {
+        self.size_for_members();
+        let held = Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map_err(|_full| "total")
+            .and_then(|slot| {
+                let turn = Arc::clone(&self.handshakes)
+                    .try_acquire_owned()
+                    .map_err(|_full| "handshake")?;
+                let source = self.sources.acquire(remote.ip()).ok_or("source")?;
+                let silent = self.silent.acquire(remote.ip()).ok_or("silent")?;
+                Ok((slot, turn, source, silent))
+            });
+        held.inspect_err(|limit| shed(remote, limit, &self.warned)).ok()
     }
 }
 
 /// Record a shed connection, warning at most once per [`SIGNALS_SHED_WARN_EVERY`].
-fn shed(remote: SocketAddr, limit: &str, warned: &mut Option<std::time::Instant>) {
+fn shed(remote: SocketAddr, limit: &str, warned: &std::sync::Mutex<Option<std::time::Instant>>) {
     operator::metrics::record_signals_shed(limit);
-    let quiet = warned.is_some_and(|at| at.elapsed() < SIGNALS_SHED_WARN_EVERY);
+    let quiet = {
+        let mut warned = warned.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let quiet = warned.is_some_and(|at| at.elapsed() < SIGNALS_SHED_WARN_EVERY);
+        if !quiet {
+            *warned = Some(std::time::Instant::now());
+        }
+        quiet
+    };
     if quiet {
         tracing::debug!(%remote, limit, "signals connection shed");
     } else {
-        *warned = Some(std::time::Instant::now());
         tracing::warn!(%remote, limit, "signals connection limit reached; shedding");
     }
 }
 
-/// Open handshakes per source, each capped, with a second cap per global IPv6 /48.
+/// Open handshakes per source, each capped, with a second cap per global IPv6 /48. At a cap the
+/// newest handshake is refused, so a flood from one source cannot cut its own handshakes that are
+/// already in progress; [`SIGNALS_HANDSHAKE_TIMEOUT`] bounds how long a slow one holds a slot.
 #[derive(Clone)]
 struct SourceSlots {
-    /// Open handshakes by source key.
-    open: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    /// Pending handshakes by source key.
+    pending: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     /// Cap per source key.
     limit: usize,
     /// Cap per global unicast IPv6 /48.
@@ -1966,7 +2690,7 @@ impl SourceSlots {
     /// A tracker allowing `limit` handshakes per source and `limit_48` per IPv6 /48.
     fn new(limit: usize, limit_48: usize) -> Self {
         Self {
-            open: Arc::default(),
+            pending: Arc::default(),
             limit,
             limit_48,
         }
@@ -1975,20 +2699,29 @@ impl SourceSlots {
     /// A slot for `ip`, released on drop, or `None` at either cap.
     fn acquire(&self, ip: std::net::IpAddr) -> Option<SourceSlot> {
         let (key, wider) = source_keys(ip);
-        let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let held = |counted: &std::net::IpAddr| open.get(counted).copied().unwrap_or_default();
-        if held(&key) >= self.limit || wider.is_some_and(|wider| held(&wider) >= self.limit_48) {
+        let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let full = std::iter::once((key, self.limit))
+            .chain(wider.map(|wider| (wider, self.limit_48)))
+            .any(|(counted, limit)| pending.get(&counted).copied().unwrap_or(0) >= limit);
+        if full {
             return None;
         }
         for counted in std::iter::once(key).chain(wider) {
-            let count = open.entry(counted).or_default();
-            *count = count.saturating_add(1);
+            *pending.entry(counted).or_default() += 1;
         }
-        drop(open);
+        drop(pending);
         Some(SourceSlot {
             slots: self.clone(),
             keys: (key, wider),
         })
+    }
+
+    /// Handshakes pending for `ip`'s source key.
+    #[cfg(test)]
+    fn held(&self, ip: std::net::IpAddr) -> usize {
+        let (key, _) = source_keys(ip);
+        let pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.get(&key).copied().unwrap_or(0)
     }
 }
 
@@ -2014,16 +2747,16 @@ struct SourceSlot {
 
 impl Drop for SourceSlot {
     fn drop(&mut self) {
-        let mut open = self
+        let mut pending = self
             .slots
-            .open
+            .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for key in std::iter::once(self.keys.0).chain(self.keys.1) {
-            if let Some(count) = open.get_mut(&key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    open.remove(&key);
+            if let std::collections::hash_map::Entry::Occupied(mut held) = pending.entry(key) {
+                *held.get_mut() = held.get().saturating_sub(1);
+                if *held.get() == 0 {
+                    held.remove();
                 }
             }
         }
@@ -2095,12 +2828,19 @@ impl Drop for PeerSlot {
     }
 }
 
-/// A connection still in its handshake: the source slot it holds, and the per-peer caps that follow.
+/// A connection still in its handshake: the slots it holds, and the per-peer caps that follow.
 struct Handshaking {
     /// Released once the handshake ends.
+    turn: tokio::sync::OwnedSemaphorePermit,
+    /// Released once the handshake ends.
     source: SourceSlot,
+    /// Released as soon as the connection sends anything, or when it is dropped for sending
+    /// nothing. It covers only the window before the first byte.
+    silent: SourceSlot,
     /// Where the authenticated connection is counted.
     peers: PeerSlots,
+    /// When a shed connection was last warned about, shared across the listener.
+    warned: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Who a leaf speaks for and the site it counts against, `Local` only for this site's current leaf.
@@ -2121,6 +2861,12 @@ fn caller_for(leaf: Option<&[u8]>, identity: &SignalsIdentity, remote: SocketAdd
         tracing::debug!(%remote, "signals caller is not a site this one names");
         return (Caller::Peer(None), None);
     };
+    // A pin or SPIFFE ID picks the site; the leaf must also name only that site, as the poller
+    // requires of the peers it reads.
+    if !certs::leaf_names_site(leaf, &site) {
+        tracing::debug!(%remote, %site, "signals caller's leaf does not name the site it matched");
+        return (Caller::Peer(None), None);
+    }
     (Caller::Peer(Some(labels)), Some(site))
 }
 
@@ -2135,14 +2881,34 @@ fn site_by_spiffe(leaf: &[u8], identity: &SignalsIdentity) -> Option<(String, BT
     identity.peers.labels_for(site).map(|labels| (site.to_owned(), labels))
 }
 
+/// Whether `tcp` sent anything within [`SIGNALS_SILENT_TIMEOUT`].
+///
+/// A connection that never speaks costs a slot and proves nothing, and opening many of them
+/// is the cheapest way to hold the handshake share. `readable()` does not consume, so the
+/// handshake that follows still sees the `ClientHello`. False also covers shutdown, where the
+/// caller stops for its own reasons.
+async fn spoke_in_time(
+    tcp: &tokio::net::TcpStream,
+    remote: SocketAddr,
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool {
+    let ready = tokio::select! {
+        biased;
+        () = shutdown.triggered() => return false,
+        ready = tokio::time::timeout(SIGNALS_SILENT_TIMEOUT, tcp.readable()) => ready,
+    };
+    if matches!(ready, Ok(Ok(()))) {
+        return true;
+    }
+    operator::metrics::record_signals_shed("silent");
+    tracing::debug!(%remote, "signals connection sent nothing; dropping");
+    false
+}
+
 /// Handshake one connection, then serve it with the scope its certificate earns.
 #[cfg_attr(
     not(feature = "fips"),
     expect(clippy::large_stack_frames, reason = "async future over a rustls handshake")
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "handshake shutdown, authenticated admission, and HTTP serving form one connection lifecycle"
 )]
 async fn serve_signals_connection(
     serving: Serving,
@@ -2151,13 +2917,19 @@ async fn serve_signals_connection(
     handshaking: Handshaking,
     shutdown: operator::shutdown::Shutdown,
 ) {
+    let handshake = (handshaking.turn, handshaking.source);
+    if !spoke_in_time(&tcp, remote, &shutdown).await {
+        return;
+    }
+    // It has spoken, so it no longer counts against the silent cap; the handshake caps take over.
+    drop(handshaking.silent);
     let accepted = tokio::select! {
         biased;
         () = shutdown.triggered() => return,
         accepted = tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT, tls_backend::accept(tcp, &serving.tls)) => accepted,
     };
-    // The source cap covers only the unauthenticated phase.
-    drop(handshaking.source);
+    // The handshake caps cover only the unauthenticated phase.
+    drop(handshake);
     let Ok(Ok(stream)) = accepted else {
         tracing::debug!(%remote, "signals handshake failed or timed out");
         return;
@@ -2170,16 +2942,24 @@ async fn serve_signals_connection(
         (Caller::Local, _) => None,
         (_, Some(site)) => {
             let Some(slot) = handshaking.peers.acquire(&site) else {
-                operator::metrics::record_signals_shed("peer");
+                shed(remote, "peer", &handshaking.warned);
                 tracing::debug!(%remote, site, "signals site at its connection cap; answering 503");
-                Box::pin(serve_http(stream, unavailable(), Caller::Peer(None), remote, shutdown)).await;
+                Box::pin(serve_http(
+                    stream,
+                    unavailable(),
+                    (Caller::Peer(None), None),
+                    remote,
+                    shutdown,
+                ))
+                .await;
                 return;
             };
             Some(slot)
         },
         (_, None) => return,
     };
-    Box::pin(serve_http(stream, serving.app, caller, remote, shutdown)).await;
+    let rescope = Some((Arc::<[u8]>::from(leaf), serving.identity));
+    Box::pin(serve_http(stream, serving.app, (caller, rescope), remote, shutdown)).await;
     drop(slot);
 }
 
@@ -2188,11 +2968,17 @@ fn unavailable() -> axum::Router {
     axum::Router::new().fallback(|| std::future::ready(http::StatusCode::SERVICE_UNAVAILABLE))
 }
 
+/// A connection's caller, and the leaf and identity to name it again by on each request.
+type Scope = (Caller, Option<(Arc<[u8]>, SignalsIdentity)>);
+
 /// Serve HTTP on an authenticated stream with the scope `caller` earned, bounded by every signals timeout.
+///
+/// With a leaf and identity to rescope by, each request is named again against the current
+/// peer records, so a peer removed or re-keyed is refused on its next request, not at reconnect.
 async fn serve_http(
     stream: tls_backend::ServerTlsStream,
     app: axum::Router,
-    caller: Caller,
+    (caller, rescope): Scope,
     remote: SocketAddr,
     shutdown: operator::shutdown::Shutdown,
 ) {
@@ -2201,7 +2987,11 @@ async fn serve_http(
     let service = hyper::service::service_fn(move |request: http::Request<hyper::body::Incoming>| {
         use tower::Service as _;
         let mut request = request;
-        request.extensions_mut().insert(caller.clone());
+        let scoped = rescope.as_ref().map_or_else(
+            || caller.clone(),
+            |(leaf, identity)| caller_for(Some(leaf), identity, remote).0,
+        );
+        request.extensions_mut().insert(scoped);
         app.clone().call(request)
     });
     let io = hyper_util::rt::TokioIo::new(WriteDeadline::new(stream, SIGNALS_WRITE_TIMEOUT));
@@ -2322,12 +3112,28 @@ impl<Stream: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadl
     }
 }
 
+/// Header naming the producer's release on every cross-site answer.
+const GRID_VERSION_HEADER: &str = "x-grid-version";
+
 /// Signals and feedback routes sharing the certificate-derived caller scope.
 fn signals_app(published: Published) -> axum::Router {
+    let membership = http::HeaderValue::from_static(published.membership);
     axum::Router::new()
         .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
+        .route(
+            operator::site_providers::PROVIDERS_PATH,
+            axum::routing::get(providers_handler),
+        )
         .route(grid_signals::feedback::INGEST_PATH, axum::routing::post(ingest_handler))
         .with_state(published)
+        .layer(axum::middleware::map_response(
+            move |mut response: axum::response::Response| {
+                let headers = response.headers_mut();
+                headers.insert(operator::signals::MEMBERSHIP_HEADER, membership.clone());
+                headers.insert(GRID_VERSION_HEADER, http::HeaderValue::from_static(version::VERSION));
+                std::future::ready(response)
+            },
+        ))
 }
 
 /// Accept completed ingests only from the certificate-proven local gateway.
@@ -2358,12 +3164,64 @@ async fn signals_handler(
     // Local, the site's own data plane, gets the whole grid view unscoped.
     // Access policy bounds peer reads, not the site reading itself.
     let now = operator::signals::ClockReading::now();
-    let (body, oldest) = match &caller {
-        Caller::Local => local_relay(&published, target, &collect, now),
-        Caller::Peer(Some(labels)) => published.site.render(target, &collect, Some(labels), now),
+    let (body, oldest, reader) = match &caller {
+        Caller::Local => {
+            let (body, oldest) = local_relay(&published, target, &collect, now);
+            (body, oldest, operator::site_providers::Reader::Local)
+        },
+        Caller::Peer(Some(labels)) => {
+            let (body, oldest) = published.site.render(target, &collect, Some(labels), now);
+            (body, oldest, operator::site_providers::Reader::Peer(labels))
+        },
         Caller::Peer(None) => return refused(),
     };
-    served(body, oldest, now.wall)
+    with_catalog_version(served(body, oldest, now.wall), &published, reader)
+}
+
+/// `response` naming the version of the catalog `reader` would read, so it re-reads only when
+/// that changes.
+fn with_catalog_version(
+    mut response: axum::response::Response,
+    published: &Published,
+    reader: operator::site_providers::Reader<'_>,
+) -> axum::response::Response {
+    if let Some(version) = published
+        .providers
+        .version_for(reader)
+        .and_then(|version| http::HeaderValue::from_str(&version).ok())
+    {
+        response
+            .headers_mut()
+            .insert(operator::site_providers::VERSION_HEADER, version);
+    }
+    response
+}
+
+/// Serve this site's providers, scoped by the caller's certificate like its signals.
+async fn providers_handler(
+    axum::extract::State(published): axum::extract::State<Published>,
+    axum::Extension(caller): axum::Extension<Caller>,
+) -> axum::response::Response {
+    let reader = match &caller {
+        Caller::Local => operator::site_providers::Reader::Local,
+        Caller::Peer(Some(labels)) => operator::site_providers::Reader::Peer(labels),
+        Caller::Peer(None) => return refused(),
+    };
+    // Before the first publish an answer would read as no providers, so a peer keeps what it holds.
+    let Some(rendered) = published.providers.rendered(reader) else {
+        return http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let contract = operator::site_providers::CONTRACT_VERSION.to_string();
+    // The version and the body come from one render, so the reader records what it read.
+    (
+        [
+            (http::header::CONTENT_TYPE.as_str(), "application/json"),
+            (operator::site_providers::CONTRACT_HEADER, contract.as_str()),
+            (operator::site_providers::VERSION_HEADER, rendered.version.as_str()),
+        ],
+        rendered.body,
+    )
+        .into_response()
 }
 
 /// This site's own gateway's read: the poller's rounds, then the site, then its peers, in one
@@ -2481,18 +3339,16 @@ async fn own_leaf(network: &GridNetwork, client: &Client) -> Option<grid_network
     }
 }
 
-/// Scrape this site's providers on their own interval and publish the result.
+/// Scrape this site's providers on their own interval, write their readiness, and in Poll
+/// mode publish the result.
 ///
 /// Separate from reconcile, which runs on an interval sized for declarations
 /// and is two orders of magnitude slower than these values move.
 async fn run_local_scraper(
-    interval: Option<std::time::Duration>,
+    interval: std::time::Duration,
     ctx: Arc<OperatorCtx>,
     client: Client,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(interval) = interval else {
-        return Ok(());
-    };
     tracing::info!(interval_ms = interval.as_millis(), "local signals scraper started");
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2506,7 +3362,10 @@ async fn run_local_scraper(
         let Ok(list) = networks.list(&kube::api::ListParams::default()).await else {
             continue;
         };
-        for network in list.items.iter().filter_map(|n| n.metadata.name.as_deref()) {
+        let live: Vec<&str> = list.items.iter().filter_map(|n| n.metadata.name.as_deref()).collect();
+        // A network deleted with no finalizer is never reconciled again, so forget it here.
+        ctx.local_providers().retain_networks(|held| live.contains(&held));
+        for network in live {
             if let Err(error) = grid_network::refresh_signals(&ctx, &client, network).await {
                 tracing::warn!(network, %error, "local signals refresh failed");
             }
@@ -2585,7 +3444,7 @@ fn bounded_model_discovery_ttl(
 ) -> std::time::Duration {
     let requested_ttl =
         std::time::Duration::from_secs(parse_env_or("GRID_MODEL_DISCOVERY_TTL_SECS", default.as_secs()).max(1));
-    let minimum_ttl = interval.saturating_add(timeout);
+    let minimum_ttl = minimum_model_discovery_ttl(interval, timeout);
     let unclamped_ttl = requested_ttl.max(minimum_ttl);
     let ttl = unclamped_ttl.min(MAX_MODEL_DISCOVERY_TTL);
     if unclamped_ttl > MAX_MODEL_DISCOVERY_TTL {
@@ -2598,6 +3457,15 @@ fn bounded_model_discovery_ttl(
         );
     }
     ttl
+}
+
+/// Keep a discovered model alive through a poll round and the gateway's expiry margin.
+fn minimum_model_discovery_ttl(interval: std::time::Duration, timeout: std::time::Duration) -> std::time::Duration {
+    interval
+        .saturating_add(timeout)
+        .saturating_add(std::time::Duration::from_millis(
+            grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS,
+        ))
 }
 
 /// Parse one discovery duration, enforcing a positive value and maximum.
@@ -2641,32 +3509,48 @@ async fn run_peer_poller(
     let Some(settings) = settings else {
         return Ok(());
     };
-    let Some(swim) = swim_settled(swim).await else {
-        tracing::info!("peer signals poller disabled: SWIM is not running");
-        return Ok(());
-    };
-    PeerPoller {
+    let swim = swim_settled(swim).await;
+    if swim.is_none() {
+        tracing::info!("peer signals poller polls declared endpoints only: SWIM is not running");
+    }
+    let poller = PeerPoller {
         ctx,
         swim,
         client,
         settings,
         shutdown,
         ages: operator::peer_ages::PeerAges::default(),
+        memberships: operator::peer_membership::PeerMemberships::default(),
+        reach: operator::peer_reach::PeerReach::default(),
+        misses: operator::peer_reach::Misses::default(),
+        written: NetworkWritten::default(),
+        catalogs: operator::peer_reach::PeerReach::none(&operator::peer_reach::CATALOGS),
+        sites_written: false,
+        catalog_versions: std::collections::HashMap::new(),
         remembered: BTreeMap::new(),
         unanswered: BTreeSet::new(),
         turn: 0,
-    }
-    .run()
-    .await;
+    };
+    Box::pin(poller.run()).await;
     Ok(())
 }
+
+/// Whether a peer's catalog is due a read: on the [`CATALOG_ROUNDS`] schedule, the floor under a
+/// version that misses a change, and between, when the version it names differs from the one
+/// last read.
+fn catalog_stale(named: Option<&str>, last_read: Option<&str>, scheduled: bool) -> bool {
+    scheduled || named.is_some_and(|version| last_read != Some(version))
+}
+
+/// Rounds between reads of a peer's catalog, which changes with its providers, not its load.
+const CATALOG_ROUNDS: usize = 6;
 
 /// The invariant state one peer-polling session threads through every round.
 struct PeerPoller {
     /// Where polled peer signals are published and peer identities are read.
     ctx: Arc<OperatorCtx>,
-    /// Membership, for the alive peers and their advertised addresses.
-    swim: Arc<swim_runtime::SwimHandle>,
+    /// Membership, for the peers and their advertised addresses, `None` without SWIM.
+    swim: Option<Arc<swim_runtime::SwimHandle>>,
     /// Kube client, for resolving this site's TLS material.
     client: Client,
     /// Poll cadence, timeouts, and what to collect.
@@ -2675,6 +3559,20 @@ struct PeerPoller {
     shutdown: operator::shutdown::Shutdown,
     /// Peers whose relayed ages the last rounds rejected, for the `GridNetwork` condition.
     ages: operator::peer_ages::PeerAges,
+    /// Peers naming a different membership mode, for the `GridNetwork` condition.
+    memberships: operator::peer_membership::PeerMemberships,
+    /// Under Local membership, which peers' signals endpoints did not answer, as last written.
+    reach: operator::peer_reach::PeerReach,
+    /// Rounds in a row each peer went unanswered, which a reachable peer outlasts.
+    misses: operator::peer_reach::Misses,
+    /// What the `GridNetwork`'s peer conditions were last written from.
+    written: NetworkWritten,
+    /// Under Local membership, which peers' catalogs were refused, as last written.
+    catalogs: operator::peer_reach::PeerReach,
+    /// Whether the peer `GridSite` conditions were last written in full.
+    sites_written: bool,
+    /// Each peer's catalog version as last read, so a changed one is read in the next round.
+    catalog_versions: std::collections::HashMap<String, String>,
     /// Each peer where it was last polled, so one SWIM no longer lists is still polled there.
     remembered: BTreeMap<String, operator::signals::PeerSite>,
     /// Peers polled last round that did not answer, polled last and briefly.
@@ -2696,7 +3594,10 @@ impl PeerPoller {
         let Some(source) = Box::pin(peer_source(
             &self.client,
             self.shutdown.clone(),
-            self.ctx.peer_settings().trust,
+            (
+                self.ctx.peer_settings().trust,
+                self.ctx.site_name().unwrap_or_default().to_owned(),
+            ),
             &self.settings,
         ))
         .await
@@ -2729,9 +3630,9 @@ impl PeerPoller {
         source: &operator::signals::PollPeers,
         changed: impl Future<Output = ()> + Send,
     ) {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(self.settings.peer_interval_secs));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let interval = std::time::Duration::from_secs(self.settings.peer_interval_secs);
         let mut changed = std::pin::pin!(changed);
+        let mut next = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 biased;
@@ -2740,10 +3641,102 @@ impl PeerPoller {
                     tracing::info!("peer signals TLS material changed; rebuilding the client");
                     return;
                 },
-                _ = ticker.tick() => {},
+                () = tokio::time::sleep_until(next) => {},
             }
             self.poll_once(source).await;
+            // Each round is spread apart, so sites that started together do not poll in step.
+            next = round_after(next, interval);
         }
+    }
+
+    /// Under Local membership, write on each peer's `GridSite` whether its signals endpoint
+    /// answered and its catalog was accepted, and the counts on the `GridNetwork`, when that
+    /// changed. Under Swim, remove what a Local run left on the `GridSite` objects, once.
+    async fn report_reach(
+        &mut self,
+        (source, local_site): (&operator::signals::PollPeers, &str),
+        polled: &[String],
+        answered: &BTreeMap<String, usize>,
+        urls: &std::collections::HashMap<String, String>,
+    ) {
+        use operator::peer_reach::{CATALOGS, PeerReach, REACH};
+        if self.ctx.membership() != Membership::Local {
+            if !self.sites_written {
+                let none = [PeerReach::none(&REACH), PeerReach::none(&CATALOGS)];
+                let sites = Box::pin(write_site_conditions(&self.client, &none, &self.shutdown)).await;
+                let network = Box::pin(withdraw_network_conditions(&self.client, &self.shutdown)).await;
+                self.sites_written = sites && network;
+            }
+            return;
+        }
+        let (reach, catalogs, skipped) = self.judge((source, local_site), polled, answered, urls);
+        Box::pin(self.write_network((&reach, &catalogs), (skipped, polled.len()))).await;
+        for (peer, judged) in reach.judged() {
+            operator::metrics::set_peer_signals_reachable(peer, judged.is_clear());
+        }
+        for (peer, judged) in catalogs.judged() {
+            operator::metrics::set_peer_catalog_refused(peer, !judged.is_clear());
+        }
+        let changed = reach != self.reach || catalogs != self.catalogs;
+        // Rechecked against the live objects on the catalog schedule, so a lost write heals.
+        if changed || !self.sites_written || self.turn.is_multiple_of(CATALOG_ROUNDS) {
+            let judged = [reach.clone(), catalogs.clone()];
+            self.sites_written = Box::pin(write_site_conditions(&self.client, &judged, &self.shutdown)).await;
+        }
+        self.reach = reach;
+        self.catalogs = catalogs;
+    }
+
+    /// Write each `GridNetwork` peer condition this round changed, or whose last write failed.
+    async fn write_network(
+        &mut self,
+        (reach, catalogs): (&operator::peer_reach::PeerReach, &operator::peer_reach::PeerReach),
+        polls: (usize, usize),
+    ) {
+        if write_due(self.written.polls.as_ref(), &polls) {
+            let landed = Box::pin(write_peer_polls(&self.client, polls, &self.shutdown)).await;
+            self.written.polls = landed.then_some(polls);
+        }
+        if write_due(self.written.reach.as_ref(), reach) {
+            let landed = Box::pin(write_peer_reach(&self.client, reach, &self.shutdown)).await;
+            self.written.reach = landed.then(|| reach.clone());
+        }
+        if write_due(self.written.catalogs.as_ref(), catalogs) {
+            let landed = Box::pin(write_peer_reach(&self.client, catalogs, &self.shutdown)).await;
+            self.written.catalogs = landed.then(|| catalogs.clone());
+        }
+    }
+
+    /// This round's signals and catalog verdicts on each peer, and how many peers it had no
+    /// time to poll.
+    fn judge(
+        &self,
+        (source, local_site): (&operator::signals::PollPeers, &str),
+        polled: &[String],
+        answered: &BTreeMap<String, usize>,
+        urls: &std::collections::HashMap<String, String>,
+    ) -> (operator::peer_reach::PeerReach, operator::peer_reach::PeerReach, usize) {
+        use operator::peer_reach::PeerReach;
+        let without_endpoint = self.ctx.peer_identities().without_endpoint(local_site);
+        let reach = PeerReach::of(
+            answered.keys().map(String::as_str),
+            self.unanswered.iter().map(|peer| {
+                let failure = source
+                    .failures
+                    .of(peer)
+                    .map(|why| (why, urls.get(peer).map_or("", String::as_str)));
+                (peer.as_str(), failure)
+            }),
+            without_endpoint.iter().map(String::as_str),
+        );
+        let skipped = reach.skipped();
+        let reach = reach.held_over(&self.reach, &self.misses);
+        let held = self.ctx.peer_providers();
+        let catalogs = PeerReach::catalogs(
+            polled.iter().map(String::as_str).filter(|site| held.holds(site)),
+            &held.verdicts(),
+        );
+        (reach, catalogs, skipped)
     }
 
     /// Collect from every known peer, replace what is published for them, and say
@@ -2754,28 +3747,49 @@ impl PeerPoller {
     )]
     async fn poll_once(&mut self, source: &operator::signals::PollPeers) {
         let membership_ready = self.ctx.membership_hold().is_none();
-        let Some(mut sites) = poll_targets(
-            &self.swim.snapshot(),
-            &self.ctx.peer_identities(),
-            source.trust,
-            self.swim.is_encrypted(),
-            self.swim.site_name(),
-            &mut self.remembered,
-        ) else {
+        let snapshot = self.swim.as_ref().map(|swim| swim.snapshot());
+        let Some(local_site) = self
+            .swim
+            .as_ref()
+            .map(|swim| swim.site_name())
+            .or_else(|| self.ctx.site_name())
+            .map(str::to_owned)
+        else {
+            tracing::debug!("peer polling waits for this site's name");
+            return;
+        };
+        let identities = self.ctx.peer_identities();
+        let targets = Targeting {
+            identities: &identities,
+            trust: source.trust,
+            encrypted: self.swim.as_ref().is_some_and(|swim| swim.is_encrypted()),
+            local_site: &local_site,
+        }
+        .targets(snapshot.as_ref(), &mut self.remembered);
+        // A Local site whose peers are all endpoint-less still reports on them, and clears what
+        // the last pollable one left.
+        let idle = idle_round(self.ctx.membership(), identities.loaded());
+        let Some(mut sites) = targets.or_else(|| idle.then(Vec::new)) else {
             return;
         };
         self.turn = self.turn.wrapping_add(1);
         order_targets(&mut sites, &self.unanswered, self.turn);
+        for site in sites.iter_mut().filter(|site| !site.answering) {
+            site.answering = self.misses.full_budget_due(&site.name);
+        }
         // Each peer lands as it answers, so one slow peer cannot age out the rest.
         let peers = self.ctx.peers();
         let heard = self.ctx.load_heard();
-        let identities = self.ctx.peer_identities();
         heard.retain_sites(|site| identities.knows(site));
         let ttl = self.settings.peer_ttl();
         let mut answered = BTreeMap::new();
+        let mut modes = BTreeMap::new();
+        let mut versions = std::collections::HashMap::<String, Option<String>>::new();
         source
-            .collect_each(&sites, |peer, observations, rejected| {
+            .collect_each(&sites, |peer, observations, rejected, stamp| {
                 answered.insert(peer.clone(), rejected);
+                modes.insert(peer.clone(), stamp.membership);
+                versions.insert(peer.clone(), stamp.providers_version);
                 heard.record(&peer, &observations);
                 peers.refresh(BTreeMap::from([(peer, observations)]), ttl);
             })
@@ -2784,17 +3798,108 @@ impl PeerPoller {
         if self.shutdown.is_triggered() {
             return;
         }
+        // Catalogs change rarely: a peer's is read when none is held, then every
+        // CATALOG_ROUNDS rounds, within one round. A silent peer keeps what it last served.
+        let catalogs = self.ctx.peer_providers();
+        let due = self.turn.is_multiple_of(CATALOG_ROUNDS);
+        let read_at = &self.catalog_versions;
+        let stale = |site: &str| {
+            catalog_stale(
+                versions.get(site).and_then(Option::as_deref),
+                read_at.get(site).map(String::as_str),
+                due,
+            )
+        };
+        let wanted = sites
+            .iter()
+            .filter(|site| answered.contains_key(&site.name) && (stale(&site.name) || !catalogs.holds(&site.name)));
+        let concurrency = source.dial_concurrency(sites.len());
+        let Some(read) = read_catalogs(source, wanted, concurrency, &catalogs, &self.shutdown).await else {
+            return;
+        };
+        // The version the providers answer itself named, not the one the signals answer did.
+        for (site, version) in read {
+            match version {
+                Some(version) => self.catalog_versions.insert(site, version),
+                None => self.catalog_versions.remove(&site),
+            };
+        }
+        let urls: std::collections::HashMap<String, String> =
+            sites.iter().map(|site| (site.name.clone(), site.url.clone())).collect();
         let polled: Vec<String> = sites.into_iter().map(|site| site.name).collect();
+        self.catalog_versions.retain(|site, _| polled.contains(site));
+        self.ctx
+            .peer_providers()
+            .retain_sites(|site| polled.iter().any(|polled| polled == site));
+        operator::metrics::retain_peers(|site| polled.iter().any(|polled| polled == site));
+        self.ctx
+            .peer_catch_up()
+            .record(&polled, |site| answered.contains_key(site), |site| catalogs.holds(site));
         self.ctx.peer_rounds().record(&polled, SystemTime::now());
+        self.misses.record(
+            &polled,
+            |site| answered.contains_key(site),
+            |site| source.failures.of(site) == Some(operator::signals::Unreachable::RoundDeadline),
+        );
         self.unanswered = polled
             .iter()
             .filter(|site| !answered.contains_key(*site))
             .cloned()
             .collect();
+        Box::pin(self.report_reach((source, &local_site), &polled, &answered, &urls)).await;
         if observe_peer_ages(membership_ready, &mut self.ages, &polled, &answered) {
             Box::pin(write_peer_ages(&self.client, &self.ages, &self.shutdown)).await;
         }
+        if membership_ready {
+            let ours = self.ctx.membership().as_str();
+            self.memberships.observe(&polled, &modes, ours);
+            Box::pin(write_peer_memberships(
+                &self.client,
+                &self.memberships,
+                ours,
+                &self.shutdown,
+            ))
+            .await;
+        }
     }
+}
+
+/// Read the catalogs of `wanted` into `catalogs` within one round, with the version each
+/// answer named, or `None` when shutdown stood the reads down.
+async fn read_catalogs(
+    source: &operator::signals::PollPeers,
+    wanted: impl Iterator<Item = &operator::signals::PeerSite>,
+    concurrency: usize,
+    catalogs: &operator::site_providers::PeerProviders,
+    shutdown: &operator::shutdown::Shutdown,
+) -> Option<Vec<(String, Option<String>)>> {
+    let read = std::sync::Mutex::new(Vec::new());
+    let reads = futures::stream::iter(wanted).for_each_concurrent(concurrency, |site| async {
+        if let Some((providers, version)) = source.fetch_providers(site).await {
+            operator::metrics::record_peer_catalog(&site.name, "replaced");
+            catalogs.replace(&site.name, providers);
+            read.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((site.name.clone(), version));
+        } else {
+            operator::metrics::record_peer_catalog(&site.name, "failed");
+        }
+    });
+    let finished = tokio::select! {
+        biased;
+        () = shutdown.triggered() => return None,
+        finished = tokio::time::timeout(source.round, reads) => finished,
+    };
+    if finished.is_err() {
+        tracing::debug!("peer catalog reads cut at the round deadline");
+    }
+    Some(read.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// When the round after one started at `started` begins: `interval` later, jittered, and never
+/// in the past, so a round that overran is followed at once and not by a burst.
+fn round_after(started: tokio::time::Instant, interval: std::time::Duration) -> tokio::time::Instant {
+    (started + operator::enroll::jittered(interval)).max(tokio::time::Instant::now())
 }
 
 /// The order a round polls `sites` in.
@@ -2889,59 +3994,299 @@ async fn apply_peer_ages(client: &Client, ages: &operator::peer_ages::PeerAges) 
     }
 }
 
-/// Peers this site would name under `trust`, `None` in SPIFFE mode over plaintext gossip.
-///
-/// Every member whatever its SWIM state at the signals address it gossiped, then each peer SWIM no
-/// longer lists at the address it was last polled at while its `GridSite` still names it, so
-/// polling never waits on gossip. A peer that never gossiped an address is not polled.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "membership, trust, and addressing inputs of one round"
-)]
-fn poll_targets(
-    snapshot: &operator::swim::MembershipSnapshot,
-    identities: &operator::signals::PeerIdentities,
-    trust: operator::signals::PeerTrustMode,
-    encrypted: bool,
-    local_site: &str,
-    remembered: &mut BTreeMap<String, operator::signals::PeerSite>,
-) -> Option<Vec<operator::signals::PeerSite>> {
-    let pinned = trust == operator::signals::PeerTrustMode::Pin;
-    if !pinned && !encrypted {
-        tracing::debug!("SPIFFE peer polling waits for encrypted gossip");
-        return None;
+/// Write the `PeerSignalsReachable` or `PeerCatalogsAccepted` count on the sole `GridNetwork`,
+/// bounded and cut short by shutdown.
+async fn write_peer_reach(
+    client: &Client,
+    reach: &operator::peer_reach::PeerReach,
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool {
+    Box::pin(write_network_condition(
+        client,
+        reach.kind().field_manager,
+        |network, now| operator::peer_reach::patch(network, reach, now),
+        shutdown,
+    ))
+    .await
+}
+
+/// Whether a `GridNetwork` condition judged as `next` is to be written: it differs from what
+/// was `written` last, `None` when that write did not land.
+fn write_due<T: PartialEq>(written: Option<&T>, next: &T) -> bool {
+    written != Some(next)
+}
+
+/// What the `GridNetwork`'s peer conditions were last written from, each `None` until a write
+/// lands, so one that failed is written again however the next round judges.
+#[derive(Default)]
+struct NetworkWritten {
+    /// Peers a round had no time for, of how many it polled.
+    polls: Option<(usize, usize)>,
+    /// `PeerSignalsReachable`'s verdicts.
+    reach: Option<operator::peer_reach::PeerReach>,
+    /// `PeerCatalogsAccepted`'s verdicts.
+    catalogs: Option<operator::peer_reach::PeerReach>,
+}
+
+/// Whether a round with nothing to poll still runs: under Local once the peers are read, so
+/// endpoint-less peers are reported and a last endpoint's removal is seen. Without that input
+/// the round waits.
+fn idle_round(membership: Membership, peers_read: bool) -> bool {
+    membership == Membership::Local && peers_read
+}
+
+/// Withdraw what a Local run left on the `GridNetwork`, so a site now under Swim is not
+/// degraded by it. `true` once every one is gone.
+async fn withdraw_network_conditions(client: &Client, shutdown: &operator::shutdown::Shutdown) -> bool {
+    use operator::peer_reach::{CATALOGS, PEER_POLLS_COMPLETE, POLLS_FIELD_MANAGER, REACH};
+    let mut withdrawn = true;
+    for (manager, type_) in [
+        (REACH.field_manager, REACH.type_),
+        (CATALOGS.field_manager, CATALOGS.type_),
+        (POLLS_FIELD_MANAGER, PEER_POLLS_COMPLETE),
+    ] {
+        withdrawn &= Box::pin(write_network_condition(
+            client,
+            manager,
+            |network, _| operator::peer_reach::withdrawal(network, type_),
+            shutdown,
+        ))
+        .await;
     }
-    let named = |site: &str| {
-        if pinned {
-            !identities.refuses(site)
-        } else {
-            identities.labels_for(site).is_some()
+    withdrawn
+}
+
+/// Write `PeerPollsComplete` after a round that had no time for `skipped` of its `judged` peers,
+/// `true` once written.
+async fn write_peer_polls(
+    client: &Client,
+    (skipped, judged): (usize, usize),
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool {
+    Box::pin(write_network_condition(
+        client,
+        operator::peer_reach::POLLS_FIELD_MANAGER,
+        |network, now| {
+            operator::peer_reach::network_patch(network, |current| {
+                operator::peer_reach::polls_condition(current, (skipped, judged), now)
+            })
+        },
+        shutdown,
+    ))
+    .await
+}
+
+/// Apply the condition `build` makes for the sole `GridNetwork` under `manager`, bounded and
+/// stood down by shutdown. `true` when it landed or the live status already says it.
+async fn write_network_condition<Build>(
+    client: &Client,
+    manager: &str,
+    build: Build,
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool
+where
+    Build: for<'network> FnOnce(&'network GridNetwork, &str) -> Option<(&'network str, serde_json::Value)> + Send,
+{
+    let apply = async {
+        let Some(network) = Box::pin(sole_network(client)).await else {
+            return false;
+        };
+        let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+            return false;
+        };
+        let Some((name, patch)) = build(&network, &now) else {
+            return true;
+        };
+        let api: Api<GridNetwork> = Api::all(client.clone());
+        let params = PatchParams::apply(manager).force();
+        Box::pin(api.patch_status(name, &params, &Patch::Apply(patch)))
+            .await
+            .inspect_err(|error| tracing::warn!(%error, manager, "peer condition not written; retrying next round"))
+            .is_ok()
+    };
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => false,
+        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, apply) => result.unwrap_or_else(|_elapsed| {
+            tracing::warn!(manager, "peer condition write timed out; retrying next round");
+            false
+        }),
+    }
+}
+
+/// Write each `GridSite`'s condition for every one of `judged`, against the live objects,
+/// bounded and cut short by shutdown. `true` when every write landed.
+async fn write_site_conditions(
+    client: &Client,
+    judged: &[operator::peer_reach::PeerReach],
+    shutdown: &operator::shutdown::Shutdown,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => false,
+        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, Box::pin(apply_site_conditions(client, judged))) => {
+            result.unwrap_or_else(|_| {
+                tracing::warn!("peer GridSite condition writes timed out; retrying next round");
+                false
+            })
+        },
+    }
+}
+
+/// List the `GridSite` objects and apply each condition of `judged` that differs; `true` when
+/// every write landed.
+async fn apply_site_conditions(client: &Client, judged: &[operator::peer_reach::PeerReach]) -> bool {
+    let api: Api<GridSite> = Api::all(client.clone());
+    let sites = match Box::pin(api.list(&kube::api::ListParams::default())).await {
+        Ok(sites) => sites,
+        Err(error) => {
+            tracing::warn!(%error, "peer GridSites not listed; their conditions retry next round");
+            return false;
+        },
+    };
+    let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+        return false;
+    };
+    let mut landed = true;
+    for site in &sites.items {
+        for reach in judged {
+            let Some((name, patch)) = reach.site_patch(site, &now) else {
+                continue;
+            };
+            let params = PatchParams::apply(reach.kind().field_manager).force();
+            if let Err(error) = Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+                tracing::warn!(%error, site = name, "peer GridSite condition not written; retrying next round");
+                landed = false;
+            }
+        }
+    }
+    landed
+}
+
+/// Write the `PeerMembership` condition on the sole `GridNetwork` when it changed.
+async fn write_peer_memberships(
+    client: &Client,
+    memberships: &operator::peer_membership::PeerMemberships,
+    ours: &str,
+    shutdown: &operator::shutdown::Shutdown,
+) {
+    let apply = async {
+        let Some(network) = Box::pin(sole_network(client)).await else {
+            return;
+        };
+        let Ok(now) = time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339) else {
+            return;
+        };
+        let Some((name, patch)) = operator::peer_membership::patch(&network, memberships, ours, &now) else {
+            return;
+        };
+        let api: Api<GridNetwork> = Api::all(client.clone());
+        let params = PatchParams::apply(operator::peer_membership::FIELD_MANAGER).force();
+        match Box::pin(api.patch_status(name, &params, &Patch::Apply(patch))).await {
+            Ok(_) if memberships.mismatched().is_empty() => {},
+            Ok(_) => tracing::warn!(peers = ?memberships.mismatched(), ours, "peers run a different membership mode"),
+            Err(error) => tracing::warn!(%error, "peer membership condition not written; retrying next round"),
         }
     };
-    let members = snapshot
-        .members
-        .iter()
-        .filter(|m| m.signals_address.is_some() && named(&m.site_id));
-    let mut sites = operator::signals::peer_sites(members, local_site, "https", 0);
-    remembered.retain(|site, _| named(site));
-    for site in &sites {
-        remembered.insert(site.name.clone(), site.clone());
+    tokio::select! {
+        biased;
+        () = shutdown.triggered() => {},
+        result = tokio::time::timeout(PEER_AGES_WRITE_TIMEOUT, apply) => {
+            if result.is_err() {
+                tracing::warn!("peer membership condition write timed out; retrying next round");
+            }
+        },
     }
-    let listed: BTreeSet<String> = sites.iter().map(|site| site.name.clone()).collect();
-    sites.extend(remembered.values().filter(|site| !listed.contains(&site.name)).cloned());
-    if pinned {
-        for site in &mut sites {
-            site.pins = identities.pins_for(&site.name);
+}
+
+/// What one round polls, from the local `GridSite` objects and, when readable, gossip.
+struct Targeting<'round> {
+    /// Who may be polled, and where each is declared.
+    identities: &'round operator::signals::PeerIdentities,
+    /// How peers are authorized.
+    trust: operator::signals::PeerTrustMode,
+    /// Whether gossip is encrypted, which SPIFFE trust needs before reading it.
+    encrypted: bool,
+    /// This site, never polled.
+    local_site: &'round str,
+}
+
+impl Targeting<'_> {
+    /// Whether `site` is one this site would name under its trust.
+    fn named(&self, site: &str) -> bool {
+        if self.trust == operator::signals::PeerTrustMode::Pin {
+            !self.identities.refuses(site)
+        } else {
+            self.identities.labels_for(site).is_some()
         }
     }
-    Some(sites)
+
+    /// Peers this site would name, `None` when there is none to poll.
+    ///
+    /// Gossiped peers first: every member whatever its SWIM state at the signals address it
+    /// gossiped, then each peer SWIM no longer lists at the address it was last polled at while
+    /// its `GridSite` still names it, so polling never waits on gossip. Gossip is not read in
+    /// SPIFFE mode while plaintext. A `GridSite` that declares a signals endpoint is then polled
+    /// there, without SWIM and over any gossiped address.
+    fn targets(
+        &self,
+        snapshot: Option<&operator::swim::MembershipSnapshot>,
+        remembered: &mut BTreeMap<String, operator::signals::PeerSite>,
+    ) -> Option<Vec<operator::signals::PeerSite>> {
+        let pinned = self.trust == operator::signals::PeerTrustMode::Pin;
+        if !pinned && !self.encrypted {
+            tracing::debug!("SPIFFE peer polling ignores plaintext gossip");
+        }
+        let gossiped = snapshot.filter(|_| pinned || self.encrypted);
+        let mut targets = BTreeMap::new();
+        if let Some(members) = gossiped {
+            self.gossiped(members, remembered, &mut targets);
+        }
+        for (name, declared) in self.identities.declared_endpoints() {
+            if name == self.local_site || !self.named(&name) {
+                continue;
+            }
+            if let Some(site) = declared.peer_site(name) {
+                targets.insert(site.name.clone(), site);
+            }
+        }
+        if gossiped.is_none() && targets.is_empty() {
+            return None;
+        }
+        let mut sites: Vec<_> = targets.into_values().collect();
+        if pinned {
+            for site in &mut sites {
+                site.pins = self.identities.pins_for(&site.name);
+            }
+        }
+        Some(sites)
+    }
+
+    /// The gossiped peers into `targets`, each remembered where it was last polled.
+    fn gossiped(
+        &self,
+        members: &operator::swim::MembershipSnapshot,
+        remembered: &mut BTreeMap<String, operator::signals::PeerSite>,
+        targets: &mut BTreeMap<String, operator::signals::PeerSite>,
+    ) {
+        let listed = members
+            .members
+            .iter()
+            .filter(|m| m.signals_address.is_some() && self.named(&m.site_id));
+        let sites = operator::signals::peer_sites(listed, self.local_site, "https", 0);
+        remembered.retain(|site, _| self.named(site));
+        for site in sites {
+            remembered.insert(site.name.clone(), site);
+        }
+        targets.extend(remembered.iter().map(|(name, site)| (name.clone(), site.clone())));
+    }
 }
 
 /// Build the peer poller source from verified TLS material, or `None` when absent.
 async fn peer_source(
     client: &Client,
     shutdown: operator::shutdown::Shutdown,
-    trust: operator::signals::PeerTrustMode,
+    (trust, local_site): (operator::signals::PeerTrustMode, String),
     settings: &operator::cli::SignalsArgs,
 ) -> Option<operator::signals::PollPeers> {
     let tls = peer_tls(client).await?;
@@ -2958,6 +4303,8 @@ async fn peer_source(
         shutdown,
         trust,
         transports: operator::signals::PeerTransports::default(),
+        failures: operator::signals::PeerFailures::default(),
+        local_site,
     })
 }
 
@@ -2988,6 +4335,132 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 mod tests {
     use super::*;
 
+    #[test]
+    fn discovery_ttl_covers_poll_round_and_gateway_expiry_margin() {
+        let minimum =
+            minimum_model_discovery_ttl(std::time::Duration::from_secs(60), std::time::Duration::from_secs(5));
+
+        assert_eq!(minimum, std::time::Duration::from_secs(95));
+        assert!(
+            minimum > std::time::Duration::from_millis(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS),
+            "the TTL must remain valid when received by the gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reads_network_membership_before_selecting_the_swim_listener() -> Result<(), String> {
+        let install = GridModes::without_network(Some(SignalMode::Poll), Some(operator::signals::PeerTrustMode::Pin));
+        for (spec, expected, declared) in [
+            (None, Membership::Swim, false),
+            (Some(serde_json::json!({})), Membership::Swim, false),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "poll"}})),
+                Membership::Local,
+                true,
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Swim"}})),
+                Membership::Swim,
+                true,
+            ),
+        ] {
+            let client = network_modes_client(spec.clone());
+            let (modes, membership_declared) = resolve_grid_modes(&client, true, install).await?;
+            assert_eq!(modes.membership, expected, "spec={spec:?}, modes={modes:?}");
+            assert_eq!(membership_declared, declared, "spec={spec:?}, modes={modes:?}");
+            let swim = swim_requested(modes.membership, membership_declared, true);
+            assert!(
+                swim.as_ref()
+                    .is_ok_and(|enabled| *enabled == (expected == Membership::Swim)),
+                "spec={spec:?}, modes={modes:?}, membership_declared={membership_declared}, swim={swim:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_validates_transport_after_network_overrides() -> Result<(), String> {
+        let cli = Cli::try_parse_from(["operator", "--membership-source", "Local", "--grid-signals", "gossip"])
+            .map_err(|error| error.to_string())?;
+        let install = GridModes::without_network(cli.grid.startup_signal_transport(), cli.grid.peer_trust)
+            .with_membership(cli.grid.membership);
+        for (spec, expected) in [
+            (
+                Some(serde_json::json!({"membership": {"mode": "Swim"}, "signalTransport": {"mode": "gossip"}})),
+                Some((Membership::Swim, SignalMode::Gossip)),
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "poll"}})),
+                Some((Membership::Local, SignalMode::Poll)),
+            ),
+            (
+                Some(serde_json::json!({"membership": {"mode": "Local"}, "signalTransport": {"mode": "gossip"}})),
+                None,
+            ),
+            (None, None),
+        ] {
+            let resolved = resolve_grid_modes(&network_modes_client(spec.clone()), true, install).await;
+            if let Some((membership, signal)) = expected {
+                let (modes, declared) = resolved?;
+                assert_eq!(
+                    (modes.membership, modes.signal),
+                    (membership, signal),
+                    "spec={spec:?}, modes={modes:?}"
+                );
+                assert!(
+                    declared,
+                    "spec={spec:?} must override the install's contradictory modes"
+                );
+            } else {
+                assert!(
+                    resolved
+                        .as_ref()
+                        .is_err_and(|error| error.contains("Local membership requires")),
+                    "spec={spec:?} leaves Local/gossip invalid: {resolved:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// An API serving the optional network used to resolve startup modes.
+    fn network_modes_client(spec: Option<serde_json::Value>) -> Client {
+        let items: Vec<_> = spec
+            .into_iter()
+            .map(|spec| {
+                serde_json::json!({
+                    "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetwork",
+                    "metadata": {"name": "grid"}, "spec": spec
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "apiVersion": "grid.praxis.fast/v1alpha1", "kind": "GridNetworkList",
+            "metadata": {}, "items": items
+        })
+        .to_string();
+        Client::new(
+            tower::service_fn(move |_request: http::Request<kube::client::Body>| {
+                let body = body.clone();
+                async move { Ok::<_, std::convert::Infallible>(http::Response::new(axum::body::Body::from(body))) }
+            }),
+            "default",
+        )
+    }
+
+    #[test]
+    fn declared_local_membership_disables_an_installed_swim_listener() {
+        for has_bind in [false, true] {
+            assert!(swim_requested(Membership::Local, true, has_bind).is_ok_and(|enabled| !enabled));
+            assert!(swim_requested(Membership::Swim, true, has_bind).is_ok_and(|enabled| enabled == has_bind));
+        }
+        assert!(
+            swim_requested(Membership::Local, false, true).is_err(),
+            "without a network override, contradictory install settings remain an error"
+        );
+        assert!(swim_requested(Membership::Local, false, false).is_ok_and(|enabled| !enabled));
+    }
+
     #[tokio::test]
     async fn feedback_handler_refuses_every_peer_scope() {
         let client = Client::new(
@@ -3000,6 +4473,8 @@ mod tests {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
+            providers: operator::site_providers::LocalProviders::default(),
+            membership: "Swim",
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
@@ -3042,7 +4517,7 @@ mod tests {
         assert_eq!(
             ages.condition(std::slice::from_ref(&live), "t1", Some(1))
                 .map(|condition| condition.status),
-            Some("True".to_owned()),
+            Some(ConditionStatus::True),
             "a genuinely empty snapshot after convergence clears rejection"
         );
     }
@@ -3127,6 +4602,7 @@ mod tests {
                 fingerprint: operator::signals::leaf_fingerprint(&renewed),
                 spiffe: None,
                 previous: Some(operator::signals::leaf_fingerprint(&replaced)),
+                anchors: None,
             }),
             trust: operator::signals::PeerTrustMode::Pin,
         };
@@ -3156,6 +4632,7 @@ mod tests {
                 fingerprint,
                 spiffe: None,
                 previous: None,
+                anchors: None,
             })
         };
 
@@ -3197,7 +4674,11 @@ mod tests {
 
     /// A listener for site `hub` under `trust`, knowing `east` (pinned to `east_der`) and `west` (no pins).
     fn hub_identity(trust: operator::signals::PeerTrustMode, own: &[u8], east_der: &[u8]) -> SignalsIdentity {
-        let record = |pins: Vec<String>| operator::signals::PeerRecord { labels: gpu(), pins };
+        let record = |pins: Vec<String>| operator::signals::PeerRecord {
+            labels: gpu(),
+            pins,
+            signals: None,
+        };
         let peers = operator::signals::PeerIdentities::new();
         peers.set(BTreeMap::from([
             (
@@ -3212,14 +4693,24 @@ mod tests {
                 fingerprint: operator::signals::leaf_fingerprint(own),
                 spiffe: Some(certs::spiffe_id("hub")),
                 previous: None,
+                anchors: None,
             }),
             trust,
         }
     }
 
+    /// A key pinned for `east` whose leaf names another site is refused, as the poller refuses it.
+    #[test]
+    fn a_pinned_leaf_must_name_the_site_its_pin_picks() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let (own, west) = (site_der("hub"), site_der("west"));
+        // west's leaf, pinned as east's.
+        let pin = hub_identity(operator::signals::PeerTrustMode::Pin, &own, &west);
+        assert_eq!(caller_for(Some(&west), &pin, addr), (Caller::Peer(None), None));
+    }
+
     /// The same callers under both trust modes.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "case table")]
     fn signals_caller_by_trust_mode() {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let (own, east, west, stranger) = (site_der("hub"), site_der("east"), site_der("west"), site_der("nowhere"));
@@ -3259,19 +4750,28 @@ mod tests {
         }
     }
 
-    /// Fresh caps, and a handshake slot for loopback against them.
+    /// Fresh caps, and a handshake slot for loopback against them. `silent` is its own
+    /// tracker, as in the listener, so a test can watch either cap on its own.
     fn handshaking(sources: &SourceSlots, peers: &PeerSlots) -> Handshaking {
+        handshaking_with(sources, &SourceSlots::new(1, 1), peers)
+    }
+
+    /// As [`handshaking`], with the quiet tracker named.
+    fn handshaking_with(sources: &SourceSlots, silent: &SourceSlots, peers: &PeerSlots) -> Handshaking {
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
         Handshaking {
-            source: sources
-                .acquire(std::net::IpAddr::from([127, 0, 0, 1]))
-                .expect("a free slot"),
+            warned: Arc::default(),
+            turn: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("a free turn"),
+            source: sources.acquire(loopback).expect("a free slot"),
+            silent: silent.acquire(loopback).expect("a free quiet slot"),
             peers: peers.clone(),
         }
     }
 
     #[tokio::test(start_paused = true)]
-    #[expect(clippy::too_many_lines, reason = "server TLS setup and a silent client")]
-    async fn a_silent_client_is_dropped_at_the_handshake_timeout() {
+    async fn a_silent_client_is_dropped_before_its_handshake_is_waited_out() {
         let ca = certs::generate_ca("grid-ca").expect("fixture");
         let site = certs::generate_site_cert(&ca, "east").expect("fixture");
         let tls = tls_backend::build_server_config(
@@ -3304,18 +4804,51 @@ mod tests {
             handshaking(&sources, &PeerSlots::new(1, 8)),
             operator::shutdown::Shutdown::never(),
         ));
+        let silent = SourceSlots::new(1, 1);
         tokio::time::timeout(SIGNALS_HANDSHAKE_TIMEOUT * 2, serve)
             .await
-            .expect("released by the handshake bound");
+            .expect("released by the silence bound");
         assert_eq!(
             started.elapsed(),
-            SIGNALS_HANDSHAKE_TIMEOUT,
-            "released exactly at the bound"
+            SIGNALS_SILENT_TIMEOUT,
+            "a connection that sends nothing goes at the silence bound, not the handshake one"
         );
         assert!(
-            sources.acquire(remote.ip()).is_some(),
-            "a failed handshake frees its source slot"
+            SIGNALS_SILENT_TIMEOUT < SIGNALS_HANDSHAKE_TIMEOUT,
+            "silence is the tighter of the two, or this proves nothing"
         );
+        assert_eq!(
+            sources.held(remote.ip()),
+            0,
+            "a dropped connection frees its source slot"
+        );
+        assert_eq!(silent.held(remote.ip()), 0, "and holds no quiet slot once it is gone");
+    }
+
+    #[test]
+    fn the_quiet_cap_is_a_quarter_of_the_handshake_share() {
+        let share = SIGNALS_MAX_HANDSHAKES / 2;
+        let admission = Admission::new(8, share, operator::signals::PeerIdentities::new());
+        let loopback = std::net::IpAddr::from([127, 0, 0, 1]);
+        // The handshake cap is the whole share, which is what a peer set behind one router
+        // needs; the quiet cap is a quarter of it, which is what one slow source gets.
+        let mut held = Vec::new();
+        for _ in 0..share {
+            held.push(admission.sources.acquire(loopback).expect("the share is available"));
+        }
+        assert!(
+            admission.sources.acquire(loopback).is_none(),
+            "the handshake cap stops at the share"
+        );
+        let mut quiet = Vec::new();
+        for _ in 0..(share / 4) {
+            quiet.push(admission.silent.acquire(loopback).expect("a quarter is available"));
+        }
+        assert!(
+            admission.silent.acquire(loopback).is_none(),
+            "the quiet cap stops at a quarter of the share"
+        );
+        assert_eq!(quiet.len() * 4, held.len(), "a quarter, whatever the share is");
     }
 
     /// A rustls client presenting `client` (a Grid-CA site cert) to a server named `east`.
@@ -3383,6 +4916,7 @@ mod tests {
                     fingerprint: operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem)),
                     spiffe: None,
                     previous: None,
+                    anchors: None,
                 }),
                 trust: operator::signals::PeerTrustMode::Pin,
             }
@@ -3396,6 +4930,7 @@ mod tests {
                 operator::signals::PeerRecord {
                     labels: gpu(),
                     pins: vec![operator::signals::leaf_fingerprint(&pem_der(&self.west.cert_pem))],
+                    signals: None,
                 },
             )]));
             SignalsIdentity {
@@ -3473,14 +5008,299 @@ mod tests {
         axum::Router::new().route(operator::signals::SIGNALS_PATH, axum::routing::get(|| async { "ok" }))
     }
 
+    /// A provider served to every site, and one only `tier=gold` sites may read.
+    #[cfg(not(feature = "fips"))]
+    fn open_and_gold() -> operator::site_providers::LocalProviders {
+        let provider = |id: &str, labels: BTreeMap<String, String>| operator::site_providers::WireProvider {
+            network_id: "net".to_owned(),
+            provider_id: id.to_owned(),
+            routing_cluster: id.to_owned(),
+            models: vec!["m".to_owned()],
+            tools: Vec::new(),
+            backend_kind: "local".to_owned(),
+            capacity_weight: 2,
+            phase: crdt::ProviderPhase::Available,
+            match_labels: labels,
+            revision: 1,
+        };
+        let local = operator::site_providers::LocalProviders::default();
+        local.replace(
+            "net",
+            vec![
+                provider("open", BTreeMap::new()),
+                provider("gold", BTreeMap::from([("tier".to_owned(), "gold".to_owned())])),
+            ],
+        );
+        local
+    }
+
+    /// What a site serving [`open_and_gold`] publishes.
+    #[cfg(not(feature = "fips"))]
+    fn serving_providers() -> Published {
+        Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            rounds: operator::signals::PeerRounds::default(),
+            providers: open_and_gold(),
+            membership: "Swim",
+            feedback: operator::gateway_ages::GatewayFeedback::new(
+                stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+                operator::shutdown::Shutdown::never(),
+            ),
+        }
+    }
+
+    /// The real peer client, presenting `west` and trusting the mesh CA.
+    #[cfg(not(feature = "fips"))]
+    fn west_poller(mesh: &Mesh) -> operator::signals::PollPeers {
+        operator::signals::PollPeers {
+            tls: Some(Arc::new(operator::signals::PeerTlsMaterial {
+                ca: mesh.ca.cert_pem.clone().into_bytes(),
+                identity: Some(operator::signals::PeerClientIdentity {
+                    cert: mesh.west.cert_pem.clone().into_bytes(),
+                    key: zeroize::Zeroizing::new(mesh.west.key_pem.clone().into_bytes()),
+                }),
+            })),
+            attempts: 1,
+            ..operator::signals::PollPeers::default()
+        }
+    }
+
+    /// A pinned peer reads over mTLS only the providers its labels admit, through the real client.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn a_peer_reads_only_the_providers_its_labels_admit() {
+        let mesh = Mesh::new();
+        let app = signals_app(serving_providers());
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(mesh.west_is_pinned(), app, (&sources, &peers), 1).await;
+        let poll = west_poller(&mesh);
+        let east = operator::signals::PeerSite {
+            name: "east".to_owned(),
+            url: format!("https://{addr}{}", operator::signals::SIGNALS_PATH),
+            pins: vec![operator::signals::leaf_fingerprint(&pem_der(&mesh.east.cert_pem))],
+            answering: true,
+            alias: None,
+        };
+        let (read, _) = poll.fetch_providers(&east).await.expect("east answered");
+        let ids: Vec<&str> = read.iter().map(|p| p.provider_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["open"],
+            "a tier=gpu peer is served the open provider and not the gold one"
+        );
+        drop(poll);
+        server.await.expect("server task");
+    }
+
+    /// A peer removed while its connection is open is refused on that connection's next
+    /// request, not only when it reconnects.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn a_removed_peer_is_refused_on_its_open_connection() {
+        let mesh = Mesh::new();
+        let identity = mesh.west_is_pinned();
+        let records = identity.peers.clone();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            operator::site_providers::PROVIDERS_PATH,
+            axum::routing::get(move |axum::Extension(caller): axum::Extension<Caller>| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(match caller {
+                    Caller::Peer(Some(_)) => (http::StatusCode::OK, r#"{"providers":[]}"#),
+                    Caller::Peer(None) | Caller::Local => (http::StatusCode::FORBIDDEN, ""),
+                })
+            }),
+        );
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(identity, app, (&sources, &peers), 1).await;
+        let poll = west_poller(&mesh);
+        let east = operator::signals::PeerSite {
+            name: "east".to_owned(),
+            url: format!("https://{addr}{}", operator::signals::SIGNALS_PATH),
+            pins: vec![operator::signals::leaf_fingerprint(&pem_der(&mesh.east.cert_pem))],
+            answering: true,
+            alias: None,
+        };
+        assert!(poll.fetch_providers(&east).await.is_some(), "admitted while named");
+        records.set(BTreeMap::new());
+        assert!(poll.fetch_providers(&east).await.is_none(), "refused once removed");
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the refusal came on the one served connection, not a failed reconnect"
+        );
+        drop(poll);
+        server.await.expect("server task");
+    }
+
+    /// A catalog is read when its named version changes, else only on the schedule.
+    #[test]
+    fn a_catalog_is_read_when_its_version_changes_and_on_schedule_regardless() {
+        assert!(
+            catalog_stale(Some("b"), Some("a"), false),
+            "a new version is read at once"
+        );
+        assert!(catalog_stale(Some("a"), None, false), "a version never read is read");
+        assert!(
+            !catalog_stale(Some("a"), Some("a"), false),
+            "an unchanged version is not re-read between scheduled reads"
+        );
+        assert!(
+            catalog_stale(Some("a"), Some("a"), true),
+            "the schedule re-reads even an unchanged version, the floor under a missed change"
+        );
+        assert!(catalog_stale(None, Some("a"), true), "no version: the schedule decides");
+        assert!(!catalog_stale(None, Some("a"), false), "no version, not due");
+    }
+
+    /// Every signals answer names the catalog version and the producer release.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn a_signals_answer_names_the_catalog_version_and_the_release() {
+        let mesh = Mesh::new();
+        let published = serving_providers();
+        let expected = published
+            .providers
+            .version_for(operator::site_providers::Reader::Peer(&BTreeMap::new()));
+        assert!(expected.is_some(), "a published catalog has a version");
+        let app = signals_app(published);
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(mesh.west_is_pinned(), app, (&sources, &peers), 1).await;
+        let poll = west_poller(&mesh);
+        let east = operator::signals::PeerSite {
+            name: "east".to_owned(),
+            url: format!("https://{addr}{}", operator::signals::SIGNALS_PATH),
+            pins: vec![operator::signals::leaf_fingerprint(&pem_der(&mesh.east.cert_pem))],
+            answering: true,
+            alias: None,
+        };
+        let mut named = None;
+        poll.collect_each(std::slice::from_ref(&east), |_, _, _, stamp| {
+            named = stamp.providers_version;
+        })
+        .await;
+        assert_eq!(named, expected);
+        drop(poll);
+        server.await.expect("server task");
+    }
+
+    /// A site that has not published its providers answers 503, which a reader takes as
+    /// nothing new rather than no providers.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn an_unpublished_catalog_is_not_read_as_empty() {
+        let mesh = Mesh::new();
+        let mut published = serving_providers();
+        published.providers = operator::site_providers::LocalProviders::default();
+        let app = signals_app(published);
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(mesh.west_is_pinned(), app, (&sources, &peers), 1).await;
+        let poll = west_poller(&mesh);
+        let east = operator::signals::PeerSite {
+            name: "east".to_owned(),
+            url: format!("https://{addr}{}", operator::signals::SIGNALS_PATH),
+            pins: vec![operator::signals::leaf_fingerprint(&pem_der(&mesh.east.cert_pem))],
+            answering: true,
+            alias: None,
+        };
+        assert!(
+            poll.fetch_providers(&east).await.is_none(),
+            "a 503 keeps the reader's copy"
+        );
+        drop(poll);
+        server.await.expect("server task");
+    }
+
+    /// Every answer names the serving site's membership mode, and the poller reads it back.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn a_peer_answer_names_its_membership_mode() {
+        let mesh = Mesh::new();
+        let mut published = serving_providers();
+        published.membership = "Local";
+        let app = signals_app(published);
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(mesh.west_is_pinned(), app, (&sources, &peers), 1).await;
+        let poll = west_poller(&mesh);
+        let east = operator::signals::PeerSite {
+            name: "east".to_owned(),
+            url: format!("https://{addr}{}", operator::signals::SIGNALS_PATH),
+            pins: vec![operator::signals::leaf_fingerprint(&pem_der(&mesh.east.cert_pem))],
+            answering: true,
+            alias: None,
+        };
+        let mut named = None;
+        poll.collect_each(std::slice::from_ref(&east), |_, _, _, stamp| named = stamp.membership)
+            .await;
+        assert_eq!(named.as_deref(), Some("Local"));
+        drop(poll);
+        server.await.expect("server task");
+    }
+
+    /// A peer dialled under another name presents that name and is verified by its pins all the same.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn a_peer_behind_a_name_router_is_read_under_its_server_name() {
+        let mesh = Mesh::new();
+        let app = signals_app(serving_providers());
+        let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+        let (addr, server) = mesh.serve(mesh.west_is_pinned(), app, (&sources, &peers), 1).await;
+        let poll = west_poller(&mesh);
+        let east = operator::signals::PeerSite {
+            name: "east".to_owned(),
+            url: format!(
+                "https://east-signals.grid.internal:{}{}",
+                addr.port(),
+                operator::signals::SIGNALS_PATH
+            ),
+            pins: vec![operator::signals::leaf_fingerprint(&pem_der(&mesh.east.cert_pem))],
+            answering: true,
+            alias: Some(("east-signals.grid.internal".to_owned(), addr.ip().to_string())),
+        };
+        let (read, _) = poll
+            .fetch_providers(&east)
+            .await
+            .expect("east answered under its server name");
+        assert_eq!(
+            read.iter().map(|p| p.provider_id.as_str()).collect::<Vec<_>>(),
+            ["open"],
+            "the same scoped read, dialled at the address rather than the name"
+        );
+        drop(poll);
+        server.await.expect("server task");
+    }
+
+    /// An unnamed peer is refused the providers, and this site's own gateway is served them all.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn an_unnamed_peer_is_refused_the_providers_and_local_reads_them_all() {
+        let refused = providers_handler(
+            axum::extract::State(serving_providers()),
+            axum::Extension(Caller::Peer(None)),
+        )
+        .await;
+        assert_eq!(
+            refused.status(),
+            http::StatusCode::FORBIDDEN,
+            "a peer this site holds no record for"
+        );
+        let local = providers_handler(
+            axum::extract::State(serving_providers()),
+            axum::Extension(Caller::Local),
+        )
+        .await;
+        let body = axum::body::to_bytes(local.into_body(), operator::site_providers::MAX_BODY_BYTES)
+            .await
+            .expect("body");
+        let read = operator::site_providers::parse(std::str::from_utf8(&body).expect("utf-8")).expect("parses");
+        assert_eq!(read.len(), 2, "the local gateway is not scoped by access policy");
+    }
+
     /// A renewal rebinds the listener on the new leaf: a peer's open connection keeps
     /// polling across it, and new connections see the renewed leaf.
     #[cfg(not(feature = "fips"))]
     #[tokio::test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "serve, poll, rotate, and poll again read as one scenario"
-    )]
     async fn a_renewal_rebinds_the_listener_without_dropping_a_peer_poll() {
         let mesh = Mesh::new();
         let renewed = certs::generate_site_cert(&mesh.ca, "east").expect("fixture");
@@ -3491,6 +5311,7 @@ mod tests {
                 operator::signals::PeerRecord {
                     labels: gpu(),
                     pins: Vec::new(),
+                    signals: None,
                 },
             )]));
             SignalsIdentity {
@@ -3519,7 +5340,7 @@ mod tests {
                 let server = tokio::spawn(serve_signals_tls(
                     listener,
                     serving,
-                    Admission::new(8),
+                    Admission::new(8, 8, operator::signals::PeerIdentities::new()),
                     changed,
                     operator::shutdown::Shutdown::never(),
                 ));
@@ -3591,8 +5412,9 @@ mod tests {
         let mut conn = mesh.connect(addr).await;
         let head = get(&mut conn).await;
         assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
-        assert!(
-            sources.acquire(std::net::IpAddr::from([127, 0, 0, 1])).is_some(),
+        assert_eq!(
+            sources.held(std::net::IpAddr::from([127, 0, 0, 1])),
+            0,
             "an authenticated connection holds no source slot"
         );
         // Real time for the handshake, virtual time for the idle wait.
@@ -3640,11 +5462,80 @@ mod tests {
         drop(held);
         let same: Vec<PeerSlot> = (0..3).filter_map(|_| peers.acquire("a")).collect();
         assert_eq!(same.len(), 2, "per site");
-        let admission = Admission::new(4);
+        let admission = Admission::new(4, 8, operator::signals::PeerIdentities::new());
         assert_eq!(
             admission.peers.total.available_permits(),
-            SIGNALS_MAX_CONNECTIONS - SIGNALS_LOCAL_RESERVE,
-            "the gateway keeps its reserve"
+            SIGNALS_MAX_CONNECTIONS - SIGNALS_LOCAL_RESERVE - SIGNALS_MAX_HANDSHAKES,
+            "the gateway keeps its reserve, and handshakes their share"
+        );
+    }
+
+    #[test]
+    fn the_connection_cap_grows_with_the_declared_members_up_to_its_ceiling() {
+        let members = operator::signals::PeerIdentities::new();
+        let mut admission = Admission::new(4, 8, members.clone());
+        assert_eq!(admission.capacity, SIGNALS_MAX_CONNECTIONS, "the floor with no members");
+        let declare = |count: usize| {
+            members.set(
+                (0..count)
+                    .map(|n| (format!("site-{n}"), operator::signals::PeerRecord::default()))
+                    .collect(),
+            );
+        };
+        declare(100);
+        let held = admission.admit(([127, 0, 0, 1], 1).into()).expect("admitted");
+        let wanted = 100 * 4 + SIGNALS_LOCAL_RESERVE + SIGNALS_MAX_HANDSHAKES;
+        assert_eq!(admission.capacity, wanted, "every member's share fits");
+        assert_eq!(
+            admission.peers.total.available_permits(),
+            wanted - SIGNALS_LOCAL_RESERVE - SIGNALS_MAX_HANDSHAKES,
+            "peers grow with the cap and keep off the reserve"
+        );
+        drop(held);
+        declare(10);
+        admission.size_for_members();
+        assert_eq!(admission.capacity, wanted, "never shrunk under a held slot");
+        declare(10_000);
+        admission.size_for_members();
+        assert_eq!(
+            admission.capacity, SIGNALS_CONNECTIONS_CEILING,
+            "bounded by the ceiling"
+        );
+    }
+
+    #[test]
+    fn handshakes_never_take_the_slots_authenticated_connections_need() {
+        let mut admission = Admission::new(4, 64, operator::signals::PeerIdentities::new());
+        let held: Vec<_> = (0..=u8::MAX)
+            .filter_map(|n| admission.admit(([10, 0, 1, n], 1).into()))
+            .collect();
+        assert_eq!(held.len(), SIGNALS_MAX_HANDSHAKES, "handshakes stop at their share");
+        assert_eq!(
+            admission.slots.available_permits(),
+            SIGNALS_MAX_CONNECTIONS - SIGNALS_MAX_HANDSHAKES,
+            "the rest stay free for authenticated connections"
+        );
+        drop(held);
+        // Through admit the quiet cap binds first, because a connection has not spoken yet
+        // when it is admitted: one source gets a quarter of the share while it stays quiet.
+        let one_source: Vec<_> = (0..SIGNALS_MAX_HANDSHAKES)
+            .filter_map(|_| admission.admit(([10, 0, 2, 1], 1).into()))
+            .collect();
+        assert_eq!(
+            one_source.len(),
+            SIGNALS_MAX_HANDSHAKES / 8,
+            "a source that has not spoken holds a quarter of the share, whatever its configured cap"
+        );
+        drop(one_source);
+        // The handshake cap itself is still the whole share, which is what a peer set behind
+        // one router needs once its connections speak and give their quiet slots back.
+        let speaking: Vec<_> = (0..SIGNALS_MAX_HANDSHAKES)
+            .filter_map(|_| admission.sources.acquire(std::net::IpAddr::from([10, 0, 2, 1])))
+            .collect();
+        assert_eq!(
+            speaking.len(),
+            SIGNALS_MAX_HANDSHAKES / 2,
+            "one source holds at most half the handshakes, whatever its configured cap"
         );
     }
 
@@ -3883,11 +5774,10 @@ mod tests {
         );
         started.send_replace(SwimStage::Settled(None));
         assert!(settled.await.is_none(), "settled without SWIM");
-        assert!(readiness(&std::sync::atomic::AtomicBool::new(false)).0 == http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(Readiness::default().status().0 == http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one fixture walked through each kind of peer")]
     fn the_first_write_waits_for_every_live_named_peer_to_deliver() {
         let member = |site: &str, status| operator::swim::MemberRecord {
             site_id: site.to_owned(),
@@ -3904,6 +5794,7 @@ mod tests {
         let record = operator::signals::PeerRecord {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
+            signals: None,
         };
         let heard = operator::signals::LoadHeard::default();
         let nothing = crdt::GridStateSnapshot::new("hub".to_owned());
@@ -4023,27 +5914,56 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn rounds_are_spread_apart_and_an_overrun_round_is_followed_at_once() {
+        let interval = std::time::Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let next = round_after(started, interval);
+        assert!(
+            (interval..=interval + interval / 10).contains(&(next - started)),
+            "an interval later, spread by up to a tenth: {:?}",
+            next - started
+        );
+        tokio::time::advance(interval * 3).await;
+        assert_eq!(
+            round_after(started, interval),
+            tokio::time::Instant::now(),
+            "a round that overran is followed now, not by the rounds it missed"
+        );
+    }
+
     #[test]
-    fn handshake_slots_cap_a_source_and_a_global_48() {
+    fn handshake_slots_cap_a_source_and_a_global_48_by_refusing_the_newest() {
         let slots = SourceSlots::new(1, 2);
         let ip = |text: &str| text.parse::<std::net::IpAddr>().expect("ip");
-        let first = slots.acquire(ip("2001:db8:1:1::1"));
-        assert!(first.is_some());
-        assert!(slots.acquire(ip("2001:db8:1:1::ffff")).is_none(), "same /64");
-        let second = slots.acquire(ip("2001:db8:1:2::1"));
-        assert!(second.is_some(), "another /64");
-        assert!(slots.acquire(ip("2001:db8:1:3::1")).is_none(), "the /48 is full");
+        let first = slots.acquire(ip("2001:db8:1:1::1")).expect("first");
+        assert!(
+            slots.acquire(ip("2001:db8:1:1::ffff")).is_none(),
+            "same /64: the newest is refused"
+        );
+        assert_eq!(
+            slots.held(ip("2001:db8:1:1::1")),
+            1,
+            "the handshake in progress is kept"
+        );
+        let second = slots.acquire(ip("2001:db8:1:2::1")).expect("another /64");
+        assert!(
+            slots.acquire(ip("2001:db8:1:3::1")).is_none(),
+            "the /48 is full: the newest is refused"
+        );
         assert!(slots.acquire(ip("2001:db8:2:1::1")).is_some(), "another /48");
-        assert!(
-            slots.acquire(ip("fd00::1")).is_some() && slots.acquire(ip("fd00::2")).is_some(),
-            "ULA per address"
-        );
         drop(first);
-        assert!(
-            slots.acquire(ip("2001:db8:1:3::1")).is_some(),
-            "a released slot frees the /48"
+        assert_eq!(
+            slots.held(ip("2001:db8:1:1::1")),
+            0,
+            "a finished handshake frees its slot"
         );
+        assert!(slots.acquire(ip("2001:db8:1:3::1")).is_some(), "the /48 has room again");
         drop(second);
+        assert!(
+            SourceSlots::new(0, 0).acquire(ip("fd00::1")).is_none(),
+            "a cap of zero admits nothing"
+        );
     }
 
     #[test]
@@ -4077,7 +5997,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "every bind outcome against one fake binder")]
     async fn the_default_bind_falls_back_to_ipv4_without_ipv6() {
         let refuse_v6 = |kind: Option<std::io::ErrorKind>, raw: Option<i32>| {
             move |addr: SocketAddr| {
@@ -4117,7 +6036,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "membership and identities for both trust modes")]
     fn peers_are_polled_only_when_this_site_would_name_them() {
         let member = |site: &str, endpoint: &str| operator::swim::MemberRecord {
             site_id: site.to_owned(),
@@ -4148,6 +6066,7 @@ mod tests {
                 operator::signals::PeerRecord {
                     labels: gpu(),
                     pins: vec!["bb".to_owned()],
+                    signals: None,
                 },
             ),
             (
@@ -4155,6 +6074,7 @@ mod tests {
                 operator::signals::PeerRecord {
                     labels: gpu(),
                     pins: vec!["aa".to_owned()],
+                    signals: None,
                 },
             ),
             (
@@ -4162,12 +6082,19 @@ mod tests {
                 operator::signals::PeerRecord {
                     labels: gpu(),
                     pins: Vec::new(),
+                    signals: None,
                 },
             ),
         ]));
         let names = |trust, encrypted| {
-            poll_targets(&snapshot, &identities, trust, encrypted, "hub", &mut BTreeMap::new())
-                .map(|sites| sites.into_iter().map(|site| site.name).collect::<Vec<_>>())
+            Targeting {
+                identities: &identities,
+                trust,
+                encrypted,
+                local_site: "hub",
+            }
+            .targets(Some(&snapshot), &mut BTreeMap::new())
+            .map(|sites| sites.into_iter().map(|site| site.name).collect::<Vec<_>>())
         };
         let (pin, spiffe) = (
             operator::signals::PeerTrustMode::Pin,
@@ -4187,7 +6114,180 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "three rounds over one remembered set")]
+    fn a_declared_endpoint_is_polled_without_gossip_and_over_a_gossiped_address() {
+        let declared = |address: &str, server_name: Option<&str>, pins: Vec<String>| operator::signals::PeerRecord {
+            labels: BTreeMap::new(),
+            pins,
+            signals: Some(operator::signals::DeclaredSignals {
+                endpoint: operator::signals::SignalsEndpoint::parse(address).expect("endpoint"),
+                server_name: server_name.map(str::to_owned),
+            }),
+        };
+        let pinned = || vec!["aa".to_owned()];
+        let identities = operator::signals::PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            (
+                "east".to_owned(),
+                declared("router.example.com:443", Some("east-signals.grid.internal"), pinned()),
+            ),
+            ("west".to_owned(), declared("10.0.0.3:9443", None, pinned())),
+            ("hub".to_owned(), declared("10.0.0.1:9443", None, pinned())),
+            ("unpinned".to_owned(), declared("10.0.0.4:9443", None, Vec::new())),
+        ]));
+        let mut remembered = BTreeMap::new();
+        let round = |snapshot: Option<&operator::swim::MembershipSnapshot>, memory: &mut BTreeMap<_, _>| {
+            Targeting {
+                identities: &identities,
+                trust: operator::signals::PeerTrustMode::Pin,
+                encrypted: false,
+                local_site: "hub",
+            }
+            .targets(snapshot, memory)
+            .map(|sites| {
+                sites
+                    .into_iter()
+                    .map(|site| (site.name.clone(), site))
+                    .collect::<BTreeMap<_, _>>()
+            })
+        };
+        let sites = round(None, &mut remembered).expect("declared peers are polled without SWIM");
+        assert_eq!(
+            sites.keys().collect::<Vec<_>>(),
+            ["east", "west"],
+            "not this site, not an unpinned one"
+        );
+        let east = sites.get("east").expect("east");
+        assert_eq!(east.url, "https://east-signals.grid.internal:443/v1/site/signals");
+        assert_eq!(east.alias(), Some(("east-signals.grid.internal", "router.example.com")));
+        assert_eq!(east.pins, pinned());
+        let west = sites.get("west").expect("west");
+        assert_eq!(west.url, "https://10.0.0.3:9443/v1/site/signals");
+        assert_eq!(west.alias(), None);
+
+        let snapshot = operator::swim::MembershipSnapshot {
+            members: vec![operator::swim::MemberRecord {
+                site_id: "west".to_owned(),
+                endpoint: "10.0.0.9:7946".to_owned(),
+                incarnation: 0,
+                status: operator::swim::MemberStatus::Alive,
+                age_secs: 0,
+                gateway_address: None,
+                site_cert_pem: None,
+                signals_address: Some("10.0.0.9:9443".to_owned()),
+            }],
+        };
+        let with_gossip = round(Some(&snapshot), &mut remembered).expect("peers");
+        assert_eq!(
+            with_gossip.get("west").map(|site| site.url.as_str()),
+            Some("https://10.0.0.3:9443/v1/site/signals"),
+            "a declared address wins over a gossiped one"
+        );
+
+        // SPIFFE trust waits for encrypted gossip before reading gossiped addresses; a declared
+        // address is admitted by the local object, so it is polled over plaintext gossip or none.
+        let spiffe = Targeting {
+            identities: &identities,
+            trust: operator::signals::PeerTrustMode::Spiffe,
+            encrypted: false,
+            local_site: "hub",
+        };
+        let declared_only = spiffe
+            .targets(Some(&snapshot), &mut BTreeMap::new())
+            .expect("declared peers are polled under SPIFFE without encrypted gossip");
+        assert_eq!(
+            declared_only.iter().map(|site| site.name.as_str()).collect::<Vec<_>>(),
+            ["east", "unpinned", "west"],
+            "every declared peer with a record, pins or not, and nothing from gossip"
+        );
+
+        identities.set(BTreeMap::new());
+        assert!(
+            round(None, &mut remembered).is_none(),
+            "nothing declared and no gossip is nothing to poll"
+        );
+    }
+
+    #[test]
+    fn a_failed_network_write_is_retried_though_the_next_round_judges_the_same() {
+        assert!(write_due(None, &1), "the last write did not land");
+        assert!(write_due(Some(&1), &2), "the verdict changed");
+        assert!(!write_due(Some(&1), &1), "unchanged and written");
+    }
+
+    #[test]
+    fn a_local_round_with_only_endpoint_less_peers_still_reports_them() {
+        let identities = operator::signals::PeerIdentities::new();
+        identities.set(BTreeMap::from([(
+            "east".to_owned(),
+            operator::signals::PeerRecord::default(),
+        )]));
+        let targets = Targeting {
+            identities: &identities,
+            trust: operator::signals::PeerTrustMode::Spiffe,
+            encrypted: true,
+            local_site: "hub",
+        }
+        .targets(None, &mut BTreeMap::new());
+        assert!(targets.is_none(), "nothing to poll");
+        assert!(
+            idle_round(Membership::Local, identities.loaded()),
+            "yet the round runs, so east reads EgressOnly and a removed endpoint is cleared"
+        );
+        assert!(
+            !idle_round(Membership::Local, operator::signals::PeerIdentities::new().loaded()),
+            "before the peers are read, the round waits for them"
+        );
+        assert!(
+            !idle_round(Membership::Swim, true),
+            "under Swim gossip drives the round"
+        );
+    }
+
+    #[test]
+    fn this_site_never_polls_itself_though_its_own_grid_site_declares_an_endpoint() {
+        let declared = |host: &str| operator::signals::PeerRecord {
+            labels: BTreeMap::new(),
+            pins: vec!["aa".to_owned()],
+            signals: operator::signals::SignalsEndpoint::parse(&format!("{host}:9443")).map(|endpoint| {
+                operator::signals::DeclaredSignals {
+                    endpoint,
+                    server_name: None,
+                }
+            }),
+        };
+        let identities = operator::signals::PeerIdentities::new();
+        identities.set(BTreeMap::from([
+            ("hub".to_owned(), declared("hub.example.com")),
+            ("east".to_owned(), declared("east.example.com")),
+        ]));
+        let gossip = |site: &str| operator::swim::MemberRecord {
+            site_id: site.to_owned(),
+            endpoint: format!("{site}.example.com:7946"),
+            incarnation: 0,
+            status: operator::swim::MemberStatus::Alive,
+            age_secs: 0,
+            gateway_address: None,
+            site_cert_pem: None,
+            signals_address: Some(format!("{site}.example.com:9443")),
+        };
+        let snapshot = operator::swim::MembershipSnapshot {
+            members: vec![gossip("hub"), gossip("east")],
+        };
+        let polled: Vec<String> = Targeting {
+            identities: &identities,
+            trust: operator::signals::PeerTrustMode::Pin,
+            encrypted: false,
+            local_site: "hub",
+        }
+        .targets(Some(&snapshot), &mut BTreeMap::new())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|site| site.name)
+        .collect();
+        assert_eq!(polled, ["east"], "declared and gossiped alike, the own site is skipped");
+    }
+
+    #[test]
     fn a_peer_swim_lost_is_still_polled_while_its_grid_site_names_it() {
         let member = |site: &str, endpoint: &str, status| operator::swim::MemberRecord {
             site_id: site.to_owned(),
@@ -4204,6 +6304,7 @@ mod tests {
         let record = || operator::signals::PeerRecord {
             labels: BTreeMap::new(),
             pins: vec!["aa".to_owned()],
+            signals: None,
         };
         let identities = operator::signals::PeerIdentities::new();
         identities.set(BTreeMap::from([
@@ -4213,14 +6314,13 @@ mod tests {
         let mut remembered = BTreeMap::new();
         let mut round = |members| {
             let snapshot = operator::swim::MembershipSnapshot { members };
-            poll_targets(
-                &snapshot,
-                &identities,
-                operator::signals::PeerTrustMode::Pin,
-                false,
-                "hub",
-                &mut remembered,
-            )
+            Targeting {
+                identities: &identities,
+                trust: operator::signals::PeerTrustMode::Pin,
+                encrypted: false,
+                local_site: "hub",
+            }
+            .targets(Some(&snapshot), &mut remembered)
             .unwrap_or_default()
             .into_iter()
             .map(|site| (site.name, site.url))
@@ -4231,7 +6331,7 @@ mod tests {
 
         assert_eq!(
             round(vec![dead(), alive()]),
-            [west.clone(), east.clone()],
+            [east.clone(), west.clone()],
             "a dead member is polled"
         );
         assert_eq!(
@@ -4254,6 +6354,7 @@ mod tests {
             url: format!("https://{name}:9443/v1/site/signals"),
             pins: Vec::new(),
             answering: true,
+            alias: None,
         };
         let unanswered: BTreeSet<String> = ["a", "b", "c"].iter().map(|name| (*name).to_owned()).collect();
         let order = |turn| {
@@ -4280,6 +6381,7 @@ mod tests {
                     url: format!("https://{name}:9443/v1/site/signals"),
                     pins: Vec::new(),
                     answering: true,
+                    alias: None,
                 })
                 .collect();
             order_targets(&mut sites, &unanswered, turn);
@@ -4390,6 +6492,7 @@ mod tests {
             operator::signals::PeerRecord {
                 labels: gpu(),
                 pins: Vec::new(),
+                signals: None,
             },
         )]));
         Serving {
@@ -4415,7 +6518,7 @@ mod tests {
         let held = Arc::clone(&slots).try_acquire_owned().expect("a slot");
 
         let waiting = tokio::time::Instant::now();
-        drain_connections(&slots).await;
+        drain_connections(&slots, SIGNALS_MAX_CONNECTIONS).await;
         assert!(
             waiting.elapsed() >= SHUTDOWN_GRACE,
             "a peer mid-answer must hold the drain open"
@@ -4423,11 +6526,97 @@ mod tests {
 
         drop(held);
         let idle = tokio::time::Instant::now();
-        drain_connections(&slots).await;
+        drain_connections(&slots, SIGNALS_MAX_CONNECTIONS).await;
         assert!(
             idle.elapsed() < SHUTDOWN_GRACE,
             "with nothing open the drain must not wait out the grace"
         );
+    }
+
+    /// Stand-down answers not ready before any worker sees the signal, and a startup that
+    /// finishes later cannot make it ready again.
+    #[tokio::test]
+    async fn stand_down_answers_not_ready_before_workers_stop() {
+        let ready = Arc::new(Readiness::default());
+        ready.mark_started();
+        assert_eq!(ready.status().0, http::StatusCode::OK);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let observed = Arc::clone(&ready);
+        let worker = tokio::spawn(async move {
+            shutdown.triggered().await;
+            observed.status()
+        });
+        begin_stand_down(&trigger, &ready);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("the worker saw the signal")
+            .expect("worker task");
+        assert_eq!(seen, (http::StatusCode::SERVICE_UNAVAILABLE, "stopping"));
+        ready.mark_started();
+        assert_eq!(
+            ready.status().0,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "stays stopping"
+        );
+    }
+
+    /// The SWIM restart stands down as a SIGTERM does, and only once the address appears.
+    #[tokio::test]
+    async fn the_swim_restart_stands_down_in_order() {
+        let ready = Arc::new(Readiness::default());
+        ready.mark_started();
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let stand_down = StandDown {
+            trigger: Arc::new(trigger),
+            ready: Arc::clone(&ready),
+            routes: HolderRouting::default(),
+        };
+        restart_when(std::future::ready(false), stand_down.clone()).await;
+        assert_eq!(ready.status().0, http::StatusCode::OK, "no address, no restart");
+        assert!(!shutdown.is_triggered(), "no address, no restart");
+        restart_when(std::future::ready(true), stand_down).await;
+        assert_eq!(ready.status(), (http::StatusCode::SERVICE_UNAVAILABLE, "stopping"));
+        assert!(shutdown.is_triggered(), "the workers are asked to stop");
+    }
+
+    /// While an answer still holds the drain open, a new connection is refused at once rather
+    /// than left in the backlog.
+    #[cfg(not(feature = "fips"))]
+    #[tokio::test]
+    async fn the_drain_refuses_new_connections_at_once() {
+        let mesh = Mesh::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let addr = listener.local_addr().expect("fixture");
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let admission = Admission::new(8, 8, operator::signals::PeerIdentities::new());
+        // Stands in for a connection mid-answer, which holds the drain.
+        let answering = Arc::clone(&admission.slots).acquire_owned().await.expect("slot");
+        let server = tokio::spawn(serve_signals_tls(
+            listener,
+            serving_for(&mesh),
+            admission,
+            std::future::pending(),
+            shutdown,
+        ));
+        let mut polling = mesh.connect(addr).await;
+        assert!(get(&mut polling).await.starts_with(b"HTTP/1.1 200"), "serves before");
+
+        trigger.trigger();
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while tokio::net::TcpStream::connect(addr).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(refused.is_ok(), "a new connection is refused within 2s of the signal");
+        assert!(!server.is_finished(), "refused while an answer still holds the drain");
+
+        drop(answering);
+        tokio::time::timeout(SHUTDOWN_GRACE, server)
+            .await
+            .expect("the drain ends once the answer does")
+            .expect("server task")
+            .expect("the listener stands down cleanly");
     }
 
     /// The signal closes the listener, where before only SIGKILL did.
@@ -4441,7 +6630,7 @@ mod tests {
         let server = tokio::spawn(serve_signals_tls(
             listener,
             serving_for(&mesh),
-            Admission::new(8),
+            Admission::new(8, 8, operator::signals::PeerIdentities::new()),
             std::future::pending(),
             shutdown,
         ));
@@ -4477,22 +6666,186 @@ mod tests {
         assert!(settled(&rx).is_none(), "settled without a runtime carries no handle");
     }
 
+    /// An apiserver that routes one holder slice, then never answers again.
+    fn routes_then_hangs() -> Arc<operator::holder_route::HolderRoutes> {
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let seen = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let respond = |code: u16, body: serde_json::Value| {
+                    http::Response::builder()
+                        .status(code)
+                        .body(kube::client::Body::from(body.to_string().into_bytes()))
+                        .expect("response")
+                };
+                match seen {
+                    0 => Ok::<_, std::convert::Infallible>(respond(
+                        404,
+                        serde_json::json!({"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}),
+                    )),
+                    1 => Ok(respond(
+                        200,
+                        serde_json::json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"signals","namespace":"grid","uid":"u"},"spec":{"ports":[{"name":"signals","port":9091}]}}),
+                    )),
+                    2 => {
+                        drop(request);
+                        Ok(respond(
+                            200,
+                            serde_json::json!({"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"signals-holder","resourceVersion":"1"},"addressType":"IPv4","endpoints":[]}),
+                        ))
+                    },
+                    _ => std::future::pending().await,
+                }
+            }
+        });
+        let me = operator::holder_route::Me {
+            address: "10.0.0.1".parse().expect("address"),
+            pod: "a".to_owned(),
+            node: None,
+        };
+        Arc::new(operator::holder_route::HolderRoutes::new(
+            &Client::new(service, "grid"),
+            vec!["signals".to_owned()],
+            me,
+            BTreeMap::new(),
+        ))
+    }
+
+    /// Having lost the lease, every writer is told to stop before any slice write, so one that
+    /// hangs cannot keep a writer running past the moment a successor may take over.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_stops_the_writers_before_routing_away() {
+        let routes = routes_then_hangs();
+        let routing = routes.route_when(std::future::ready("test"), operator::leader::Holding::unelected());
+        drop(tokio::time::timeout(std::time::Duration::from_millis(50), routing).await);
+        let (trigger, shutdown) = operator::shutdown::Trigger::new();
+        let ready = Arc::new(Readiness::default());
+        ready.mark_started();
+        let stand_down = StandDown {
+            trigger: Arc::new(trigger),
+            ready: Arc::clone(&ready),
+            routes: HolderRouting {
+                signals: Some(routes),
+                swim: None,
+            },
+        };
+        let standing_down = tokio::spawn(stand_down.begin_lost());
+        let stopped = tokio::time::timeout(std::time::Duration::from_millis(10), shutdown.triggered()).await;
+        assert!(stopped.is_ok(), "the writers are told to stop at once");
+        assert_eq!(ready.status().0, http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!standing_down.is_finished(), "while the slice write still hangs");
+        assert!(
+            operator::leader::RENEW_DEADLINE < operator::leader::LEASE_DURATION,
+            "a lost holder stops before a candidate could take the lease"
+        );
+        standing_down.abort();
+    }
+
+    /// An identity renewal under way holds the lease until it finishes, whether the stand-down
+    /// began on a signal or on a lost lease.
+    #[tokio::test(start_paused = true)]
+    async fn a_renewal_under_way_holds_the_lease_release_on_either_path() {
+        for lost in [false, true] {
+            let (trigger, shutdown) = operator::shutdown::Trigger::new();
+            let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
+            let (renewal_done_tx, renewal_done) = operator::shutdown::Trigger::new();
+            let (_swim_tx, swim) = tokio::sync::watch::channel(SwimStage::Settled(None));
+            let (left_tx, left) = operator::shutdown::Trigger::new();
+            // The renewal loop with a Secret write in flight: it returns only once the write lands.
+            let (write_lands, landed) = tokio::sync::oneshot::channel::<()>();
+            let renewal_stop = shutdown.clone();
+            let renewal = tokio::spawn(async move {
+                renewal_stop.triggered().await;
+                drop(landed.await);
+                drop(renewal_done_tx);
+            });
+            let standing_down = tokio::spawn(stand_down(shutdown, (writers_done, renewal_done), swim, left_tx));
+            let begin = StandDown {
+                trigger: Arc::new(trigger),
+                ready: Arc::new(Readiness::default()),
+                routes: HolderRouting::default(),
+            };
+            if lost {
+                begin.begin_lost().await;
+            } else {
+                begin.begin().await;
+            }
+            drop(writers_done_tx);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert!(
+                !left.is_triggered(),
+                "lost={lost}: the lease is held while the renewal writes"
+            );
+            let _sent = write_lands.send(());
+            renewal.await.expect("renewal task");
+            tokio::task::yield_now().await;
+            assert!(left.is_triggered(), "lost={lost}: released once the write has landed");
+            tokio::time::advance(SHUTDOWN_GRACE).await;
+            standing_down.await.expect("stand-down task");
+        }
+    }
+
+    /// A start that may succeed on another try is retried; a pending address or a bad setting is not.
+    #[test]
+    fn only_a_swim_start_that_may_succeed_again_is_retried() {
+        for reason in ["AdvertiseAddressUnresolved", "RevisionLeaseFailed", "StartFailed"] {
+            assert!(SwimFailure::new(reason, "x").retried(), "{reason}");
+        }
+        for reason in [
+            "AdvertiseAddressPending",
+            "AdvertiseAddressUnspecified",
+            "BindAddressInvalid",
+            "KeyInvalid",
+            "MembershipConflict",
+        ] {
+            assert!(!SwimFailure::new(reason, "x").retried(), "{reason}");
+        }
+        assert_eq!(
+            swim_cleared("grid").pointer("/status/conditions"),
+            Some(&serde_json::json!([])),
+            "clearing applies no conditions under the Swim manager"
+        );
+    }
+
+    /// SWIM that cannot start reads False with its cause, and running SWIM reads True.
+    #[test]
+    fn the_swim_condition_names_its_cause() {
+        let pending = SwimFailure::new("AdvertiseAddressPending", "no SWIM advertise address within 180s");
+        let down = swim_condition(Some(&pending), "t", Some(2));
+        assert_eq!(
+            (down.type_.as_str(), down.status.as_str(), down.reason.as_str()),
+            ("Swim", "False", "AdvertiseAddressPending")
+        );
+        assert!(down.message.contains("no SWIM advertise address"), "{}", down.message);
+        assert_eq!(down.observed_generation, Some(2));
+        let up = swim_condition(None, "t", None);
+        assert_eq!(
+            (up.status.as_str(), up.reason.as_str()),
+            ("True", "Swim"),
+            "True names the type"
+        );
+    }
+
     /// Stand-down cannot start its leave grace until every state writer has stopped.
     #[tokio::test(start_paused = true)]
     async fn stand_down_waits_for_writers_before_the_grace() {
         let (shutdown_tx, shutdown) = operator::shutdown::Trigger::new();
         let (writers_done_tx, writers_done) = operator::shutdown::Trigger::new();
         let (_swim_tx, swim) = tokio::sync::watch::channel(SwimStage::Settled(None));
-        let standing_down = tokio::spawn(stand_down(shutdown, writers_done, swim));
+        let (left_tx, left) = operator::shutdown::Trigger::new();
+        let (_, no_renewal) = operator::shutdown::Trigger::new();
+        let standing_down = tokio::spawn(stand_down(shutdown, (writers_done, no_renewal), swim, left_tx));
 
         shutdown_tx.trigger();
         tokio::time::advance(SHUTDOWN_GRACE * 2).await;
         tokio::task::yield_now().await;
         assert!(!standing_down.is_finished(), "writers hold the leave barrier");
+        assert!(!left.is_triggered(), "the lease stays while a writer may run");
 
         writers_done_tx.trigger();
         tokio::task::yield_now().await;
         assert!(!standing_down.is_finished(), "the grace begins only after writers stop");
+        assert!(left.is_triggered(), "the lease goes before the grace");
         tokio::time::advance(SHUTDOWN_GRACE).await;
         standing_down.await.expect("stand-down task");
     }
@@ -4610,6 +6963,8 @@ mod tests {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
             rounds: operator::signals::PeerRounds::default(),
+            providers: operator::site_providers::LocalProviders::default(),
+            membership: "Swim",
             feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
@@ -4962,6 +7317,8 @@ mod tests {
                 site: operator::signals::SignalStore::new(),
                 peers: operator::signals::SignalStore::new(),
                 rounds: operator::signals::PeerRounds::default(),
+                providers: operator::site_providers::LocalProviders::default(),
+                membership: "Swim",
                 feedback,
             })
         }
@@ -5000,14 +7357,22 @@ mod tests {
                 .iter()
                 .find(|held| held.type_ == "PeerTimeValid")
                 .expect("peer condition preserved");
-            assert_eq!(peer.status, "False", "gateway publication cannot recover the peer");
+            assert_eq!(
+                peer.status,
+                ConditionStatus::False,
+                "gateway publication cannot recover the peer"
+            );
             assert_eq!(peer.reason, "TimestampOutOfRange", "peer reason preserved");
             let gateway = status
                 .conditions
                 .iter()
                 .find(|held| held.type_ == "GatewayAgesRejected")
                 .expect("gateway condition persisted");
-            assert_eq!(gateway.status, "True", "fresh gateway rejection persisted");
+            assert_eq!(
+                gateway.status,
+                ConditionStatus::True,
+                "fresh gateway rejection persisted"
+            );
             assert_eq!(status.gateway_age_reports.len(), 1, "one durable reporter");
             assert!(
                 status

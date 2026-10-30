@@ -941,7 +941,6 @@ mod tests {
 
     /// A `KServe` EPP exposition for pool `qwen3-kserve`, in the label sets the lab EPP emits:
     /// `served` streaming requests answered, about 104 usage reports each.
-    #[expect(clippy::too_many_lines, reason = "one exposition, line for line")]
     fn kserve_epp_exposition(served: f64, ready: f64) -> String {
         let l = r#"fairness_id="default-flow",model_name="qwen3",priority="0",target_model_name="qwen3""#;
         let (b01, b05, b1) = (served * 0.2, served * 0.6, served * 0.9);
@@ -981,7 +980,6 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "two scrapes and every published series")]
     fn a_kserve_epp_scrape_publishes_latency_and_republishes_gauges_only() {
         let readiness = crate::readiness::ReadinessStore::default();
         let mut mc = mc_with_queue("llm_d_epp_average_running_requests");
@@ -1410,19 +1408,15 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     #[tokio::test]
     async fn provider_signal_scrapes_are_bounded_at_sixteen() {
         let (endpoint, peak_connections) = start_bounded_test_server(ok_response("bounded_queue 0.1\n"), 17, 16).await;
+        let mut metrics = mc_with_queue("bounded_queue");
+        metrics.timeout = "10s".to_owned();
         let providers: Vec<_> = (0..17)
-            .map(|index| {
-                provider_fixture(
-                    &format!("provider-{index}"),
-                    &endpoint,
-                    Some(mc_with_queue("bounded_queue")),
-                )
-            })
+            .map(|index| provider_fixture(&format!("provider-{index}"), &endpoint, Some(metrics.clone())))
             .collect();
         let readiness = crate::readiness::ReadinessStore::default();
 
         let collected = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(15),
             collect_provider_signals("net", &providers, None, &readiness),
         )
         .await;
@@ -1708,7 +1702,6 @@ llm_d_epp_request_error_total{{{l},error_code="503"}} {errors}
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "cache seeding + assertion")]
     async fn stale_cache_used_within_ttl_on_scrape_failure() {
         // Seed the cache with a known good sample from T=0.
         let t0 = Instant::now();

@@ -1,5 +1,7 @@
 gridNetwork:
   name: grid
+  # -- Set once. Under Argo CD, set this to status.gridId before the operator copies it into
+  # spec, or the empty value fights the copy; see docs/installation/migration-0.3.x.md.
   gridId: ""
   # -- Create a GridSite for each SWIM peer and route to them. Unset, it is on when peers
   # are listed, else off, which keeps the clusterName overlay of existing networks.
@@ -32,9 +34,19 @@ gridNetwork:
   # signalTransport:
   #   mode: poll
   # -- Grid-wide peer trust: pin (default) or spiffe. The operator applies it at
-  # startup and, under poll, restarts itself when it changes.
+  # startup and, under poll, restarts itself when it changes. signedState: enforce
+  # signs state; set it at every site together.
   # peerTrust:
   #   mode: spiffe
+  #   signedState: enforce
+
+# -- Grid-wide settings shared with the other grid charts.
+grid:
+  membership:
+    # -- Where this site learns its members, Swim or Local, as the grid-operator chart's
+    # grid.membership.source. Writes GridNetwork.spec.membership.mode. Local writes poll signals and no discovery or SWIM key to the
+    # GridNetwork, and every peer is polled at the endpoint derived from its address.
+    source: Swim
 
 gridSite:
   name: ""
@@ -42,12 +54,15 @@ gridSite:
   zone: ""
   providerSiteLabel: ""
 
-# -- Remote sites this site trusts, keyed by site name, one GridSite <network>-<name>
-# each, the name the operator gives a peer it discovers. Listing peers also turns on
-# site discovery and the TLS Secrets the operator writes, unless those are set.
-# address is the peer gateway the operator probes, verifying serverName (default
-# <name>.grid.internal). digest pins the peer's leaf. To rotate, set nextDigest to the
-# new digest, then move it to digest once the peer is Active.
+# -- Remote sites this site trusts, keyed by site name, one GridSite each: <network>-<name>
+# under Swim, the name SWIM discovery gives the peer, or <name> under Local. Listing peers also turns on site discovery and the TLS Secrets the operator
+# writes, unless those are set. address is the peer gateway the operator probes,
+# verifying serverName, which must be <name>.grid.internal, the default. The peer's signals are polled at
+# the same host, under server name <name>-signals.grid.internal, so each site puts its
+# gateway and signals behind one router or one load balancer, unless signalsEndpoint
+# says otherwise: address (host:port), serverName and port, each optional.
+# digest pins the peer's leaf. To rotate, set nextDigest to the new digest, then move
+# it to digest once the peer is Active.
 peers: {}
 #   site-a:
 #     address: 203.0.113.20:8080

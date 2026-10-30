@@ -168,12 +168,36 @@ const (
 	TransportModePlaintext TransportMode = "plaintext"
 )
 
+// GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter is a string enumeration.
+type GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter string
+
+const (
+	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterIntelligentRoute GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "intelligentRoute"
+	GridNetworkConsumerGatewaysItemPraxisConfigSiteRouterGridSiteRoute    GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter = "gridSiteRoute"
+)
+
+// GridNetworkMembershipMode is a string enumeration.
+type GridNetworkMembershipMode string
+
+const (
+	GridNetworkMembershipModeSWIM  GridNetworkMembershipMode = "Swim"
+	GridNetworkMembershipModeLocal GridNetworkMembershipMode = "Local"
+)
+
 // PeerTrustMode is a string enumeration.
 type PeerTrustMode string
 
 const (
 	PeerTrustModePin    PeerTrustMode = "pin"
 	PeerTrustModeSpiffe PeerTrustMode = "spiffe"
+)
+
+// GridNetworkPeerTrustSignedState is a string enumeration.
+type GridNetworkPeerTrustSignedState string
+
+const (
+	GridNetworkPeerTrustSignedStateOff     GridNetworkPeerTrustSignedState = "off"
+	GridNetworkPeerTrustSignedStateEnforce GridNetworkPeerTrustSignedState = "enforce"
 )
 
 // PlacementStrategy is a string enumeration.
@@ -449,7 +473,7 @@ type GridNetworkBudgetPolicy struct {
 
 // GatewayCASecretRef Optional gateway-namespace Secret supplying a custom CA bundle for tls transport. Specify only its name and optional key; the Secret must be in the namespace named by the containing GatewayRef. The mounted path is /run/secrets/grid-backend-ca/{secret-name}/{key}; the key defaults to ca.crt. Omitted uses the process trust store.
 type GatewayCASecretRef struct {
-	// Optional key containing the CA bundle. Defaults to ca.crt.
+	// Optional key containing the CA bundle. Defaults to ca.crt. A Secret key: no /, not . or .., and not starting with ...
 	Key *string `json:"key,omitempty"`
 	// Secret name in the target gateway namespace.
 	Name string `json:"name"`
@@ -480,9 +504,9 @@ type GridNetworkConsumerGatewaysItemPraxisConfigClusterEndpointsItem struct {
 	Transport *EndpointTransport `json:"transport,omitempty"`
 }
 
-// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 type GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology struct {
-	// Routing identities whose declarations this gateway derives from.
+	// Remote routing identities this gateway derives a hop for without a member catalog, as under SWIM membership.
 	// Each entry is a provider's clusterName, or its metadata.name when that is unset. At most 64 entries, each named once.
 	FromProviders []string `json:"fromProviders,omitempty"`
 	// TLS for derived local https backends. Omitted uses the endpoint host and the process trust store.
@@ -521,7 +545,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfigTelemetry struct {
 }
 
 // GridNetworkConsumerGatewaysItemPraxisConfig Opt-in configuration for operator-managed consumer Praxis config generation.
-// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the inference-model intelligent_route candidates (with credential secretRef data), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
+// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the routing filter siteRouter selects, intelligent_route or grid_site_route, a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
 // The generated ConfigMap contains no token bytes. Credential-bearing overlays are withheld until the consumer has explicitly declared that its compatible filter config is already running.
 type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// Endpoint topology for the generated load_balancer section.
@@ -537,7 +561,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// In projected-credential mode, mount each Secret at {credentialMountPath}/{secret-namespace}/{secret-name} with its data keys as files. Static file: entries continue to use their explicit paths and are not constrained by this directory layout.
 	// Default: /run/secrets/grid-credentials.
 	CredentialMountPath string `json:"credentialMountPath,omitempty"`
-	// Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+	// Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 	DeriveTopology *GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology `json:"deriveTopology,omitempty"`
 	// Generate the dynamic credential_inject filter and projected mount root, including when the current overlay has no credentials. Enable this first, then roll out the generated config before asserting readiness with supportsProjectedCredentials.
 	// Default: false.
@@ -552,6 +576,10 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// Opt in to validating Secret references and reconciling required mounts into a specifically delegated gateway Deployment.
 	// Disabled by default. When enabled, the named Deployment must carry the grid.praxis-proxy.io/mount-reconciliation, .../network, and .../gateway annotations emitted by charts/praxis-gateway (or set them explicitly on an externally managed Deployment).
 	MountReconciliation *GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation `json:"mountReconciliation,omitempty"`
+	// The filter that picks a candidate for each request.
+	// gridSiteRoute reads the serving config, so it needs the operator's poll signal transport. It also needs an enabled mountReconciliation, whose rollout per config revision re-reads the provider-hop backends, and an empty providerHopEndpoints, since hops follow clusterEndpoints. Every cluster is health-checked, so the gateway's readiness probe must ask Praxis /healthy: /ready fails while any one site is down.
+	// Default: intelligentRoute.
+	SiteRouter GridNetworkConsumerGatewaysItemPraxisConfigSiteRouter `json:"siteRouter,omitempty"`
 	// Declare that the running consumer has the dynamic credential_inject filter configured with the projected Secret mount root. This is a fail-closed capability gate for credential-bearing overlay revisions. Set it only after the consumer has loaded a config containing that filter; the Grid operator does not own or roll out the consumer Deployment.
 	// Default: false.
 	SupportsProjectedCredentials bool `json:"supportsProjectedCredentials,omitempty"`
@@ -581,15 +609,18 @@ type GridNetworkConsumerGatewaysItemProviderHopEndpointsItem struct {
 
 // GridNetworkConsumerGatewaysItem Reference to a Praxis Gateway that participates in this grid.
 type GridNetworkConsumerGatewaysItem struct {
+	// Model-discovery contract version supported by the running gateway.
+	// Set this only after the gateway is running an image that understands the expires_at routing-candidate field and enforces its deadline. The operator includes discovered model candidates only when this is exactly v1; absent or other values keep dynamic candidates withheld.
+	ModelDiscoveryContractVersion *string `json:"modelDiscoveryContractVersion,omitempty"`
 	// Gateway name.
 	Name string `json:"name"`
 	// Gateway namespace.
 	Namespace string `json:"namespace"`
 	// Opt-in configuration for operator-managed consumer Praxis config generation.
-	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the inference-model intelligent_route candidates (with credential secretRef data), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
+	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the routing filter siteRouter selects, intelligent_route or grid_site_route, a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
 	// The generated ConfigMap contains no token bytes. Credential-bearing overlays are withheld until the consumer has explicitly declared that its compatible filter config is already running.
 	PraxisConfig *GridNetworkConsumerGatewaysItemPraxisConfig `json:"praxisConfig,omitempty"`
-	// Explicit mTLS provider-hop endpoints for the embedded grid-gateway serving config. This allowlist is independent of praxisConfig, so a missing or disabled generated Praxis config cannot alter embedded serving behavior. Every entry must declare mutual_tls and a nonblank SNI. The embedded gateway compares each declaration against the loaded Praxis load-balancer's verified mTLS backend before it sends provider-hop context. Changing Praxis backend transport requires a gateway restart while gridServing is enabled.
+	// Explicit mTLS provider-hop endpoints for the embedded grid-gateway serving config. With the default praxisConfig.siteRouter intelligentRoute this allowlist is independent of praxisConfig, so a missing or disabled generated Praxis config cannot alter embedded serving behavior. With gridSiteRoute the hops are the generated config's mutual TLS endpoints instead, and this must be empty. Every entry must declare mutual_tls and a nonblank SNI. The embedded gateway compares each declaration against the loaded Praxis load-balancer's verified mTLS backend before it sends provider-hop context. Changing Praxis backend transport requires a gateway restart while gridServing is enabled.
 	ProviderHopEndpoints []GridNetworkConsumerGatewaysItemProviderHopEndpointsItem `json:"providerHopEndpoints,omitempty"`
 	// Local site name for the intelligent_route overlay generated for this gateway.
 	// Identifies which [GridSite] this gateway's cluster represents. Praxis uses local_site to score candidates running on the same site higher than remote candidates.
@@ -597,7 +628,7 @@ type GridNetworkConsumerGatewaysItem struct {
 	// [GridSite]: crate::crd::grid_site::GridSite [GridNetwork]: crate::crd::grid_network::GridNetwork
 	SiteName *string `json:"siteName,omitempty"`
 	// Deprecated in favor of praxisConfig; this legacy field will be removed in a future release. Opt-in configuration for operator-managed consumer Praxis config generation.
-	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the inference-model intelligent_route candidates (with credential secretRef data), a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
+	// When absent or generate: false, this gateway behaves exactly as before: only the routing overlay ConfigMap is applied. When generate: true, the operator additionally renders a consumer Praxis ConfigMap containing the routing filter siteRouter selects, intelligent_route or grid_site_route, a credential_inject section for credential-bearing inference candidates, and a load_balancer section with one cluster entry per unique inference cluster. Other capability kinds remain in the routing overlay for dedicated data-plane pipelines.
 	// The generated ConfigMap contains no token bytes. Credential-bearing overlays are withheld until the consumer has explicitly declared that its compatible filter config is already running.
 	ConsumerConfig *GridNetworkConsumerGatewaysItemPraxisConfig `json:"consumerConfig,omitempty"`
 	// Deprecated in favor of siteName; this legacy field will be removed in a future release. Local site name for the intelligent_route overlay generated for this gateway.
@@ -607,10 +638,18 @@ type GridNetworkConsumerGatewaysItem struct {
 	LocalSiteName *string `json:"localSiteName,omitempty"`
 }
 
-// GridNetworkPeerTrust Grid-wide peer trust on the signals path, pin when absent, read at operator start.
+// GridNetworkMembership Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
+type GridNetworkMembership struct {
+	// Membership source. Local requires signalTransport.mode: poll.
+	Mode GridNetworkMembershipMode `json:"mode"`
+}
+
+// GridNetworkPeerTrust Grid-wide peer trust: signals-path mode, pin when absent, read at operator start; signed state, read each reconcile.
 type GridNetworkPeerTrust struct {
 	// Peer trust mode.
 	Mode PeerTrustMode `json:"mode"`
+	// Signed state, off when absent. Switch every site together: an enforcing site refuses unsigned peers.
+	SignedState GridNetworkPeerTrustSignedState `json:"signedState,omitempty"`
 }
 
 // GridNetworkPlacementPolicy Optional static capacity-placement policy.
@@ -677,12 +716,14 @@ type GridNetworkSpec struct {
 	BudgetPolicy *GridNetworkBudgetPolicy `json:"budgetPolicy,omitempty"`
 	// References to Praxis Gateways that participate in this grid.
 	ConsumerGateways []GridNetworkConsumerGatewaysItem `json:"consumerGateways,omitempty"`
-	// Grid ID for tenancy. Empty on creation; auto-generated on first join with another site.
+	// The grid this network belongs to, set once by bootstrap or its delivery automation. The operator waits until this is declared and never generates a grid ID. A grid ID that operators before #474 kept only in status is copied here once, and status then mirrors spec. Moving to another grid means recreating the network.
 	GridID string `json:"gridId,omitempty"`
+	// Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
+	Membership *GridNetworkMembership `json:"membership,omitempty"`
 	// Maximum time between metric refreshes and score/ranking recalculation.
 	// This controls the GridNetwork reconcile cadence for provider metrics; it does not change request-path routing or the overlay watch latency. Use a duration of at least one second, such as "10s" or "1500ms". The default cadence is 300 seconds. TLS-protected provider metrics cap the cadence at 60 seconds for bounded certificate-rotation detection.
 	MetricsRefreshInterval *string `json:"metricsRefreshInterval,omitempty"`
-	// Grid-wide peer trust on the signals path, pin when absent, read at operator start.
+	// Grid-wide peer trust: signals-path mode, pin when absent, read at operator start; signed state, read each reconcile.
 	PeerTrust *GridNetworkPeerTrust `json:"peerTrust,omitempty"`
 	// Optional static capacity-placement policy.
 	PlacementPolicy *GridNetworkPlacementPolicy `json:"placementPolicy,omitempty"`
@@ -752,20 +793,6 @@ type GridNetworkGatewayAgeReportsItem struct {
 	Sequence int64 `json:"sequence"`
 	// Cumulative skew rejection count.
 	Skew int64 `json:"skew"`
-}
-
-// GridNetworkIdentity This site's identity certificate: when it expires and when rotation is due.
-type GridNetworkIdentity struct {
-	// SHA-256 of the certificate DER, the digest peers pin.
-	Fingerprint string `json:"fingerprint"`
-	// How to recover.
-	Message string `json:"message,omitempty"`
-	// When the certificate expires, RFC 3339.
-	NotAfter string `json:"notAfter"`
-	// IdentityExpired once the certificate has expired, IdentityUnreadable when the Secret holds no usable certificate.
-	Reason string `json:"reason,omitempty"`
-	// When rotation is due, a third of the lifetime before notAfter, RFC 3339. Empty under pin peer trust, or when this site's operator does not rotate.
-	RotateAfter string `json:"rotateAfter"`
 }
 
 // GridNetworkMountReconciliationItem Per-gateway progress for Secret mount reconciliation and gateway readiness.
@@ -868,8 +895,6 @@ type GridNetworkStatus struct {
 	GatewayAgeReports []GridNetworkGatewayAgeReportsItem `json:"gatewayAgeReports,omitempty"`
 	// The negotiated grid ID.
 	GridID string `json:"gridId,omitempty"`
-	// This site's identity certificate: when it expires and when rotation is due.
-	Identity *GridNetworkIdentity `json:"identity,omitempty"`
 	// Per-gateway Secret requirements and optional mount reconciliation status.
 	// Populated for every gateway with praxisConfig.generate: true. Without explicit mount reconciliation, the phase remains RequirementsRendered.
 	MountReconciliationStatus []GridNetworkMountReconciliationItem `json:"mountReconciliationStatus,omitempty"`
@@ -906,6 +931,15 @@ type GridSiteGatewayEndpoint struct {
 	TLS *GridSiteGatewayEndpointTLS `json:"tls,omitempty"`
 }
 
+// GridSiteSignalsEndpoint Where this site serves its signals, where its gateway endpoint does not say.
+// Absent, signals are polled at the gateway endpoint's host under the server name <site>-signals.grid.internal, at the operator's signals port setting or the gateway's.
+type GridSiteSignalsEndpoint struct {
+	// host:port of the signals listener: a DNS name, an IPv4 address, or a bracketed IPv6 address. Absent, the gateway endpoint's host.
+	Address *string `json:"address,omitempty"`
+	// TLS server name sent to the signals listener, which a router in front selects on. Absent, <site>-signals.grid.internal.
+	ServerName *string `json:"serverName,omitempty"`
+}
+
 // GridSiteTrust Trust policy for this site.
 // When configured, the operator verifies the received public certificate against this policy before promoting the site to Active. If absent, the site remains Connecting with reason TrustMaterialMissing regardless of certificate material.
 type GridSiteTrust struct {
@@ -929,6 +963,9 @@ type GridSiteSpec struct {
 	GridNetworkRef string `json:"gridNetworkRef"`
 	// Deployment region.
 	Region *string `json:"region,omitempty"`
+	// Where this site serves its signals, where its gateway endpoint does not say.
+	// Absent, signals are polled at the gateway endpoint's host under the server name <site>-signals.grid.internal, at the operator's signals port setting or the gateway's.
+	SignalsEndpoint *GridSiteSignalsEndpoint `json:"signalsEndpoint,omitempty"`
 	// Sovereignty zone for data residency constraints.
 	SovereigntyZone *string `json:"sovereigntyZone,omitempty"`
 	// Trust policy for this site.
@@ -957,6 +994,8 @@ type GridSiteStatus struct {
 	AbsentSince *string `json:"absentSince,omitempty"`
 	// Capabilities offered by this site.
 	Capabilities *GridSiteCapabilities `json:"capabilities,omitempty"`
+	// Observed conditions: Connected, and the Available, Progressing and Degraded roll-up, on every site, this cluster's own included. Its Accepted, ResolvedRefs, Enrolled, IdentityValid and RotationOnSchedule live on the GridNetwork. Under Local membership, a peer's also carries this site's SignalsReachable and CatalogAccepted view of it. The phase stays, kept for v1alpha1 readers.
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// Timestamp of the last probe whose resulting status was persisted.
 	// This is not a liveness heartbeat; it may remain unchanged when a probe produces no status changes.
 	LastProbeTime *string `json:"lastProbeTime,omitempty"`
@@ -1087,7 +1126,7 @@ type OpenAIModelsSource struct {
 }
 
 // ModelDiscoveryConfig Where to discover the models this provider serves.
-// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovery does not yet affect routing or gossip; spec.models remains the routing source. When absent, no discovery runs. Exactly one source field must be set (CRD oneOf).
+// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovered names may be routed locally to gateways that declare model-discovery contract v1. They are withheld from provider records, whose current wire format cannot carry expiry, and never fall back to spec.models. When absent, no discovery runs. Exactly one source field must be set (CRD oneOf).
 type ModelDiscoveryConfig struct {
 	// OpenAI-compatible GET /v1/models (vLLM, KServe, OpenAI).
 	// Reads data[].id from the response. The response is rejected as a whole when it is not valid JSON, has a blank, overlong, or duplicate id, or lists more models than the operator's cap. A rejected response never clears the previously discovered set.
@@ -1140,7 +1179,7 @@ type InferenceProviderSpec struct {
 	// [GridNetwork]: crate::crd::grid_network::GridNetwork
 	MetricsConfig *MetricsConfig `json:"metricsConfig,omitempty"`
 	// Where to discover the models this provider serves.
-	// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovery does not yet affect routing or gossip; spec.models remains the routing source. When absent, no discovery runs.
+	// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovered names may be routed locally to gateways that declare model-discovery contract v1. They are withheld from provider records, whose current wire format cannot carry expiry, and never fall back to spec.models. When absent, no discovery runs.
 	ModelDiscovery *ModelDiscoveryConfig `json:"modelDiscovery,omitempty"`
 	// Models served by this provider.
 	Models []ModelInfo `json:"models,omitempty"`
@@ -1193,6 +1232,9 @@ type InferenceProviderStatus struct {
 	// RFC 3339 UTC deadline for the corresponding servedModels set.
 	// Readers must reject the set at or after this time, even if the status field has not yet been cleared by the next discovery round.
 	ServedModelsExpiresAt *string `json:"servedModelsExpiresAt,omitempty"`
+	// Provider generation that produced the corresponding servedModels set.
+	// Readers must require this value to equal metadata.generation; a spec change invalidates the inventory until discovery succeeds again.
+	ServedModelsObservedGeneration *int64 `json:"servedModelsObservedGeneration,omitempty"`
 }
 
 // SiteInviteSpec An invitation that authorizes one site to request admission.
