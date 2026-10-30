@@ -74,7 +74,7 @@ use operator::{
         agent_tool_provider::AgentToolProvider,
         grid_network::{GridNetwork, SignalMode},
         grid_site::GridSite,
-        inference_provider::InferenceProvider,
+        inference_provider::{Condition, ConditionStatus, InferenceProvider},
     },
     error::OperatorError,
     gateway,
@@ -1097,22 +1097,22 @@ fn swim_cleared(name: &str) -> serde_json::Value {
 }
 
 /// The [`SWIM_CONDITION`] condition: `True` while SWIM runs, `False` with the cause when it cannot.
-fn swim_condition(
-    unavailable: Option<&SwimFailure>,
-    now: &str,
-    generation: Option<i64>,
-) -> operator::crd::inference_provider::Condition {
+fn swim_condition(unavailable: Option<&SwimFailure>, now: &str, generation: Option<i64>) -> Condition {
     let (status, reason, message) = match unavailable {
         Some(failure) => (
-            "False",
+            ConditionStatus::False,
             failure.reason,
             format!("SWIM is not running: {}", failure.cause),
         ),
-        None => ("True", SWIM_CONDITION, "SWIM membership gossip is running".to_owned()),
+        None => (
+            ConditionStatus::True,
+            SWIM_CONDITION,
+            "SWIM membership gossip is running".to_owned(),
+        ),
     };
-    operator::crd::inference_provider::Condition {
+    Condition {
         type_: SWIM_CONDITION.to_owned(),
-        status: status.to_owned(),
+        status,
         reason: reason.to_owned(),
         message,
         last_transition_time: now.to_owned(),
@@ -3444,7 +3444,7 @@ fn bounded_model_discovery_ttl(
 ) -> std::time::Duration {
     let requested_ttl =
         std::time::Duration::from_secs(parse_env_or("GRID_MODEL_DISCOVERY_TTL_SECS", default.as_secs()).max(1));
-    let minimum_ttl = interval.saturating_add(timeout);
+    let minimum_ttl = minimum_model_discovery_ttl(interval, timeout);
     let unclamped_ttl = requested_ttl.max(minimum_ttl);
     let ttl = unclamped_ttl.min(MAX_MODEL_DISCOVERY_TTL);
     if unclamped_ttl > MAX_MODEL_DISCOVERY_TTL {
@@ -3457,6 +3457,15 @@ fn bounded_model_discovery_ttl(
         );
     }
     ttl
+}
+
+/// Keep a discovered model alive through a poll round and the gateway's expiry margin.
+fn minimum_model_discovery_ttl(interval: std::time::Duration, timeout: std::time::Duration) -> std::time::Duration {
+    interval
+        .saturating_add(timeout)
+        .saturating_add(std::time::Duration::from_millis(
+            grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS,
+        ))
 }
 
 /// Parse one discovery duration, enforcing a positive value and maximum.
@@ -4326,6 +4335,18 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 mod tests {
     use super::*;
 
+    #[test]
+    fn discovery_ttl_covers_poll_round_and_gateway_expiry_margin() {
+        let minimum =
+            minimum_model_discovery_ttl(std::time::Duration::from_secs(60), std::time::Duration::from_secs(5));
+
+        assert_eq!(minimum, std::time::Duration::from_secs(95));
+        assert!(
+            minimum > std::time::Duration::from_millis(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS),
+            "the TTL must remain valid when received by the gateway"
+        );
+    }
+
     #[tokio::test]
     async fn startup_reads_network_membership_before_selecting_the_swim_listener() -> Result<(), String> {
         let install = GridModes::without_network(Some(SignalMode::Poll), Some(operator::signals::PeerTrustMode::Pin));
@@ -4496,7 +4517,7 @@ mod tests {
         assert_eq!(
             ages.condition(std::slice::from_ref(&live), "t1", Some(1))
                 .map(|condition| condition.status),
-            Some("True".to_owned()),
+            Some(ConditionStatus::True),
             "a genuinely empty snapshot after convergence clears rejection"
         );
     }
@@ -7336,14 +7357,22 @@ mod tests {
                 .iter()
                 .find(|held| held.type_ == "PeerTimeValid")
                 .expect("peer condition preserved");
-            assert_eq!(peer.status, "False", "gateway publication cannot recover the peer");
+            assert_eq!(
+                peer.status,
+                ConditionStatus::False,
+                "gateway publication cannot recover the peer"
+            );
             assert_eq!(peer.reason, "TimestampOutOfRange", "peer reason preserved");
             let gateway = status
                 .conditions
                 .iter()
                 .find(|held| held.type_ == "GatewayAgesRejected")
                 .expect("gateway condition persisted");
-            assert_eq!(gateway.status, "True", "fresh gateway rejection persisted");
+            assert_eq!(
+                gateway.status,
+                ConditionStatus::True,
+                "fresh gateway rejection persisted"
+            );
             assert_eq!(status.gateway_age_reports.len(), 1, "one durable reporter");
             assert!(
                 status
