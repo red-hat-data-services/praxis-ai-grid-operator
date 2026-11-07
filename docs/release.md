@@ -10,16 +10,22 @@ root workspace; root version changes do not update them. Package versions alone
 do not establish image compatibility: qualify the tagged source and intended
 consumer below.
 
-The five charts published by this release (`grid-operator`, `grid-site`,
-`praxis-gateway`, `grid-mock-providers`, and `grid-enrollment`) have versions
-matching the AGN release. The `appVersion` for AGN-owned workloads in the
-release charts also matches the AGN tag. The `praxis-gateway` chart is
-different: its `appVersion` identifies the default Praxis AI image and may
-advance independently of AGN.
+The six charts published by this release (`grid-operator`, `grid-site`,
+`praxis-gateway`, `grid-mock-providers`, `grid-enrollment`, and
+`grid-fleet-dashboard`) have versions matching the AGN release. The
+`appVersion` for AGN-owned workloads in the release charts also matches the
+AGN tag. The `praxis-gateway` chart is different: its `appVersion` identifies
+the default Praxis AI image and may advance independently of AGN.
 
 `grid-enrollment` joined the release line in 0.2.0. Before that it versioned
 independently and its image was published elsewhere, so a reader installing
 from chart defaults could not pull it.
+
+`grid-fleet-dashboard` joins the release line in 0.3.0. Its image was
+already published at every release tag from 0.2.0, but the chart stayed at
+0.1.4 and was not published, so its default image tag `v0.1.4` did not exist.
+Its chart lives at `crates/fleet-dashboard/charts/grid-fleet-dashboard`, not
+under `charts/`.
 
 The project-owned `grid-gateway` operand is versioned with AGN and must be
 built from the same tagged AGN source. It is distinct from the separately
@@ -33,11 +39,16 @@ An AGN release publishes:
 
 - `ghcr.io/praxis-proxy/grid-gateway:v<version>`;
 - `ghcr.io/praxis-proxy/grid-operator`;
+- `ghcr.io/praxis-proxy/grid-operator:<version>-fips` and
+  `ghcr.io/praxis-proxy/grid-overlay-sync:<version>-fips` for the UBI 9 FIPS
+  images;
 - `ghcr.io/praxis-proxy/grid-mock-providers`;
 - `ghcr.io/praxis-proxy/grid-overlay-sync`;
 - `ghcr.io/praxis-proxy/grid-enrollment`;
+- `ghcr.io/praxis-proxy/grid-fleet-dashboard`;
 - the `grid-operator`, `grid-site`, `praxis-gateway`,
-  `grid-mock-providers`, and `grid-enrollment` Helm charts; and
+  `grid-mock-providers`, `grid-enrollment`, and `grid-fleet-dashboard` Helm
+  charts; and
 - a GitHub Release containing generated notes and immutable artifact digests.
 
 Build `grid-gateway:v<version>` from the matching AGN release tag and record
@@ -64,7 +75,7 @@ Before opening a release preparation pull request:
 - [ ] Update the workspace version in `Cargo.toml` and regenerate `Cargo.lock`.
 - [ ] Update both `workspace.package.version` and `package.version` in
       `crates/gateway/Cargo.toml` and regenerate `crates/gateway/Cargo.lock`.
-- [ ] Update the five release-chart versions listed above.
+- [ ] Update the six release-chart versions listed above.
 - [ ] Update their AGN workload `appVersion` values to the AGN tag.
 - [ ] Verify the `praxis-gateway` `appVersion` and default image match the
       intended official Praxis AI release.
@@ -72,6 +83,9 @@ Before opening a release preparation pull request:
       `praxis-gateway` `overlay.sidecar.image.tag`. An empty tag there resolves
       to the chart `appVersion`, which is the Praxis AI version, so these are
       pinned by hand and the release workflow does not check them.
+- [ ] Run `UPDATE_GOLDEN=1 crates/fleet-dashboard/hack/helm-template-test.sh`
+      and commit the result. The fleet dashboard golden renders carry the
+      chart version and the default image tag.
 - [ ] Run `make generate-deploy` and commit the result. The manifests under
       `deploy/operator` and `deploy/overlays` render from `charts/grid-operator`,
       so they carry the operator image tag and the kind version label.
@@ -88,7 +102,7 @@ Before opening a release preparation pull request:
 - [ ] Run `make codegen-check`, `make crds-check`, and `make deploy-check`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
-- [ ] Lint and render the five release charts with their required values.
+- [ ] Lint and render the six release charts with their required values.
 - [ ] Validate affected Forge topologies.
 - [ ] Run the relevant integration qualifications when routing, overlay, or
       gateway compatibility changes.
@@ -99,6 +113,43 @@ The first-class integration qualifications are documented in
 [the documentation index](README.md#integration-qualifications). They build
 isolated Kind environments, exercise runtime behavior, record evidence, and
 clean up their resources.
+
+### Triggered Integration Test dispatch and schedules
+
+The **Triggered Integration Test** manual dispatch uses one **Release
+qualification** dropdown. Its supported choices are:
+
+| Dropdown choice | Runner command | Mode |
+|---|---|---|
+| `glb-quick` | `run-grid-glb-demo` | `--quick` |
+| `glb-full` | `run-grid-glb-demo` | `--full` |
+| `static-weighted` | `run-grid-static-weighted-qualification` | Fixed `--quick` |
+| `combined-site` | `run-grid-combined-site-demo` | Fixed `--full` |
+| `llmd-pool-metrics-quick` | `run-grid-llmd-pool-metrics-demo` | `--quick` |
+| `llmd-pool-metrics-full` | `run-grid-llmd-pool-metrics-demo` | `--full` |
+
+Static-weighted full mode and combined-site quick mode are not selectable in
+this workflow: its validation and runner intentionally support only the fixed
+modes above. The GLB `--no-ingress` variant is also omitted because the
+Triggered Integration Test does not expose that topology selector.
+
+Only quick-mode qualifications have daily scheduled workflows. Full runs
+remain available for manual dispatch only; `combined-site` is also manual-only
+because its only supported mode is `--full`. Scheduled start times are UTC and
+are spaced one hour apart to avoid overlapping the approximately 30-minute
+runs. The original daily quick-GLB schedule remains enabled at 18:00
+`America/New_York` (22:00 UTC during daylight time, 23:00 UTC during standard
+time); consequently, `glb-quick` also has that legacy run.
+
+| Scheduled workflow | Release qualification | Daily UTC start |
+|---|---|---:|
+| `Scheduled GLB Quick Qualification` | `glb-quick` | 00:00 |
+| `Scheduled Static-Weighted Qualification` | `static-weighted` | 01:00 |
+| `Scheduled llm-d Pool-Metrics Quick Qualification` | `llmd-pool-metrics-quick` | 02:00 |
+
+The scheduled workflows call the same reusable Triggered Integration Test
+workflow as manual runs, so source resolution, image selection, evidence
+upload, cleanup, and failure diagnostics stay shared.
 
 ## Integration qualification checklist
 
@@ -118,7 +169,7 @@ directory can lose its clusters even when it uses a different config file.
 | Combined-site lifecycle | `cargo xtask env run-grid-combined-site-demo --forge-config tests/e2e/topologies/grid-combined-site/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-combined-site/forge.yaml` | Release qualification | Combined-site routing, provider add/remove/re-add, session fallback, rollout, trust, or lifecycle changes | [README](../tests/e2e/topologies/grid-combined-site/README.md) |
 | GLB | `cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-glb-demo/forge.yaml` | Release qualification | GLB, ingress, edge/provider boundary, mTLS, or network-boundary changes | [README](../tests/e2e/topologies/grid-glb-demo/README.md) |
 | Workload inference / no ingress | `cargo xtask env run-grid-glb-demo --forge-config tests/e2e/topologies/grid-glb-demo/forge.yaml --no-ingress --full --teardown --evidence-dir "$EVIDENCE_DIR"` | Reuses `tests/e2e/topologies/grid-glb-demo/forge.yaml`; documented by `tests/e2e/topologies/grid-workload-inference/README.md` | Release qualification | Workload inference, no-ingress routing, or cluster-local workload entry changes | [README](../tests/e2e/topologies/grid-workload-inference/README.md) |
-| llm-d pool metrics, cross-site signals, learned ceilings, partition, and recovery | `cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml` | Experimental qualification; selectable in the generic triggered workflow as `llmd-pool-metrics` in quick or full mode | EPP metrics, operator peer polling, Grid Gateway site selection and stale-signal gauge clearing, KV-cache saturation or learned-ceiling lifecycle, provider topology withdrawal/re-addition, pressure transitions, recovery, partition, or metrics mTLS changes | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
+| llm-d pool metrics, cross-site signals, learned ceilings, partition, and recovery | `cargo xtask env run-grid-llmd-pool-metrics-demo --forge-config tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-llmd-pool-metrics/forge.yaml` | Experimental qualification; selectable in Triggered Integration Test as `llmd-pool-metrics-quick` or `llmd-pool-metrics-full` | EPP metrics, operator peer polling, Grid Gateway site selection and stale-signal gauge clearing, KV-cache saturation or learned-ceiling lifecycle, provider topology withdrawal/re-addition, pressure transitions, recovery, partition, or metrics mTLS changes | [README](../tests/e2e/topologies/grid-llmd-pool-metrics/README.md) |
 
 Use the following one-line command stack after setting `IMAGE_TAG` and
 `EVIDENCE_DIR` for each run. The quota qualification additionally requires a
@@ -243,9 +294,11 @@ does not count as a passed external-provider qualification.
 
 ## Tagging A Release
 
-Tags use `v<MAJOR>.<MINOR>.<PATCH>`. Create the tag only
-from the reviewed commit after its pull request and CI checks pass. Sign the tag
-using the project's normal Git signing configuration:
+Tags use `v<MAJOR>.<MINOR>.<PATCH>`, with an optional pre-release segment for a
+release candidate, as in `v0.3.0-rc.4`. Build metadata is refused, because an OCI
+tag cannot carry a plus. Create the tag only from the reviewed commit after its
+pull request and CI checks pass. Sign the tag using the project's normal Git
+signing configuration:
 
 ```console
 VERSION="${VERSION:?set VERSION to the workspace release version}"
@@ -257,6 +310,17 @@ git push origin "$TAG"
 Do not move or recreate a published release tag. Prepare a new patch release
 for corrections.
 
+A pre-release tag publishes the same artifacts as any other, under its own
+version. The workflow marks its GitHub release as a pre-release, so it does not
+become the repository's latest release. Every image and chart carries the full
+version, `0.3.0-rc.4`, and nothing floating moves onto it.
+
+Tell consumers which way a candidate sorts. SemVer orders `0.3.0-rc.4` above
+`0.2.2` and below `0.3.0`. A Helm range such as `^0.2` leaves a candidate alone,
+because ranges exclude pre-releases. An exact `--version 0.3.0-rc.4`, or a tag
+read straight from the registry, lands on it. A reader tracking the charts needs
+to know which of those they are doing.
+
 ## Automated Publication
 
 Pushing a valid release tag triggers the **Release** workflow. The workflow:
@@ -266,7 +330,7 @@ Pushing a valid release tag triggers the **Release** workflow. The workflow:
 3. verifies the pinned official Praxis AI image and provenance;
 4. builds and publishes the version-tagged AGN container images, including
    `grid-gateway`, with SBOM and provenance attestations;
-5. validates, packages, and publishes the five release charts; and
+5. validates, packages, and publishes the six release charts; and
 6. creates the GitHub Release with generated notes and immutable digests.
 
 The workflow can also be dispatched for an existing immutable release tag. A

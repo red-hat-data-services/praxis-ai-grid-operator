@@ -27,6 +27,7 @@ arc-swap = "1.0.0"
 async-trait = "0.1.0"
 tracing = "0.1.0"
 http = "1.0.0"
+percent-encoding = "2.3.2"
 rustls = { version = "0.23.0", default-features = false, features = ["logging", "std", "tls12"] }
 metrics = "0.24.6"
 zeroize = "1.9.0"
@@ -35,6 +36,7 @@ xxhash-rust = { version = "0.8.0", features = ["xxh64"] }
 lru = "0.18.0"
 foldhash = "0.2.0"
 bytes = "1.0.0"
+time = { workspace = true, features = ["parsing"] }
 tokio = { version = "1.53.1", features = ["net", "rt", "time"] }
 
 [dev-dependencies]

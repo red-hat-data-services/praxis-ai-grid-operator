@@ -420,9 +420,14 @@ SPIFFE URI SAN, and the site's DNS SAN. A provider gateway in SPIFFE mode refuse
 those extensions. Certificates issued before this profile lack them, so
 re-enroll those sites before switching a provider to SPIFFE mode.
 
-SPIFFE mode, `spec.peerTrust.mode: spiffe` on the `GridNetwork`, reads no pins.
-It admits any site the Grid CA signed, auto-discovered sites included, and it
-cannot revoke one short of rotating the Grid CA and the SWIM key.
+SPIFFE mode, `spec.peerTrust.mode: spiffe` on the `GridNetwork`, reads no
+certificate fingerprint pins; it relies on the Grid CA and the site's SPIFFE
+identity instead. Signed gossip still installs the verified public signing
+key against the `(grid ID, site)` origin in either mode. See [Signed Gossip
+Trust](signed-gossip-trust.md). SPIFFE mode admits CA-issued sites with the
+expected identity, auto-discovered sites included, without requiring a
+per-certificate fingerprint update. It cannot revoke one short of rotating the
+Grid CA and the SWIM key.
 
 On the signals listener, only this site's current leaf, matched by digest,
 reads unscoped as the co-located gateway, in either mode. The listener refuses
@@ -437,6 +442,17 @@ co-located gateway. The caps start over when the listener reloads its TLS
 material. It closes a connection whose response write stalls or that outlives
 five minutes. Restrict who can reach the listener with
 `loadBalancerSourceRanges` on its Service or with a NetworkPolicy.
+
+Behind an OpenShift Route the listener's own per-source caps stop separating
+peers. Every connection arrives from the router, so one busy peer spends the
+cap for all of them. Size `signals.maxHandshakesPerSource` for the whole peer
+set, not for one peer. The router still sees each peer's own address, so the
+limit that separates them belongs there. `signals.route` renders those limits
+by default, as the router's rate-limit-connections annotations, and a signals
+Route without them leaves the listener open to anyone who can reach the router.
+The Route is passthrough: peers authenticate with a client certificate, and a
+router that terminated TLS would present its own identity and never pass theirs
+on.
 
 The gateway polls only its local operator, from the serving config the operator
 renders, and checks that operator's SPIFFE ID. Pins apply where the operator
@@ -535,6 +551,30 @@ control-plane overlay level.
 Active phase indicates the control plane completed the configured gateway probe.
 Request readiness still requires routing configuration propagation and
 provider-side authorization, which are enforced separately by the data plane.
+
+### What a member can do
+
+Under Local membership, `GridSite` objects decide who the peers are. Anyone who
+can create or label a `GridSite` adds a member, points its gateway and signals at any
+address, changes its pins, and through the labels this site holds for it unlocks the
+scoped providers those labels satisfy. That write is an administrator's right. The grid
+CRDs aggregate to no `edit` or `admin` ClusterRole, so a namespace admin cannot do it
+by default; only `cluster-admin` or an explicit grant on `gridsites` can, and RBAC
+should grant it as one.
+
+An enrolled peer is trusted for what it says, not only for who it is. Its leaf must
+name its site, and the reader refuses records that claim this site's clusters or
+another peer's, but the load it reports and the providers it lists are taken as
+given. A compromised member can draw traffic by reporting less load than it
+carries, or answer for models it does not serve. The overlay's 1024-candidate
+ceiling is shared: each declared peer is owed the ceiling divided by the peers, one
+candidate per model, and what is left goes to peers over their share in arrival order,
+so a member listing a thousand models cannot leave the rest with nothing; past what it
+may contribute the rest of its catalog waits, which its `CatalogAccepted` condition
+counts, naming the peers that took the remainder. A cluster two peers name routes to neither unless a
+declaration settles it, the gateway hop bound to a peer or the peer's own name. The
+data plane still authorizes every request, so a lying member cannot reach a
+provider its identity is not allowed to.
 
 ## Separation of Concerns
 

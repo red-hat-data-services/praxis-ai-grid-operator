@@ -50,7 +50,7 @@ use crate::{
 /// This is a deliberate memory bound for one scrape. Reaching it means the
 /// endpoint answered; it is counted as `body_cap` and leaves readiness unknown
 /// rather than treating the provider as down.
-const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -126,37 +126,24 @@ impl MetricsScrapeError {
 /// timed out, else a connect failure.
 fn transport_class(source: &(dyn std::error::Error + 'static)) -> crate::readiness::ScrapeClass {
     use crate::readiness::ScrapeClass;
+
+    let (tls, io_kind) = crate::resources::tls_backend::transport_error_details(source);
+    if tls {
+        return ScrapeClass::Tls;
+    }
+
     let mut cause = Some(source);
     while let Some(error) = cause {
-        if tls_within(error) {
-            return ScrapeClass::Tls;
-        }
         let text = error.to_string();
         if text.contains("dns error") || text.contains("failed to lookup address") {
             return ScrapeClass::Dns;
         }
-        if error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
-        {
-            return ScrapeClass::Timeout;
-        }
         cause = error.source();
     }
+    if io_kind == Some(std::io::ErrorKind::TimedOut) {
+        return ScrapeClass::Timeout;
+    }
     ScrapeClass::Connect
-}
-
-/// Whether `error` is a TLS failure or wraps one through any depth of `io::Error`.
-///
-/// `io::Error::source` skips the error it wraps, which is where a TLS failure sits, and
-/// hyper-rustls wraps the connector's `io::Error` in another, so the chain is walked by
-/// `get_ref`, not `source`.
-fn tls_within(error: &(dyn std::error::Error + 'static)) -> bool {
-    crate::resources::tls_backend::is_tls_error(error)
-        || error
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::get_ref)
-            .is_some_and(|inner| tls_within(inner))
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +189,10 @@ pub(crate) async fn scrape_metrics(
 }
 
 /// A hyper client for one peer's trust material.
-pub(crate) type PeerClient = HyperClient<crate::resources::tls_backend::HttpsConnector, Empty<Bytes>>;
+pub(crate) type PeerClient = HyperClient<
+    crate::resources::tls_backend::HttpsConnector<crate::resources::tls_backend::AliasResolver>,
+    Empty<Bytes>,
+>;
 
 /// A client and whether it presents TLS, which the plaintext checks need.
 pub(crate) struct PeerTransport {
@@ -217,6 +207,7 @@ impl PeerTransport {
     ///
     /// `pool_idle` bounds how long an unused connection is kept. A transport
     /// built per request passes `None`, which keeps no connection at all.
+    /// `alias` is `(server name, host)`: a URI at that name dials that host.
     ///
     /// # Errors
     ///
@@ -224,10 +215,12 @@ impl PeerTransport {
     pub(crate) fn new(
         tls_config: Option<&ClientTlsConfig>,
         pool_idle: Option<Duration>,
+        alias: Option<(&str, &str)>,
     ) -> Result<Self, MetricsScrapeError> {
+        let resolver = crate::resources::tls_backend::AliasResolver::new(alias);
         let connector = match tls_config {
-            Some(config) => build_custom_tls_connector(config)?,
-            None => build_native_connector()?,
+            Some(config) => crate::resources::tls_backend::build_custom_tls_connector_with_resolver(config, resolver)?,
+            None => crate::resources::tls_backend::build_native_connector_with_resolver(resolver)?,
         };
         let mut builder = HyperClient::builder(TokioExecutor::new());
         match pool_idle {
@@ -242,6 +235,20 @@ impl PeerTransport {
     }
 }
 
+/// What a peer's answer says about itself beside its body.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stamp {
+    /// Its `Date` header.
+    pub date: Option<SystemTime>,
+    /// Its membership mode, absent from a release that sends none or names one this release
+    /// does not know.
+    pub membership: Option<String>,
+    /// Its providers catalog version, absent from a release that sends none.
+    pub providers_version: Option<String>,
+    /// Its providers contract version, on a providers answer.
+    pub providers_contract: Option<String>,
+}
+
 /// GET `url` over `transport`, presenting `bearer` when given.
 ///
 /// # Errors
@@ -251,8 +258,9 @@ pub(crate) async fn scrape_peer(
     url: &str,
     timeout: Duration,
     transport: &PeerTransport,
-) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
-    scrape_over(url, timeout, transport, None).await
+    max_body: usize,
+) -> Result<(String, Stamp), MetricsScrapeError> {
+    scrape_over(url, timeout, transport, None, max_body).await
 }
 
 /// GET `url`, presenting `bearer` when given.
@@ -261,9 +269,9 @@ async fn scrape(
     timeout: Duration,
     tls_config: Option<ClientTlsConfig>,
     bearer: Option<&Bearer>,
-) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
-    let transport = PeerTransport::new(tls_config.as_ref(), None)?;
-    scrape_over(url, timeout, &transport, bearer).await
+) -> Result<(String, Stamp), MetricsScrapeError> {
+    let transport = PeerTransport::new(tls_config.as_ref(), None, None)?;
+    scrape_over(url, timeout, &transport, bearer, MAX_RESPONSE_BODY_BYTES).await
 }
 
 /// GET `url` over an already-built `transport`.
@@ -272,7 +280,8 @@ async fn scrape_over(
     timeout: Duration,
     transport: &PeerTransport,
     bearer: Option<&Bearer>,
-) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    max_body: usize,
+) -> Result<(String, Stamp), MetricsScrapeError> {
     let uri = url
         .parse::<http::Uri>()
         .map_err(|e| MetricsScrapeError::Transport(e.into()))
@@ -294,7 +303,7 @@ async fn scrape_over(
     let req = build_request(uri, bearer)?;
 
     // One deadline covers the body too, so a stalled peer cannot hold the caller.
-    tokio::time::timeout(timeout, read_response(transport.client.request(req), url))
+    tokio::time::timeout(timeout, read_response(transport.client.request(req), url, max_body))
         .await
         .map_err(|_elapsed| MetricsScrapeError::Timeout(timeout))?
 }
@@ -382,11 +391,19 @@ impl Bearer {
     }
 }
 
+/// The membership mode `header` names, only one this release knows: anything else is unknown.
+fn known_membership(header: Option<&str>) -> Option<String> {
+    header
+        .and_then(crate::cli::Membership::parse)
+        .map(|mode| mode.as_str().to_owned())
+}
+
 /// Await `request`, then read a 2xx body from `url` and its `Date` header.
 async fn read_response(
     request: hyper_util::client::legacy::ResponseFuture,
     url: &str,
-) -> Result<(String, Option<SystemTime>), MetricsScrapeError> {
+    max_body: usize,
+) -> Result<(String, Stamp), MetricsScrapeError> {
     let response = request.await.map_err(|e| MetricsScrapeError::Transport(e.into()))?;
 
     let status = response.status().as_u16();
@@ -397,18 +414,20 @@ async fn read_response(
         });
     }
 
-    let date = response
-        .headers()
-        .get(http::header::DATE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|text| httpdate::parse_http_date(text).ok());
+    let header = |name| response.headers().get(name).and_then(|value| value.to_str().ok());
+    let stamp = Stamp {
+        date: header(http::header::DATE.as_str()).and_then(|text| httpdate::parse_http_date(text).ok()),
+        membership: known_membership(header(crate::signals::MEMBERSHIP_HEADER)),
+        providers_version: header(crate::site_providers::VERSION_HEADER).map(|version| version.trim().to_owned()),
+        providers_contract: header(crate::site_providers::CONTRACT_HEADER).map(str::to_owned),
+    };
 
-    let body_bytes = Limited::new(response.into_body(), MAX_RESPONSE_BODY_BYTES)
+    let body_bytes = Limited::new(response.into_body(), max_body)
         .collect()
         .await
         .map_err(|e| {
             if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
-                MetricsScrapeError::BodyTooLarge(MAX_RESPONSE_BODY_BYTES)
+                MetricsScrapeError::BodyTooLarge(max_body)
             } else {
                 MetricsScrapeError::Transport(e)
             }
@@ -416,7 +435,7 @@ async fn read_response(
         .to_bytes();
 
     let body = String::from_utf8(Vec::from(body_bytes)).map_err(MetricsScrapeError::Encoding)?;
-    Ok((body, date))
+    Ok((body, stamp))
 }
 
 // ---------------------------------------------------------------------------
@@ -462,8 +481,8 @@ mod tests {
         );
     }
 
+    /// Every scrape failure maps to one stable, bounded readiness class.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "one table of failures and their classes")]
     fn a_scrape_failure_has_a_bounded_class() {
         use crate::readiness::ScrapeClass;
         let status = |status| MetricsScrapeError::NonOkStatus {
@@ -484,6 +503,14 @@ mod tests {
             (
                 "dns",
                 transport("dns error: failed to lookup address information".into()),
+                ScrapeClass::Dns,
+            ),
+            (
+                "timed out dns",
+                transport(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dns error: failed to lookup address information",
+                ))),
                 ScrapeClass::Dns,
             ),
             (
@@ -765,10 +792,6 @@ mod tests {
     /// `client_ca_pem`: when `Some`, the server requires client certificate
     /// authentication (mTLS).  When `None`, one-way TLS only.
     #[cfg(not(feature = "fips"))]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "TLS server setup: certs + verifier + acceptor + one-shot handler"
-    )]
     async fn start_tls_test_server(
         server_cert_pem: &str,
         server_key_pem: &str,
@@ -1003,7 +1026,7 @@ mod tests {
         .await;
 
         let pin = leaf_pin(&server_cert.cert_pem);
-        let config = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[pin]).unwrap();
+        let config = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, "peer", &[pin]).unwrap();
         let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
         assert!(result.is_ok(), "a matching pin must accept the peer: {result:?}");
         assert!(result.unwrap().contains("test_metric"), "body must be returned");
@@ -1025,7 +1048,8 @@ mod tests {
         // enough, the leaf must be the one this site wrote down.
         let other = certs::generate_dns_cert(&ca, "other", "localhost").unwrap();
         let config =
-            build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[leaf_pin(&other.cert_pem)]).unwrap();
+            build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, "peer", &[leaf_pin(&other.cert_pem)])
+                .unwrap();
         let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
         assert!(result.is_err(), "an undeclared leaf must be rejected");
         assert!(
@@ -1041,8 +1065,7 @@ mod tests {
         let body = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\ntest_metric 3.0\n".to_vec();
         for (label, site, accepted) in [("the dialed site", "east", true), ("another site", "west", false)] {
             let url = start_tls_test_server(&server_cert.cert_pem, &server_cert.key_pem, None, body.clone()).await;
-            let config =
-                build_spiffe_client_config(ca.cert_pem.as_bytes(), None, None, &certs::spiffe_id(site)).unwrap();
+            let config = build_spiffe_client_config(ca.cert_pem.as_bytes(), None, None, site).unwrap();
             let result = scrape_metrics(&url, Duration::from_secs(5), Some(config), None).await;
             assert_eq!(result.is_ok(), accepted, "{label}: {result:?}");
         }
@@ -1051,7 +1074,7 @@ mod tests {
     #[test]
     fn pinned_config_without_declared_pins_is_refused() {
         let ca = certs::generate_ca("test-ca").unwrap();
-        let result = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, &[]);
+        let result = build_pinned_client_config(ca.cert_pem.as_bytes(), None, None, "peer", &[]);
         assert!(
             matches!(result, Err(MetricsScrapeError::TlsMaterial(_))),
             "dialling a peer with no declared pin must be refused"
@@ -1091,7 +1114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::too_many_lines, reason = "server + client handshake round-trip setup")]
     async fn server_accept_verifies_the_client_and_exposes_its_leaf() {
         use crate::resources::tls_backend::{
             accept, build_server_config, connect, parse_server_name, server_peer_leaf_der,
@@ -1269,10 +1291,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "exhaustive PEM-leak check across multiple error paths"
-    )]
     fn error_messages_never_contain_pem_material() {
         let ca = certs::generate_ca("test-ca").unwrap();
         let client = certs::generate_dns_cert(&ca, "client", "localhost").unwrap();

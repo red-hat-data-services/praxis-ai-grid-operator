@@ -171,6 +171,7 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
     let raw = sites
         .iter()
         .map(|(site, cluster)| CandidateConfig {
+            expires_at_ms: None,
             admission: crate::descriptor::AdmissionState::default(),
             cluster: (*cluster).to_owned(),
             credential: None,
@@ -180,6 +181,7 @@ fn candidates(model: &str, sites: &[(&str, &str)]) -> Vec<RouteCandidate> {
             publishes_load: true,
             site: (*site).to_owned(),
             stable_id: None,
+            weight: None,
         })
         .collect();
     validate_candidates(raw).expect("valid candidates")

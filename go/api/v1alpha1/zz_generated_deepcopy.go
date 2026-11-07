@@ -623,6 +623,19 @@ func (in *GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation) DeepCo
 	return out
 }
 
+func (in *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) DeepCopyInto(out *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) {
+	*out = *in
+}
+
+func (in *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty) DeepCopy() *GridNetworkConsumerGatewaysItemPraxisConfigSovereignty {
+	if in == nil {
+		return nil
+	}
+	out := new(GridNetworkConsumerGatewaysItemPraxisConfigSovereignty)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridNetworkConsumerGatewaysItemPraxisConfigTelemetry) DeepCopyInto(out *GridNetworkConsumerGatewaysItemPraxisConfigTelemetry) {
 	*out = *in
 	if in.BatchIntervalSecs != nil {
@@ -692,6 +705,10 @@ func (in *GridNetworkConsumerGatewaysItemPraxisConfig) DeepCopyInto(out *GridNet
 		out.MountReconciliation = new(GridNetworkConsumerGatewaysItemPraxisConfigMountReconciliation)
 		in.MountReconciliation.DeepCopyInto(out.MountReconciliation)
 	}
+	if in.Sovereignty != nil {
+		out.Sovereignty = new(GridNetworkConsumerGatewaysItemPraxisConfigSovereignty)
+		in.Sovereignty.DeepCopyInto(out.Sovereignty)
+	}
 	if in.Telemetry != nil {
 		out.Telemetry = new(GridNetworkConsumerGatewaysItemPraxisConfigTelemetry)
 		in.Telemetry.DeepCopyInto(out.Telemetry)
@@ -731,6 +748,10 @@ func (in *GridNetworkConsumerGatewaysItemProviderHopEndpointsItem) DeepCopy() *G
 
 func (in *GridNetworkConsumerGatewaysItem) DeepCopyInto(out *GridNetworkConsumerGatewaysItem) {
 	*out = *in
+	if in.ModelDiscoveryContractVersion != nil {
+		x := *in.ModelDiscoveryContractVersion
+		out.ModelDiscoveryContractVersion = &x
+	}
 	if in.PraxisConfig != nil {
 		out.PraxisConfig = new(GridNetworkConsumerGatewaysItemPraxisConfig)
 		in.PraxisConfig.DeepCopyInto(out.PraxisConfig)
@@ -760,6 +781,19 @@ func (in *GridNetworkConsumerGatewaysItem) DeepCopy() *GridNetworkConsumerGatewa
 		return nil
 	}
 	out := new(GridNetworkConsumerGatewaysItem)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *GridNetworkMembership) DeepCopyInto(out *GridNetworkMembership) {
+	*out = *in
+}
+
+func (in *GridNetworkMembership) DeepCopy() *GridNetworkMembership {
+	if in == nil {
+		return nil
+	}
+	out := new(GridNetworkMembership)
 	in.DeepCopyInto(out)
 	return out
 }
@@ -899,6 +933,10 @@ func (in *GridNetworkSpec) DeepCopyInto(out *GridNetworkSpec) {
 			in.ConsumerGateways[i].DeepCopyInto(&out.ConsumerGateways[i])
 		}
 	}
+	if in.Membership != nil {
+		out.Membership = new(GridNetworkMembership)
+		in.Membership.DeepCopyInto(out.Membership)
+	}
 	if in.MetricsRefreshInterval != nil {
 		x := *in.MetricsRefreshInterval
 		out.MetricsRefreshInterval = &x
@@ -994,19 +1032,6 @@ func (in *GridNetworkGatewayAgeReportsItem) DeepCopy() *GridNetworkGatewayAgeRep
 	return out
 }
 
-func (in *GridNetworkIdentity) DeepCopyInto(out *GridNetworkIdentity) {
-	*out = *in
-}
-
-func (in *GridNetworkIdentity) DeepCopy() *GridNetworkIdentity {
-	if in == nil {
-		return nil
-	}
-	out := new(GridNetworkIdentity)
-	in.DeepCopyInto(out)
-	return out
-}
-
 func (in *GridNetworkMountReconciliationItem) DeepCopyInto(out *GridNetworkMountReconciliationItem) {
 	*out = *in
 	if in.DeploymentName != nil {
@@ -1074,10 +1099,6 @@ func (in *GridNetworkStatus) DeepCopyInto(out *GridNetworkStatus) {
 			in.GatewayAgeReports[i].DeepCopyInto(&out.GatewayAgeReports[i])
 		}
 	}
-	if in.Identity != nil {
-		out.Identity = new(GridNetworkIdentity)
-		in.Identity.DeepCopyInto(out.Identity)
-	}
 	if in.MountReconciliationStatus != nil {
 		out.MountReconciliationStatus = make([]GridNetworkMountReconciliationItem, len(in.MountReconciliationStatus))
 		for i := range in.MountReconciliationStatus {
@@ -1141,6 +1162,27 @@ func (in *GridSiteGatewayEndpoint) DeepCopy() *GridSiteGatewayEndpoint {
 	return out
 }
 
+func (in *GridSiteSignalsEndpoint) DeepCopyInto(out *GridSiteSignalsEndpoint) {
+	*out = *in
+	if in.Address != nil {
+		x := *in.Address
+		out.Address = &x
+	}
+	if in.ServerName != nil {
+		x := *in.ServerName
+		out.ServerName = &x
+	}
+}
+
+func (in *GridSiteSignalsEndpoint) DeepCopy() *GridSiteSignalsEndpoint {
+	if in == nil {
+		return nil
+	}
+	out := new(GridSiteSignalsEndpoint)
+	in.DeepCopyInto(out)
+	return out
+}
+
 func (in *GridSiteTrust) DeepCopyInto(out *GridSiteTrust) {
 	*out = *in
 	if in.CanonicalFingerprints != nil {
@@ -1171,6 +1213,10 @@ func (in *GridSiteSpec) DeepCopyInto(out *GridSiteSpec) {
 	if in.Region != nil {
 		x := *in.Region
 		out.Region = &x
+	}
+	if in.SignalsEndpoint != nil {
+		out.SignalsEndpoint = new(GridSiteSignalsEndpoint)
+		in.SignalsEndpoint.DeepCopyInto(out.SignalsEndpoint)
 	}
 	if in.SovereigntyZone != nil {
 		x := *in.SovereigntyZone
@@ -1221,6 +1267,12 @@ func (in *GridSiteStatus) DeepCopyInto(out *GridSiteStatus) {
 	if in.Capabilities != nil {
 		out.Capabilities = new(GridSiteCapabilities)
 		in.Capabilities.DeepCopyInto(out.Capabilities)
+	}
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		for i := range in.Conditions {
+			in.Conditions[i].DeepCopyInto(&out.Conditions[i])
+		}
 	}
 	if in.LastProbeTime != nil {
 		x := *in.LastProbeTime
@@ -1584,6 +1636,10 @@ func (in *InferenceProviderStatus) DeepCopyInto(out *InferenceProviderStatus) {
 	if in.ServedModelsExpiresAt != nil {
 		x := *in.ServedModelsExpiresAt
 		out.ServedModelsExpiresAt = &x
+	}
+	if in.ServedModelsObservedGeneration != nil {
+		x := *in.ServedModelsObservedGeneration
+		out.ServedModelsObservedGeneration = &x
 	}
 }
 
