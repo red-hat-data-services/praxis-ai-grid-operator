@@ -4,9 +4,10 @@ use std::{net::SocketAddr, time::Duration};
 
 use clap::{Args, Parser};
 
+pub use crate::crd::grid_network::MembershipMode as Membership;
 use crate::{
     crd::grid_network::{PeerTrustMode, SignalMode},
-    enroll, gateway,
+    gateway,
 };
 
 /// grid-operator command-line interface.
@@ -16,10 +17,6 @@ pub struct Cli {
     /// Gateway self-discovery options.
     #[command(flatten)]
     pub gateway: gateway::Config,
-
-    /// Site auto-enroll options.
-    #[command(flatten)]
-    pub enrollment: enroll::Config,
 
     /// SWIM runtime options.
     #[command(flatten)]
@@ -36,12 +33,84 @@ pub struct Cli {
     /// Metrics and health listener options.
     #[command(flatten)]
     pub metrics: MetricsArgs,
+
+    /// Leader election options.
+    #[command(flatten)]
+    pub leader: LeaderArgs,
+
+    /// Served-model discovery options.
+    #[command(flatten)]
+    pub model_discovery: ModelDiscoveryArgs,
+
+    /// The `ConfigMap` in the operator namespace holding this operator's own settings.
+    #[arg(
+        long = "operator-config",
+        env = "GRID_OPERATOR_CONFIG",
+        default_value = crate::operator_config::DEFAULT_CONFIG_MAP
+    )]
+    pub operator_config: String,
+
+    /// Signer hosts the operator config may name, comma-separated, each `host` or
+    /// `host:port`. Empty allows any.
+    #[arg(long = "signer-hosts", env = "GRID_SIGNER_HOSTS", default_value = "")]
+    pub signer_hosts: String,
+}
+
+/// Leader election options. With no lease, this replica writes unelected.
+#[derive(Args, Debug, Clone)]
+#[group(id = "leader")]
+pub struct LeaderArgs {
+    /// `Lease` in the operator's namespace that the writing replica holds.
+    #[arg(long = "leader-lease", env = "GRID_LEADER_LEASE")]
+    pub lease: Option<String>,
+
+    /// This replica's holder identity, its pod name.
+    #[arg(long = "leader-identity", env = "GRID_LEADER_IDENTITY")]
+    pub identity: Option<String>,
+
+    /// The operator Deployment's pod selector. A candidate does not contend while a pod it
+    /// matches runs unelected.
+    #[arg(long = "leader-replica-selector", env = "GRID_LEADER_REPLICA_SELECTOR")]
+    pub replica_selector: Option<String>,
+
+    /// Services carrying signals, routed to the holder alone once it has published signals.
+    #[arg(
+        long = "leader-signals-services",
+        env = "GRID_LEADER_SIGNALS_SERVICES",
+        value_delimiter = ','
+    )]
+    pub signals_services: Vec<String>,
+
+    /// Services carrying SWIM, routed to the holder alone as soon as it holds the lease.
+    #[arg(
+        long = "leader-swim-services",
+        env = "GRID_LEADER_SWIM_SERVICES",
+        value_delimiter = ','
+    )]
+    pub swim_services: Vec<String>,
+
+    /// This pod's address, the endpoint those Services route to.
+    #[arg(long = "leader-pod-ip", env = "POD_IP")]
+    pub pod_ip: Option<std::net::IpAddr>,
+
+    /// The node this pod runs on, which a `Local` traffic policy routes by.
+    #[arg(long = "leader-node-name", env = "GRID_NODE_NAME")]
+    pub node_name: Option<String>,
 }
 
 /// Grid-wide modes the install declares, used until its `GridNetwork` exists.
 #[derive(Args, Debug, Clone)]
 #[group(id = "grid")]
 pub struct GridArgs {
+    /// Membership fallback when `GridNetwork.spec.membership` is absent.
+    #[arg(
+        long = "membership-source",
+        env = "GRID_MEMBERSHIP_SOURCE",
+        value_enum,
+        default_value_t = Membership::Swim
+    )]
+    pub membership: Membership,
+
     /// Signal transport to start in with no `GridNetwork`, the chart's grid.signals.
     #[arg(long = "grid-signals", env = "GRID_SIGNAL_TRANSPORT", value_enum)]
     pub signal_transport: Option<SignalMode>,
@@ -53,6 +122,10 @@ pub struct GridArgs {
     /// `GridNetwork` the operator creates for its site when none exists.
     #[arg(long = "grid-network", env = "GRID_NETWORK", default_value = "grid")]
     pub network: String,
+
+    /// This site's name, as `GRID_SWIM_SITE_NAME` gives it, for an install that runs no SWIM.
+    #[arg(id = "grid_site_name", long = "grid-site-name", env = "GRID_SITE_NAME")]
+    pub site_name: Option<String>,
 
     /// Namespace holding the site identity before a `GridNetwork` names it. Defaults to the operator's.
     #[arg(long = "grid-identity-namespace", env = "GRID_IDENTITY_NAMESPACE")]
@@ -75,6 +148,16 @@ pub struct GridArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub create_local_records: bool,
+}
+
+impl GridArgs {
+    /// Default an unset Local transport to poll; validate after resolving network overrides.
+    pub fn startup_signal_transport(&self) -> Option<SignalMode> {
+        match (self.membership, self.signal_transport) {
+            (Membership::Local, None) => Some(SignalMode::Poll),
+            (_, mode) => mode,
+        }
+    }
 }
 
 /// Metrics and health listener options.
@@ -111,6 +194,69 @@ pub struct SwimArgs {
     /// This site's name, read once and used for SWIM, the certificate, and provider placement.
     #[arg(id = "swim_site_name", long = "swim-site-name", env = "GRID_SWIM_SITE_NAME")]
     pub site_name: Option<String>,
+
+    /// How long a dead member stays tracked before it is evicted, seconds.
+    #[arg(
+        id = "swim_dead_member_ttl_secs",
+        long = "swim-dead-member-ttl-secs",
+        env = "GRID_SWIM_DEAD_MEMBER_TTL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=99_999),
+        default_value_t = crate::swim_runtime::DEFAULT_DEAD_MEMBER_TTL.as_secs()
+    )]
+    pub dead_member_ttl_secs: u64,
+}
+
+impl SwimArgs {
+    /// Dead member lifetime.
+    #[must_use]
+    pub const fn dead_member_ttl(&self) -> Duration {
+        Duration::from_secs(self.dead_member_ttl_secs)
+    }
+}
+
+/// Served-model discovery cadence. Interval, timeout and TTL are bounded where they are used.
+#[derive(Args, Debug, Clone)]
+#[group(id = "model_discovery")]
+pub struct ModelDiscoveryArgs {
+    /// Time between discovery rounds, seconds.
+    #[arg(
+        id = "model_discovery_interval_secs",
+        long = "model-discovery-interval-secs",
+        env = "GRID_MODEL_DISCOVERY_INTERVAL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=2_592_000),
+        default_value_t = crate::served_models::DiscoveryConfig::default().interval.as_secs()
+    )]
+    pub interval_secs: u64,
+
+    /// Bound on one provider poll, seconds.
+    #[arg(
+        id = "model_discovery_timeout_secs",
+        long = "model-discovery-timeout-secs",
+        env = "GRID_MODEL_DISCOVERY_TIMEOUT_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=3_600),
+        default_value_t = crate::served_models::DiscoveryConfig::default().timeout.as_secs()
+    )]
+    pub timeout_secs: u64,
+
+    /// How long a discovered set is held without a successful poll, seconds.
+    #[arg(
+        id = "model_discovery_ttl_secs",
+        long = "model-discovery-ttl-secs",
+        env = "GRID_MODEL_DISCOVERY_TTL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=31_536_000),
+        default_value_t = crate::served_models::DiscoveryConfig::default().ttl.as_secs()
+    )]
+    pub ttl_secs: u64,
+
+    /// Providers polled at once.
+    #[arg(
+        id = "model_discovery_concurrency",
+        long = "model-discovery-concurrency",
+        env = "GRID_MODEL_DISCOVERY_CONCURRENCY",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=999),
+        default_value_t = crate::served_models::DiscoveryConfig::default().concurrency
+    )]
+    pub concurrency: usize,
 }
 
 /// Signals serving and peer polling options, used under signalTransport poll.
@@ -136,6 +282,27 @@ pub struct SignalsArgs {
         default_value_t = crate::signals::DEFAULT_PEER_PORT
     )]
     pub peer_port: u16,
+
+    /// Port a declared peer serves signals on at its gateway endpoint's host, for sites
+    /// whose one load balancer carries both. Unset, the gateway's own port, for sites
+    /// whose one router selects the signals listener by server name.
+    #[arg(
+        long = "signals-peer-endpoint-port",
+        env = "GRID_SIGNALS_PEER_ENDPOINT_PORT",
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    pub peer_endpoint_port: Option<u16>,
+
+    /// Concurrent handshakes one source address may hold. Behind a router or a load
+    /// balancer that does not keep the client address, every peer shares one source, so
+    /// raise it to the number of peers.
+    #[arg(
+        long = "signals-max-handshakes-per-source",
+        env = "GRID_SIGNALS_MAX_HANDSHAKES_PER_SOURCE",
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=65_535)
+    )]
+    pub max_per_source: usize,
 
     /// Concurrent authenticated connections one peer site may hold.
     #[arg(
@@ -181,11 +348,11 @@ pub struct SignalsArgs {
     )]
     pub peer_timeout_secs: u64,
 
-    /// Peers polled at once.
+    /// Peers polled at once, at most 32 and never more than there are peers.
     #[arg(
         long = "signals-peer-concurrency",
         env = "GRID_SIGNALS_PEER_CONCURRENCY",
-        default_value_t = 8
+        default_value_t = 32
     )]
     pub peer_concurrency: usize,
 
@@ -220,6 +387,16 @@ pub struct SignalsArgs {
         default_value_t = 1_000
     )]
     pub peer_slow_ms: u64,
+
+    /// How long a published site signal is served, seconds.
+    #[arg(
+        id = "signals_ttl_secs",
+        long = "signals-ttl-secs",
+        env = "GRID_SIGNALS_TTL_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=99_999),
+        default_value_t = crate::controller::grid_network::DEFAULT_SITE_SIGNALS_TTL.as_secs()
+    )]
+    pub ttl_secs: u64,
 
     /// How long a polled peer signal is served, seconds.
     #[arg(
@@ -259,6 +436,12 @@ impl SignalsArgs {
         Duration::from_millis(ms.max(50))
     }
 
+    /// Site signal lifetime, at least one second.
+    #[must_use]
+    pub fn site_ttl(&self) -> Duration {
+        Duration::from_secs(self.ttl_secs.max(1))
+    }
+
     /// Peer signal lifetime, at least one second.
     #[must_use]
     pub fn peer_ttl(&self) -> Duration {
@@ -285,7 +468,16 @@ impl SignalsArgs {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    #[test]
+    fn a_membership_header_names_a_known_mode_or_nothing() {
+        assert_eq!(super::Membership::parse(" local "), Some(super::Membership::Local));
+        assert_eq!(super::Membership::parse("Swim"), Some(super::Membership::Swim));
+        for unknown in ["", "gossip", "declared", "local; drop table", "swim2"] {
+            assert_eq!(super::Membership::parse(unknown), None, "{unknown:?}");
+        }
+    }
+
+    use std::{collections::HashSet, time::Duration};
 
     use clap::{CommandFactory as _, Parser as _};
 
@@ -303,6 +495,123 @@ mod tests {
         let ids: Vec<String> = Cli::command().get_groups().map(|g| g.get_id().to_string()).collect();
         let unique: HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "duplicate clap group ids: {ids:?}");
+    }
+
+    /// Local defaults to poll while explicit transport waits for network mode resolution.
+    #[test]
+    fn local_membership_starts_in_poll() {
+        let transport = |args: &[&str]| {
+            Cli::try_parse_from([&["grid-operator"], args].concat())
+                .map_err(|e| e.to_string())
+                .map(|cli| cli.grid.startup_signal_transport())
+        };
+        assert_eq!(transport(&[]), Ok(None), "Swim keeps the GridNetwork default");
+        assert_eq!(
+            transport(&["--membership-source", "Local"]),
+            Ok(Some(crate::crd::grid_network::SignalMode::Poll))
+        );
+        assert_eq!(
+            transport(&["--membership-source", "Local", "--grid-signals", "poll"]),
+            Ok(Some(crate::crd::grid_network::SignalMode::Poll))
+        );
+        assert_eq!(
+            transport(&["--membership-source", "Local", "--grid-signals", "gossip"]),
+            Ok(Some(crate::crd::grid_network::SignalMode::Gossip)),
+            "a network override can select Swim, so CLI defaults must not reject gossip"
+        );
+        assert!(
+            transport(&["--membership-source", "MemberService"]).is_err(),
+            "a member service is not a source yet"
+        );
+    }
+
+    /// The per-source handshake cap defaults to 8 and refuses zero.
+    #[test]
+    fn signals_handshakes_per_source_defaults_and_refuses_zero() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from([&["grid-operator"], args].concat()).map(|cli| cli.signals.max_per_source)
+        };
+        assert_eq!(parse(&[]).ok(), Some(8));
+        assert_eq!(parse(&["--signals-max-handshakes-per-source", "64"]).ok(), Some(64));
+        assert!(
+            parse(&["--signals-max-handshakes-per-source", "0"]).is_err(),
+            "zero is refused"
+        );
+    }
+
+    /// Settings that once fell back to a default on a bad value keep that default and refuse
+    /// the bad value.
+    #[test]
+    fn ttl_and_discovery_settings_keep_defaults_and_refuse_garbage() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["grid-operator"])?;
+        assert_eq!(cli.signals.site_ttl(), Duration::from_secs(30));
+        assert_eq!(cli.swim.dead_member_ttl(), Duration::from_secs(300));
+        let discovery = &cli.model_discovery;
+        assert_eq!(
+            (
+                discovery.interval_secs,
+                discovery.timeout_secs,
+                discovery.ttl_secs,
+                discovery.concurrency
+            ),
+            (60, 5, 180, 8)
+        );
+        for flag in [
+            "--signals-ttl-secs",
+            "--swim-dead-member-ttl-secs",
+            "--model-discovery-interval-secs",
+            "--model-discovery-timeout-secs",
+            "--model-discovery-ttl-secs",
+            "--model-discovery-concurrency",
+        ] {
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, "30s"]).is_err(),
+                "{flag} refuses an unreadable value"
+            );
+        }
+        Ok(())
+    }
+
+    /// Each setting takes the chart schema's range, so a value past it fails at startup, not at first use.
+    #[test]
+    fn ttl_and_discovery_settings_take_the_chart_range() {
+        for (flag, max) in [
+            ("--signals-ttl-secs", "99999"),
+            ("--swim-dead-member-ttl-secs", "99999"),
+            ("--model-discovery-interval-secs", "2592000"),
+            ("--model-discovery-timeout-secs", "3600"),
+            ("--model-discovery-ttl-secs", "31536000"),
+            ("--model-discovery-concurrency", "999"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, max]).is_ok(),
+                "{flag} takes {max}"
+            );
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, "0"]).is_err(),
+                "{flag} refuses 0"
+            );
+            let past = (max.parse::<u64>().unwrap_or_default() + 1).to_string();
+            assert!(
+                Cli::try_parse_from(["grid-operator", flag, past.as_str()]).is_err(),
+                "{flag} refuses {past}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["grid-operator", "--signals-ttl-secs", &u64::MAX.to_string()]).is_err(),
+            "a TTL that would overflow the expiry is refused at startup"
+        );
+    }
+
+    /// The peer endpoint port is a real port.
+    #[test]
+    fn signals_peer_endpoint_port_refuses_zero() {
+        let parse = |value: &str| {
+            Cli::try_parse_from(["grid-operator", "--signals-peer-endpoint-port", value])
+                .map(|cli| cli.signals.peer_endpoint_port)
+        };
+        assert_eq!(parse("9091").ok().flatten(), Some(9091));
+        assert!(parse("0").is_err(), "port 0 is refused");
     }
 
     /// The advertised signals endpoint is parsed strictly and normalized.

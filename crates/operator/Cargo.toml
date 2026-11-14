@@ -10,6 +10,7 @@ publish = false
 [features]
 default = ["tls-rustls"]
 tls-rustls = [
+  "swim/rust-crypto",
   "certs/rcgen",
   "grid-client/rcgen",
   "rmcp/reqwest-tls-no-provider",
@@ -20,6 +21,8 @@ tls-rustls = [
   "dep:tokio-rustls",
 ]
 fips = [
+  "dep:grid-fips",
+  "swim/fips",
   "certs/fips",
   "grid-client/fips",
   "rmcp/reqwest-native-tls",
@@ -31,6 +34,7 @@ fips = [
 ]
 
 [dependencies]
+grid-fips = { workspace = true, features = ["runtime"], optional = true }
 version.workspace = true
 axum = { workspace = true }
 bytes = { workspace = true }
@@ -38,7 +42,7 @@ clap = { workspace = true, features = ["env"] }
 certs = { path = "../certs", default-features = false }
 grid-client = { path = "../client", default-features = false, features = ["reqwest-client"] }
 crdt = { path = "../crdt" }
-swim = { path = "../swim" }
+swim = { path = "../swim", default-features = false }
 futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
@@ -52,7 +56,9 @@ grid-signals = { path = "../signals" }
 site-invite-api = { path = "../site-invite-api" }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
+kube-runtime = { workspace = true }
 percent-encoding = { workspace = true }
+pem = { workspace = true }
 prometheus = { workspace = true }
 schemars = { workspace = true }
 reqwest = { workspace = true }
@@ -78,6 +84,7 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # Server-side rmcp features, only for the mcp_probe integration tests, which
 # spin up a real Streamable HTTP MCP server to probe against.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
@@ -85,6 +92,7 @@ pem = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
+status-harness = { workspace = true }
 
 [lints]
 workspace = true

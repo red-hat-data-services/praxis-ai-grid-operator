@@ -1,16 +1,28 @@
 # cargo-deny policy for the gateway workspace. Mirrors the root deny.toml
-# (licenses, bans, registry sources) with two gateway-specific deltas: the
-# gateway depends on praxis-ai via git, and its rustls stack pulls an
-# unmaintained transitive crate the root graph does not.
+# (licenses, bans, registry sources), plus pinned Praxis git sources and
+# documented transitive advisory exceptions for the Gateway graph.
 
 [advisories]
 unmaintained = "all"
 maximum-db-staleness = "P30D"
 ignore = [
+  # PPE 0.6.0's default builtin bundle includes Limitador 0.14, which pulls
+  # atomic-polyfill through postcard/heapless and paste through CEL 0.12.
+  # Both are unmaintained with no patched versions; replacement needs an
+  # upstream dependency change. Neither is in the Policy FIPS profiles.
+  { id = "RUSTSEC-2023-0089", reason = "unmaintained atomic-polyfill via Limitador/postcard/heapless; no patched version" },
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained paste via Limitador/CEL 0.12; no patched version" },
   # rustls-pemfile is unmaintained (RUSTSEC-2025-0134); it is a transitive
   # dependency of the gateway's rustls/Pingora TLS stack with no upstream
   # replacement wired yet.
   { id = "RUSTSEC-2025-0134", reason = "transitive via rustls; no upstream fix available" },
+  # The upstream Pingora header-serde release pins zstd 0.13 and zstd-safe 7;
+  # no compatible release is available for the fixed zstd 0.14 / zstd-safe 8.
+  { id = "RUSTSEC-2026-0391", reason = "upstream header-serde pins zstd 0.13; no compatible fixed release available" },
+  { id = "RUSTSEC-2026-0398", reason = "upstream header-serde pins zstd-safe 7; no compatible fixed release available" },
+  { id = "RUSTSEC-2026-0403", reason = "upstream header-serde pins zstd-safe 7; no compatible fixed release available" },
+  # This allocator-shim issue is wasm32-only; grid-gateway is a native binary.
+  { id = "RUSTSEC-2026-0410", reason = "wasm32-only allocator issue; grid-gateway does not target wasm32" },
 ]
 
 [licenses]

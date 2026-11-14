@@ -1,5 +1,8 @@
 //! The opt-in metrics listener serves only `GET /metrics` over TLS, to any Host.
 
+#[path = "support/ports.rs"]
+mod ports;
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -12,7 +15,7 @@
 mod tests {
     use std::{
         io::{Read as _, Write as _},
-        net::{TcpListener, TcpStream},
+        net::TcpStream,
         path::PathBuf,
         process::{Child, Command, Stdio},
         sync::Arc,
@@ -26,15 +29,13 @@ mod tests {
         pki_types::{CertificateDer, ServerName, pem::PemObject as _},
     };
 
+    use super::ports::free_port;
+
     /// Bound on how long a test waits for the child.
     const TIMEOUT: Duration = Duration::from_secs(30);
 
     /// The SAN `generate_site_cert` gives site `metrics`.
     const SERVER_NAME: &str = "metrics.grid.internal";
-
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-    }
 
     /// A running gateway, killed on drop.
     struct Gateway(Child);
@@ -91,6 +92,8 @@ mod tests {
                 .arg("--config")
                 .arg(setup.dir.join("praxis.yaml"))
                 .env_remove("GRID_SERVING_CONFIG")
+                .env_remove("GRID_METRICS_AUTH_NAMESPACE")
+                .env_remove("GRID_METRICS_AUTH_RESOURCE_NAME")
                 .env("GRID_METRICS_ADDR", format!("127.0.0.1:{metrics_port}"))
                 .env("GRID_METRICS_TLS_CERT", setup.dir.join("tls.crt"))
                 .env("GRID_METRICS_TLS_KEY", setup.dir.join("tls.key"))
@@ -137,8 +140,8 @@ mod tests {
             port,
             "GET /metrics HTTP/1.1\r\nHost: grid-gateway.grid-system.svc\r\n\r\n",
         );
-        assert!(metrics.starts_with("HTTP/1.1 200 "), "{metrics}");
-        assert!(metrics.contains("text/plain; version=0.0.4"), "{metrics}");
+        assert!(metrics.starts_with("HTTP/1.1 401 "), "{metrics}");
+        assert!(metrics.contains("\r\nWWW-Authenticate: Bearer\r\n"), "{metrics}");
 
         let kv = eventually(&setup.client, port, "GET /api/kv HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(kv.starts_with("HTTP/1.1 404 "), "{kv}");
@@ -155,11 +158,12 @@ mod tests {
         let setup = setup("metrics-listener-cap");
         let port = free_port();
         let _gateway = start(&setup, port);
-        eventually(&setup.client, port, "GET /metrics HTTP/1.1\r\n\r\n");
+        let initial = eventually(&setup.client, port, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(initial.starts_with("HTTP/1.1 401 "), "{initial}");
 
-        // Four idle connections hold every slot until the handshake deadline.
+        // Sixteen idle connections hold every slot until the handshake deadline.
         let held: Vec<TcpStream> = std::iter::repeat_with(|| TcpStream::connect(("127.0.0.1", port)).unwrap())
-            .take(4)
+            .take(16)
             .collect();
         // Poll inside the 2s handshake deadline, which would free the held slots.
         let deadline = Instant::now().checked_add(Duration::from_millis(1500)).unwrap();
@@ -172,10 +176,10 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         };
-        assert!(refused, "a fifth connection is closed");
+        assert!(refused, "a seventeenth connection is closed");
         drop(held);
         let after = eventually(&setup.client, port, "GET /metrics HTTP/1.1\r\n\r\n");
-        assert!(after.starts_with("HTTP/1.1 200 "), "{after}");
+        assert!(after.starts_with("HTTP/1.1 401 "), "{after}");
     }
 
     #[test]

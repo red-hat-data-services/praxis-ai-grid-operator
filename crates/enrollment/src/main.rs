@@ -22,6 +22,20 @@ mod bootstrap;
 #[cfg(feature = "bootstrap")]
 mod invite;
 
+/// The namespace a one-shot command works in: the flag, else `pod_namespace`, the value
+/// of `POD_NAMESPACE`.
+///
+/// Refuses to guess, since a fallback to `default` would write the CA or invites where no
+/// reader looks.
+#[cfg(feature = "bootstrap")]
+fn work_namespace(flag: Option<&str>, pod_namespace: Option<String>) -> Result<String, String> {
+    flag.map(str::to_owned)
+        .or(pod_namespace)
+        .map(|namespace| namespace.trim().to_owned())
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or_else(|| "no namespace: pass --namespace or set POD_NAMESPACE".to_owned())
+}
+
 /// How long in-flight requests are given to finish once a shutdown signal lands.
 /// Kept below the Kubernetes default 30s termination grace period, so the drain
 /// has margin before SIGKILL rather than racing it.
@@ -98,10 +112,6 @@ fn version_requested() -> bool {
 }
 
 #[tokio::main]
-#[expect(
-    clippy::too_many_lines,
-    reason = "startup wires config, TLS, store, authz, drain, and cert reload in one sequence"
-)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if version_requested() {
         use std::io::Write as _;
@@ -127,6 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(not(feature = "bootstrap"))]
     reject_bootstrap_without_feature(std::env::args_os())?;
+
+    #[cfg(feature = "fips")]
+    grid_fips::verify().map_err(|error| error.to_string())?;
 
     let ca_cert_path = std::env::var(CA_CERT_PATH).map_err(|error| format!("{CA_CERT_PATH}: {error}"))?;
     let ca_key_path = std::env::var(CA_KEY_PATH).map_err(|error| format!("{CA_KEY_PATH}: {error}"))?;
@@ -154,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // feature, kept off the startup stack frame.
     let authorizer = Box::pin(build_authorizer()).await?;
     #[cfg(feature = "csr-record")]
-    let recorder = load_recorder(&authorizer).await?;
+    let recorder = Box::pin(load_recorder(&authorizer)).await?;
     let state = Arc::new(AppState {
         store,
         ca: SharedCa::new(ca),
@@ -198,11 +211,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = Handle::new();
     tokio::spawn(shutdown_signal(handle.clone()));
 
+    #[cfg(feature = "csr-record")]
+    let record_drain = state.recorder.clone();
+
     let addr: SocketAddr = listen.parse()?;
     tracing::info!(%addr, "enrollment service listening over https");
     // The acceptor hands each connection's verified client leaf to the renewal handler.
     let server = axum_server::bind(addr).acceptor(PeerAcceptor(TlsAcceptor::new(tls)));
     Box::pin(server.handle(handle).serve(router(state).into_make_service())).await?;
+
+    #[cfg(feature = "csr-record")]
+    Box::pin(drain_records(record_drain)).await;
     Ok(())
 }
 
@@ -510,6 +529,20 @@ async fn load_recorder(authorizer: &Authorizer) -> Result<Option<Arc<enrollment:
     Ok(Some(Arc::new(recorder)))
 }
 
+/// Wait for outstanding recording tasks so a shutdown between CSR calls does
+/// not leave a partial record on the hub. Bounded so the request drain plus
+/// a slow record stays inside the default thirty-second grace period.
+#[cfg(feature = "csr-record")]
+async fn drain_records(recorder: Option<Arc<enrollment::record::Recorder>>) {
+    if let Some(recorder) = &recorder
+        && tokio::time::timeout(Duration::from_secs(4), recorder.drain())
+            .await
+            .is_err()
+    {
+        tracing::warn!("recording tasks still running at shutdown");
+    }
+}
+
 /// Say at startup which rights a record would lack, so a missing role shows
 /// before the first enrollment rather than in its log line.
 #[cfg(feature = "csr-record")]
@@ -755,5 +788,24 @@ mod tests {
         ] {
             assert!(require_db_tls(url).is_ok(), "{url} fully verifies the server");
         }
+    }
+
+    #[cfg(feature = "bootstrap")]
+    #[test]
+    fn a_one_shot_command_needs_a_namespace() {
+        let namespace = |flag: Option<&str>, pod: Option<&str>| super::work_namespace(flag, pod.map(str::to_owned));
+        assert_eq!(namespace(Some(" grid-system "), None).as_deref(), Ok("grid-system"));
+        assert_eq!(namespace(None, Some(" grid-system ")).as_deref(), Ok("grid-system"));
+        assert_eq!(
+            namespace(Some("flagged"), Some("pod")).as_deref(),
+            Ok("flagged"),
+            "the flag wins over POD_NAMESPACE"
+        );
+        assert!(namespace(None, None).is_err(), "no flag and no POD_NAMESPACE");
+        assert!(namespace(Some(" "), None).is_err(), "a blank flag is not a namespace");
+        assert!(
+            namespace(None, Some(" ")).is_err(),
+            "a blank POD_NAMESPACE is not a namespace"
+        );
     }
 }

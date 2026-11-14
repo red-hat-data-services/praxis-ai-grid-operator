@@ -10,12 +10,15 @@ mod conformance;
 mod control;
 mod decisions;
 mod descriptor;
+mod dial;
 #[cfg(test)]
 mod flow;
+mod geo;
 mod health;
 mod metadata;
 mod pin;
 mod prefix;
+mod provider;
 mod route;
 mod serving;
 mod signals;
@@ -24,24 +27,31 @@ mod snapshot;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-pub use control::{ReloadOutcome, Tuning};
+pub use control::{Binding, ReloadOutcome, Tuning};
 pub use decisions::SiteDecisions;
 // The routing model and the snapshot builder are the crate's control-plane API:
 // the gateway's refresh step orders candidates by live load and swaps the
 // snapshot. The request path only reads a snapshot.
 pub use descriptor::{AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate};
+pub use dial::{BACKEND_CA_BASE, CREDENTIAL_BASE, Dialed, GRID_TLS_MOUNT, GridIdentity};
 pub use health::ClusterHealth;
 pub use metadata::{CandidateCredential, CredentialRef};
 use praxis_filter::{FilterError, FilterFactory, FilterRegistry, HttpFilter};
 pub use prefix::{AffinitySettings, PrefixAffinity};
+pub use provider::{
+    PROVIDER_FILE, ProviderCandidate, ProviderConfig, ProviderRuntime, ProviderSnapshot, spawn_provider,
+    validate_provider,
+};
 pub use serving::{
-    AvailabilitySettings, GridRuntime, GridServingConfig, PeerServingConfig, load_serving_config, spawn_grid_routing,
+    AvailabilitySettings, CredentialStrategy, DIAL_FILE, DialConfig, DialCredential, DialSpec, DialTransport,
+    DialVersion, GridRuntime, GridServingConfig, PeerServingConfig, dial_config_path, load_dial_config,
+    load_serving_config, spawn_grid_routing,
 };
 pub use signals::{Over, SiteReading, SiteSignals};
 pub use snapshot::RouteSnapshot;
 
 /// Grid counters the gateway emits, with the help text a scrape shows.
-const COUNTER_HELP: [(&str, &str); 8] = [
+const COUNTER_HELP: [(&str, &str); 13] = [
     (
         "grid_route_decisions_total",
         "Requests the gateway decided, by outcome. A refusal records an empty site and cluster.",
@@ -51,8 +61,16 @@ const COUNTER_HELP: [(&str, &str); 8] = [
         "Decisions by the path that produced them.",
     ),
     (
+        "grid_route_fenced_total",
+        "Requests the sovereignty fence refused, or would have when it only logs, by cause.",
+    ),
+    (
         "grid_route_prefix_affinity_total",
         "Prefix-affinity decisions by outcome.",
+    ),
+    (
+        "grid_route_prefix_index_evictions_total",
+        "Prefix keys that left a backend cluster's index, by reason: capacity for a live key a full index displaced, ttl for a confirmed key past its lifetime, pending for an expired key a request still waited on, forgotten for a failed or refused request's.",
     ),
     ("grid_serving_config_reload_total", "Serving-config reloads by result."),
     (
@@ -68,17 +86,49 @@ const COUNTER_HELP: [(&str, &str); 8] = [
         "grid_signals_feedback_failures_total",
         "Failed gateway feedback delivery attempts, by bounded reason.",
     ),
+    (
+        "grid_dial_failures_total",
+        "Dialed requests that got no response, or a gateway error no grid gateway attributed, by cluster.",
+    ),
+    (
+        "grid_provider_requests_total",
+        "Peer requests a provider gateway served or refused, by result.",
+    ),
+    (
+        "grid_provider_config_reload_total",
+        "Provider-file reloads by result. A refused file keeps the last good one.",
+    ),
 ];
 
 /// Grid gauges the gateway emits.
-const GAUGE_HELP: [(&str, &str); 17] = [
+const GAUGE_HELP: [(&str, &str); 29] = [
+    (
+        "grid_serving_unbound_provider_hops",
+        "Provider hops the applied serving config declares that no startup-verified backend binds. Their candidates take no traffic until a serving config names the SNI that backend verified at startup, or, for a backend not verified at startup, until the gateway restarts.",
+    ),
+    (
+        "grid_serving_undialable_clusters",
+        "Dials in the applied dial file whose TLS files could not be read. Their candidates take no traffic until the files read.",
+    ),
+    (
+        "grid_serving_refused_dial_clusters",
+        "Dials in the applied dial file praxis refused, such as a private or metadata host not trusted. Their candidates take no traffic.",
+    ),
+    (
+        "grid_serving_dial_shadowed_clusters",
+        "Dials that replace a load_balancer cluster of the same name.",
+    ),
+    (
+        "grid_dial_down",
+        "1 while a dial is down after consecutive failures, 0 otherwise. A down dial is ordered last, never excluded.",
+    ),
     (
         "grid_route_site_rho",
         "Saturation the draw weights the site by: the nearest limit it is up against, smoothed across samples. NaN when unmeasured.",
     ),
     (
         "grid_route_site_rho_reported",
-        "Saturation the site reports about itself, as its KV cache utilization plus the spread across its pods. NaN where it reports none.",
+        "The EPP's own pool saturation, published with flow control on; for a site without an in-flight count, the comparator it is read by. Uncapped. NaN where neither exists.",
     ),
     (
         "grid_route_site_rho_counted",
@@ -95,6 +145,18 @@ const GAUGE_HELP: [(&str, &str); 17] = [
     (
         "grid_route_site_ceiling_soft",
         "Most requests the current site size has carried with nothing waiting. NaN until it is seen queue-free; retired after a sustained loss of serving units.",
+    ),
+    (
+        "grid_route_site_rho_derived",
+        "Gateway approximation of the EPP's pool saturation from pool averages at the detector's default thresholds. Uncapped. NaN without a KV share.",
+    ),
+    (
+        "grid_route_site_rho_published",
+        "1 when the comparator is the EPP's published pool saturation, 0 when it is the gateway's approximation; the two use different thresholds, the EPP's configured ones and the detector defaults. NaN without one.",
+    ),
+    (
+        "grid_route_site_capacity_implied",
+        "Requests the site would run at a full cache, running over KV share at queue-free instants. NaN below a 0.15 share or without one.",
     ),
     (
         "grid_route_site_ceiling_hard",
@@ -129,8 +191,24 @@ const GAUGE_HELP: [(&str, &str); 17] = [
         "Score the site ranks by in the current snapshot. NaN when excluded or demoted.",
     ),
     (
+        "grid_route_site_score_unavailable",
+        "1 when an otherwise routable load-publishing site has no queue score, by bounded reason: absent, stale, or unreadable. 0 otherwise.",
+    ),
+    (
+        "grid_route_candidate_info",
+        "1 while the gateway lists the model as a candidate at the site's backend cluster, 0 once it no longer does. Join a per-site series on site and cluster with == 1; a cluster serving more than one model has one series per model.",
+    ),
+    (
         "grid_route_shedding",
         "1 while the gateway sheds this model, 0 otherwise.",
+    ),
+    (
+        "grid_route_prefix_index_entries",
+        "Prefix keys this replica holds for a backend cluster, expired ones included until displaced.",
+    ),
+    (
+        "grid_route_prefix_index_capacity",
+        "Prefix keys this replica may hold for a backend cluster. 0 once the cluster leaves the serving config.",
     ),
     (
         "grid_signals_last_success_timestamp_seconds",
@@ -195,4 +273,19 @@ pub fn register_grid_filters(
         )
     };
     registry.register("grid_site_route", FilterFactory::Http(Arc::new(factory)))
+}
+
+/// Register `grid_provider` into `registry` over the snapshot `spawn_provider` keeps current.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the filter name is already registered.
+pub fn register_provider_filter(
+    registry: &mut FilterRegistry,
+    snapshot: Arc<ArcSwap<ProviderSnapshot>>,
+) -> Result<(), FilterError> {
+    let factory = move |config: &serde_yaml::Value| -> Result<Box<dyn HttpFilter>, FilterError> {
+        provider::GridProviderFilter::from_config(config, Arc::clone(&snapshot))
+    };
+    registry.register("grid_provider", FilterFactory::Http(Arc::new(factory)))
 }

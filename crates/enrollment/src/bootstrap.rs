@@ -17,6 +17,8 @@ use std::error::Error;
 
 use clap::Parser;
 
+mod grid_id;
+
 /// Boxed error that is `Send + Sync` so the async command future stays `Send`.
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -25,10 +27,16 @@ type BoxError = Box<dyn Error + Send + Sync>;
 #[expect(clippy::struct_excessive_bools, reason = "independent clap switches")]
 #[command(name = "bootstrap", about = "Mint or load the Grid CA and write it as Secrets")]
 struct BootstrapArgs {
-    /// Namespace to read and write Secrets in. Defaults to `POD_NAMESPACE`, then
-    /// `default`.
+    /// Namespace to read and write Secrets in. Defaults to `POD_NAMESPACE`; with neither,
+    /// bootstrap refuses to run.
     #[arg(long)]
     namespace: Option<String>,
+    /// Persist the grid ID once in this `ConfigMap`, independently of CA rotation.
+    #[arg(long)]
+    grid_id_config_map: Option<String>,
+    /// Ignored. Accepted so callers that still pass it keep working; bootstrap reads no `GridNetwork`.
+    #[arg(long = "grid-network", hide = true)]
+    _grid_network: Option<String>,
     /// Common name recorded on the CA certificate.
     #[arg(long, default_value = "grid-ca")]
     common_name: String,
@@ -118,6 +126,8 @@ struct BootstrapArgs {
 /// sits in the argv0 slot clap ignores and the flags parse as usual.
 pub(crate) async fn run() -> Result<(), BoxError> {
     let args = BootstrapArgs::parse_from(std::env::args_os().skip(1));
+    #[cfg(feature = "fips")]
+    grid_fips::verify().map_err(|error| error.to_string())?;
     Box::pin(bootstrap(&args)).await
 }
 
@@ -130,9 +140,13 @@ async fn bootstrap(args: &BootstrapArgs) -> Result<(), BoxError> {
     use k8s_openapi::api::core::v1::Secret;
     use kube::api::Api;
 
-    let namespace = resolve_namespace(args);
+    let namespace = crate::work_namespace(args.namespace.as_deref(), std::env::var("POD_NAMESPACE").ok())?;
     check_site_args(args)?;
     let client = kube::Client::try_default().await?;
+    if let Some(name) = &args.grid_id_config_map {
+        let id = grid_id::ensure(&client, &namespace, name).await?;
+        tracing::info!(grid_id = %id, "bootstrap grid identity is persisted");
+    }
     let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
 
     Box::pin(await_secret_confinement(&secrets, args)).await?;
@@ -234,14 +248,6 @@ async fn create_key_secret(
         Err(kube::Error::Api(response)) if response.code == 409 => Ok(Some(Box::pin(held_key(secrets, name)).await?)),
         Err(error) => Err(error.into()),
     }
-}
-
-/// The namespace to work in: the flag, then `POD_NAMESPACE`, then `default`.
-fn resolve_namespace(args: &BootstrapArgs) -> String {
-    args.namespace
-        .clone()
-        .or_else(|| std::env::var("POD_NAMESPACE").ok())
-        .unwrap_or_else(|| "default".to_owned())
 }
 
 /// A Secret no allowlist in this chart carries, so admitting it means nothing is enforcing.
@@ -413,10 +419,6 @@ fn is_conflict(error: &(dyn Error + Send + Sync + 'static)) -> bool {
 ///
 /// Peers pin the leaf's digest, so an existing identity is kept, even an expired
 /// or unchained one, unless `--force-regenerate` is set.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep or issue the identity, then seed its key, read as one step"
-)]
 async fn ensure_site_identity(
     client: &kube::Client,
     ca: &certs::CaCert,
@@ -508,7 +510,6 @@ fn seed_is_current(held: Option<&enrollment::SeedRecord>, site: &str, leaf_key: 
 /// an older seed.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "the seed's fields and where it goes, each used once"
 )]
 async fn ensure_seed(
@@ -817,10 +818,6 @@ fn hub_ca_write(view: Option<&SecretView>, ca_cert_pem: &str, force: bool) -> Hu
 ///
 /// Load when the Secret exists and no regenerate is forced, so re-runs keep the
 /// same CA. The signing key is written only to the CA-key Secret.
-#[expect(
-    clippy::too_many_lines,
-    reason = "load, refuse, or mint the CA reads as one decision"
-)]
 async fn resolve_ca(
     client: &kube::Client,
     secrets: &kube::api::Api<k8s_openapi::api::core::v1::Secret>,
@@ -1301,10 +1298,19 @@ mod tests {
         BootstrapArgs::parse_from(["bootstrap", "--site-name", "hub"].iter().chain(extra))
     }
 
+    #[test]
+    fn an_older_chart_passing_grid_network_still_parses() {
+        let args =
+            BootstrapArgs::try_parse_from(["bootstrap", "--grid-id-config-map", "state", "--grid-network", "grid"]);
+        assert!(
+            args.is_ok_and(|args| args.grid_id_config_map.as_deref() == Some("state")),
+            "an older chart's --grid-network must parse and be ignored"
+        );
+    }
+
     /// The whole bootstrap order on a hub where the operator self-signed first: the
     /// CA, then the hub's CA Secret, then its identity, then a second run.
     #[test]
-    #[expect(clippy::too_many_lines, reason = "the whole bootstrap order, then a second run")]
     fn an_operator_placeholder_does_not_block_a_first_hub_install() {
         let placeholder = certs::generate_ca("grid-ca").expect("placeholder");
         let (hub_ca, hub_identity) = (view(None, &placeholder.cert_pem), identity(None, &placeholder));

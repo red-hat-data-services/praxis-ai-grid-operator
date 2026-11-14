@@ -20,6 +20,8 @@
 
 - [Overview](architecture/overview.md): operator responsibilities, data-plane
   boundaries, workspace crates, and terminology.
+- [Signed Gossip Trust](architecture/signed-gossip-trust.md): peer certificate
+  policy, certificate bootstrap, signed state verification, and source map.
 - [Auth and Policy](architecture/auth.md): provider authentication strategies,
   access policy, and trust model.
 - [Enrollment](architecture/enrollment.md): how a site becomes a member: parties,
@@ -41,6 +43,8 @@
   workflow for in-cluster, existing-service, and external HTTPS providers.
 - [Metrics Reference](metrics.md): every metric the operator and the gateway
   export, with types, labels, and what each one means.
+- [Scaling the signals listener](architecture/signals-scaling.md): connections per peer, listener bounds,
+  polling cost, and the limits to size behind an OpenShift router.
 - [Operations](architecture/operations.md): local environment setup,
   validation commands, and operator workflows.
 - [CI Kind E2E](architecture/ci-kind-e2e.md): validation tiers, gate sequence,
@@ -60,6 +64,10 @@
 - [Provider Traffic Qualification](../tests/e2e/topologies/grid-provider-traffic/README.md):
   proves multi-cluster discovery, accepted-overlay delivery, request-time
   round-robin selection, provider attribution, and stable routing.
+- [Operator-derived Local Routing Qualification](../tests/e2e/topologies/grid-operator-routing/README.md):
+  proves operator-derived local dials reach the embedded Gateway, attributed
+  requests follow those dials, passive health demotes and recovers a failed
+  backend, and endpoint replacement eventually routes to the replacement backend.
 - [Static Weighted Provider Qualification](../tests/e2e/topologies/grid-static-weighted/README.md):
   proves configured capacity propagation, weighted overlay convergence,
   proportional request selection, hot reload, and equal-weight recovery. This

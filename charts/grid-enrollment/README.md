@@ -1,5 +1,9 @@
 # Grid Enrollment Helm Chart
 
+Choose `mode: service` (the default) or `mode: external` for identity issuance.
+See [External identities](EXTERNAL.md) for bootstrap, enrollment, optional PKI
+integrations, managed-cluster delivery, and the planned decommission sequence.
+
 Helm chart for the grid enrollment service: the enrollment authority for a grid,
 its self-provisioned Grid CA, and a Postgres store. No values are required: given the
 namespaces under Prerequisites, an install stands up a site ready to enroll.
@@ -30,8 +34,14 @@ namespaces under Prerequisites, an install stands up a site ready to enroll.
 Batteries included. Off OpenShift no values are required:
 
 ```bash
-helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace
+helm install grid-enrollment charts/grid-enrollment --namespace grid-enrollment --create-namespace
 ```
+
+The enrollment Service takes the release fullname. A grid-operator hub with
+`enrollment.hub: true` dials `grid-enrollment` in namespace `grid-enrollment` by default,
+so the release and namespace above match it. Under another release or namespace, set the
+operator's `enrollment.hubService` to this release's fullname and
+`rbac.enrollmentNamespace` to its namespace.
 
 The default install generates the Grid CA, the endpoint serving cert, and the
 Postgres credentials through a pre-install hook, deploys Postgres, and runs the
@@ -53,7 +63,7 @@ rendered passthrough Route needs `route.host`, which the bootstrap adds to the
 serving cert SAN:
 
 ```bash
-helm install grid charts/grid-enrollment --namespace grid-enroll --create-namespace \
+helm install grid-enrollment charts/grid-enrollment --namespace grid-enrollment --create-namespace \
   --set route.host=enrollment.apps.<cluster-domain>
 ```
 
@@ -63,9 +73,9 @@ RBAC also remains after `helm uninstall`. This keeps it available for retries
 and avoids Helm 3.19 and later deleting earlier successful hooks when a later
 hook fails. If you uninstall the release and want to remove the privileged
 bootstrap identity, delete the `ServiceAccount`, `Role`, and `RoleBinding`
-named `<release>-grid-enrollment-ca-bootstrap` in the release namespace. When
-`hubSite.name` is set, delete the matching `-hub-site` `Role` and `RoleBinding`
-in the hub-site namespace on every uninstall, before deleting the release
+named `<fullname>-ca-bootstrap`, cut to 63 characters, in the release namespace.
+When `hubSite.name` is set, delete the `Role` and `RoleBinding` of that name with
+`-hub-site` appended in the hub-site namespace on every uninstall, before deleting the release
 namespace: they name the ServiceAccount only by namespace and name, so
 whoever creates that namespace again inherits their access. Retry a failed
 bootstrap with
@@ -128,7 +138,7 @@ Each `invites` entry (`siteName`, `gridNetworkRef`, optional `expiresInSecs` up 
 
 ## Hub site identity
 
-The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the bootstrap Job issues the hub's site identity straight from the grid CA, with the same SPIFFE name, key usage, and lifetime an enrolled site receives. It writes Secret `grid-site-identity` and the CA Secret `grid-ca` to `hubSite.namespace`. It also creates the grid's 32-byte SWIM key once, as `hubSite.swimKeySecretName` (default `grid-swim-key`), in both the release namespace, where a delivery channel such as an ACM Policy can copy it to sites, and `hubSite.namespace`. In `hubSite.namespace` the Job holds `create` on any Secret, since `create` cannot be scoped by name, `get` and `update` on the identity and CA Secrets, `delete` on the identity Secret to replace a placeholder, and `get` on the SWIM key Secret. A ValidatingAdmissionPolicy confines that unscopable `create` to the Secret names this chart renders, in the two namespaces it renders them in, and to the `Opaque` and `kubernetes.io/tls` types the bootstrap writes. The type constraint is load bearing, not belt and braces: this account also holds `delete` on the identity Secret, so a name-only rule would let it delete that name and recreate it as a `kubernetes.io/service-account-token` annotated for another ServiceAccount, which the token controller then fills with a non-expiring token for that account. Install the hub operator with `enrollment.enabled=false`. The chart does not create `hubSite.namespace`, since the hub operator's release owns it, so create it before installing this chart (`kubectl create namespace grid`); its hook RBAC fails otherwise. The enrollment service reserves the name too, refusing to mint or redeem a token for it, so no invite can issue a second identity for the hub.
+The hub hosts enrollment, so it cannot enroll itself. Set `hubSite.name` and the bootstrap Job issues the hub's site identity straight from the grid CA, with the same SPIFFE name, key usage, and lifetime an enrolled site receives. It writes Secret `grid-site-identity` and the CA Secret `grid-ca` to `hubSite.namespace`. It also creates the grid's 32-byte SWIM key once, as `hubSite.swimKeySecretName` (default `grid-swim-key`), in both the release namespace, where a delivery channel such as a governance Policy can copy it to sites, and `hubSite.namespace`. In `hubSite.namespace` the Job holds `create` on any Secret, since `create` cannot be scoped by name, `get` and `update` on the identity and CA Secrets, `delete` on the identity Secret to replace a placeholder, and `get` on the SWIM key Secret. A ValidatingAdmissionPolicy confines that unscopable `create` to the Secret names this chart renders, in the two namespaces it renders them in, and to the `Opaque` and `kubernetes.io/tls` types the bootstrap writes. The type constraint is load bearing, not belt and braces: this account also holds `delete` on the identity Secret, so a name-only rule would let it delete that name and recreate it as a `kubernetes.io/service-account-token` annotated for another ServiceAccount, which the token controller then fills with a non-expiring token for that account. Install the hub operator with `enrollment.enabled=false`. The chart does not create `hubSite.namespace`, since the hub operator's release owns it, so create it before installing this chart (`kubectl create namespace grid`); its hook RBAC fails otherwise. The enrollment service reserves the name too, refusing to mint or redeem a token for it, so no invite can issue a second identity for the hub.
 
 The invite token Secrets live in a namespace of their own, `<release-namespace>-invites`
 unless `enrollment.inviteSecrets.namespace` names another. The chart creates it, since
@@ -197,11 +207,11 @@ the policies off, delete them by hand:
 
 ```
 kubectl delete validatingadmissionpolicybinding \
-  <release>-grid-enrollment-<namespace>-bootstrap-secrets \
-  <release>-grid-enrollment-<namespace>-invite-secrets
+  <fullname>-<namespace>-bootstrap-secrets \
+  <fullname>-<namespace>-invite-secrets
 kubectl delete validatingadmissionpolicy \
-  <release>-grid-enrollment-<namespace>-bootstrap-secrets \
-  <release>-grid-enrollment-<namespace>-invite-secrets
+  <fullname>-<namespace>-bootstrap-secrets \
+  <fullname>-<namespace>-invite-secrets
 ```
 
 The invite namespace outlives an uninstall too. Deleting it destroys every invite token

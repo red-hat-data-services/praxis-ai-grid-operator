@@ -14,18 +14,18 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit lint gateway-lint lint-extra fmt doc audit \
+	test test-unit lint gateway-lint gateway-fips-check lint-extra fmt doc audit \
 	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
 	generate-go-types go-types-check \
 	coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
-	images container operator-image gateway-image \
-	mock-providers-image overlay-sync-image fleet-dashboard-image fleet-dashboard-web glb-demo-images \
+	images container operator-image operator-fips-image gateway-image \
+	mock-providers-image overlay-sync-image overlay-sync-fips-image fleet-dashboard-image fleet-dashboard-web glb-demo-images \
 	kind-up kind-down \
 	dev-env dev-push \
 	setup-hooks \
-	helm-lint helm-test praxis-gateway-e2e \
+	helm-lint helm-test praxis-gateway-e2e gateway-metrics-e2e \
 	help
 
 # -------------------------------------------------------------------
@@ -76,6 +76,16 @@ gateway-lint:
 	  tree="$$(cargo tree --manifest-path crates/gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
 	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
 	  if printf '%s\n' "$$tree" | grep -q '^ring '; then echo "ring is in the gateway's normal dependency tree" >&2; exit 1; fi
+
+# Compile and assess Policy profiles; runtime validation needs a FIPS provider.
+gateway-fips-check:
+	@set -eu; for features in fips fips,policy-jwt-fips policy-jwt-fips; do \
+	  cargo check --locked --manifest-path crates/gateway/Cargo.toml --workspace --all-targets --no-default-features --features "$$features"; \
+	  cargo test --locked --manifest-path crates/gateway/Cargo.toml --no-default-features --features "$$features" --test policy_build_contract; \
+	  tree="$$(cargo tree --locked --manifest-path crates/gateway/Cargo.toml -p gateway --no-default-features --features "$$features" -e normal,build --target all --prefix none --format '{p}')"; \
+	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
+	  if printf '%s\n' "$$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys|sha2|hmac|openssl-src) '; then echo "non-FIPS crypto is in the gateway's dependency tree" >&2; exit 1; fi; \
+	done
 
 fmt:
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all
@@ -189,6 +199,8 @@ BUILD_ARGS = --build-arg 'GRID_GIT_COMMIT=$(GRID_GIT_COMMIT)' \
 	--build-arg 'GRID_GIT_VERSION=$(GRID_GIT_VERSION)' \
 	--build-arg 'GRID_GIT_TREE_STATE=$(GRID_GIT_TREE_STATE)' \
 	--build-arg 'GRID_BUILD_DATE=$(GRID_BUILD_DATE)'
+FIPS_UBI9_MINIMAL_DIGEST ?= sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884f4ad9ebcf7bbbfc
+FIPS_BUILD_ARGS = --build-arg 'UBI9_MINIMAL_DIGEST=$(FIPS_UBI9_MINIMAL_DIGEST)'
 
 require-container-engine:
 ifndef CONTAINER_ENGINE
@@ -204,6 +216,9 @@ images: container
 operator-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/operator/Containerfile -t grid-operator:latest .
 
+operator-fips-image: | require-container-engine
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) $(FIPS_BUILD_ARGS) -f deploy/operator/Containerfile.fips -t grid-operator:latest-fips .
+
 gateway-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f deploy/gateway/Containerfile -t grid-gateway:latest .
 
@@ -212,6 +227,9 @@ mock-providers-image: | require-container-engine
 
 overlay-sync-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/overlay-sync/Containerfile -t grid-overlay-sync:latest .
+
+overlay-sync-fips-image: | require-container-engine
+	$(CONTAINER_ENGINE) build $(BUILD_ARGS) $(FIPS_BUILD_ARGS) -f crates/overlay-sync/Containerfile.fips -t grid-overlay-sync:latest-fips .
 
 fleet-dashboard-image: | require-container-engine
 	$(CONTAINER_ENGINE) build $(BUILD_ARGS) -f crates/fleet-dashboard/Containerfile -t grid-fleet-dashboard:latest .
@@ -239,6 +257,9 @@ helm-test:
 
 praxis-gateway-e2e:
 	./scripts/e2e-praxis-gateway.sh
+
+gateway-metrics-e2e:
+	E2E_STACK=gateway-metrics ./scripts/e2e-praxis-gateway.sh
 
 # -------------------------------------------------------------------
 # KIND
@@ -281,6 +302,7 @@ help:
 	@echo "  CONTAINER_ENGINE   container runtime (auto-detected)"
 	@echo "  KIND_CLUSTER_NAME  KIND cluster name"
 	@echo "  PROJECT_IMAGE      container image tag"
+	@echo "  FIPS_UBI9_MINIMAL_DIGEST  UBI 9 minimal base digest for FIPS images"
 	@echo ""
 	@echo "Top-level:"
 	@echo "  all              build + fmt + lint + doc + test + audit (+ go-types-check when go is in PATH)"
@@ -297,6 +319,7 @@ help:
 	@echo "Quality:"
 	@echo "  lint             root checks + gateway-lint"
 	@echo "  gateway-lint     Gateway Clippy + rustfmt + machete + no-ring check"
+	@echo "  gateway-fips-check  Gateway Policy FIPS build + capability + dependency checks"
 	@echo "  lint-extra       typos + taplo + shellcheck + actionlint"
 	@echo "  fmt              format root + Gateway with nightly rustfmt"
 	@echo "  doc              build docs with warnings denied"
@@ -311,14 +334,17 @@ help:
 	@echo "  helm-lint        lint, template, schema, CRD sync, package"
 	@echo "  helm-test        helm-lint + Kind install/upgrade/test/uninstall"
 	@echo "  praxis-gateway-e2e  Forge Kind run of the standalone gateway chart"
+	@echo "  gateway-metrics-e2e Forge Kind run of gateway metrics auth only"
 	@echo ""
 	@echo "Container:"
 	@echo "  container            build operator image as PROJECT_IMAGE"
 	@echo "  images               alias for container"
 	@echo "  operator-image       build operator container image"
+	@echo "  operator-fips-image  build operator FIPS container image on UBI 9"
 	@echo "  gateway-image        build gateway container image"
 	@echo "  mock-providers-image build mock-providers container image"
 	@echo "  overlay-sync-image   build overlay-sync sidecar image"
+	@echo "  overlay-sync-fips-image build overlay-sync FIPS sidecar image on UBI 9"
 	@echo "  fleet-dashboard-image build fleet dashboard image (opt-in hub web UI)"
 	@echo "  fleet-dashboard-web   build the dashboard UI and stage it for cargo build"
 	@echo "  glb-demo-images      build all Grid images tagged :glb-demo"

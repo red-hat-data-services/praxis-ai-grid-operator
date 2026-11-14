@@ -1,7 +1,7 @@
 # Konflux build for the AI Grid data-plane gateway (RHOAI onboarding, RHOAIENG-95092).
 # The single UBI build file for both ODH and RHOAI Konflux. FROM images pinned to
 # @sha256 inline, which is the only form renovate's dockerfile manager tracks.
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:217dd5692d369799d34d09ffb6f5f3404efebc7900834490fdf9ae92fd6721d4 AS build
+FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:87f66688da4e206d5a1877088626c542288a5ccd97898cf363b588d57817e6be AS build
 
 # openssl-devel/pkgconf: praxis-proxy (Pingora) links OpenSSL. rust/cargo come as RPMs
 # because rustup cannot be prefetched under hermetic mode. The prefetched repo exists
@@ -19,12 +19,18 @@ COPY . .
 # source replacement. Cargo finds that file from the working directory, not from
 # --manifest-path, so the build has to run from here or the git dependency is unresolvable.
 WORKDIR /src/crates/gateway
+# CARGO_FEATURES selects the Praxis policy profile. Empty keeps the default profile,
+# which bundles aws-lc and fails check-payload. fips,policy-jwt-fips links the system
+# OpenSSL only, and a gateway built with it refuses an API-key or JWT policy unless the
+# host activates the OpenSSL FIPS provider. The RHOAI pipelines pass it as a build arg.
+ARG CARGO_FEATURES=
 # --locked: under prefetch a build free to re-resolve can drift from what was fetched.
 # --ignore-rust-version: UBI ships 1.92, the manifests declare 1.96.
-RUN cargo build --release --locked --ignore-rust-version --bin grid-gateway \
+RUN if [ -n "${CARGO_FEATURES}" ]; then set -- --no-default-features --features "${CARGO_FEATURES}"; fi \
+    && cargo build --release --locked --ignore-rust-version --bin grid-gateway "$@" \
     && cp target/release/grid-gateway /usr/local/bin/grid-gateway
 
-FROM registry.redhat.io/ubi9/ubi-minimal-pqc@sha256:b3a0b012de0c578082e1bc5b01c8bc27461b4eeb571a0b1a2b21a07dbd845a62
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8@sha256:d638f3b49b79575329aacdae2739f954effe2467c12147711e73445c4fc97819
 
 COPY --from=build --chmod=0555 /usr/local/bin/grid-gateway /usr/local/bin/grid-gateway
 

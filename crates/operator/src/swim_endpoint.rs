@@ -82,10 +82,6 @@ impl SwimEndpoint {
 impl FromStr for SwimEndpoint {
     type Err = String;
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "endpoint parsing keeps all accepted and rejected forms together"
-    )]
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.is_empty() || value.chars().any(char::is_whitespace) {
             return Err("endpoint must be non-empty and contain no whitespace".to_owned());
@@ -208,10 +204,6 @@ pub async fn resolve_endpoint_list_partial(raw: &[String], source: &str) -> Seed
 }
 
 /// Injectable implementation of the partial seed resolver.
-#[expect(
-    clippy::too_many_lines,
-    reason = "partial resolution keeps parse, bounded concurrency, diagnostics, and deterministic finalization together"
-)]
 pub async fn resolve_endpoint_list_partial_with<F, Fut>(
     raw: &[String],
     source: &str,
@@ -419,7 +411,7 @@ mod tests {
             "10.0.0.1:7946".to_owned(),
             "10.0.0.2:7946".to_owned(),
         ];
-        let result = resolve_endpoint_list(&raw, "GridNetwork.spec.seeds").await;
+        let result = resolve_endpoint_list(&raw, "GridNetwork.spec.membership.swim.seeds").await;
         assert_eq!(result, Ok(vec![addr("10.0.0.1:7946"), addr("10.0.0.2:7946")]));
     }
 
@@ -468,7 +460,7 @@ mod tests {
         ];
         let result = resolve_endpoint_list_partial_with(
             &raw,
-            "GridNetwork.spec.seeds",
+            "GridNetwork.spec.membership.swim.seeds",
             Duration::from_secs(1),
             Duration::from_secs(1),
             |host, _port| {
@@ -497,7 +489,7 @@ mod tests {
     async fn all_failed_nonempty_seed_list_is_degraded_but_empty_is_valid() {
         let failed = resolve_endpoint_list_partial_with(
             &["missing.example:7946".to_owned()],
-            "GridNetwork.spec.seeds",
+            "GridNetwork.spec.membership.swim.seeds",
             Duration::from_secs(1),
             Duration::from_secs(1),
             |_host, _port| async { Err(io::Error::new(io::ErrorKind::NotFound, "not found")) },
@@ -507,7 +499,7 @@ mod tests {
         assert!(failed.addresses.is_empty());
         assert!(failed.is_degraded());
 
-        let empty = resolve_endpoint_list_partial(&[], "GridNetwork.spec.seeds").await;
+        let empty = resolve_endpoint_list_partial(&[], "GridNetwork.spec.membership.swim.seeds").await;
         assert!(!empty.configured);
         assert!(empty.addresses.is_empty());
         assert!(!empty.is_degraded());

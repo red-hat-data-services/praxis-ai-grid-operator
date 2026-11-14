@@ -7,15 +7,28 @@
 #[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     /// Names `describe_metrics` documents, which a scrape must explain.
-    const DOCUMENTED: [&str; 25] = [
+    const DOCUMENTED: [&str; 42] = [
         "grid_route_decisions_total",
+        "grid_route_fenced_total",
         "grid_route_selections_total",
         "grid_route_prefix_affinity_total",
+        "grid_route_prefix_index_entries",
+        "grid_route_prefix_index_capacity",
+        "grid_route_prefix_index_evictions_total",
         "grid_serving_config_reload_total",
+        "grid_serving_unbound_provider_hops",
+        "grid_serving_undialable_clusters",
+        "grid_serving_refused_dial_clusters",
+        "grid_serving_dial_shadowed_clusters",
+        "grid_dial_down",
+        "grid_dial_failures_total",
         "grid_route_site_silent_transitions_total",
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
         "grid_route_site_rho_counted",
+        "grid_route_site_rho_derived",
+        "grid_route_site_rho_published",
+        "grid_route_site_capacity_implied",
         "grid_route_site_weight",
         "grid_route_site_ceiling",
         "grid_route_site_ceiling_soft",
@@ -27,19 +40,26 @@ mod tests {
         "grid_route_site_last_sample_age_seconds",
         "grid_route_site_round_age_seconds",
         "grid_route_site_score",
+        "grid_route_site_score_unavailable",
         "grid_route_shedding",
+        "grid_route_candidate_info",
         "grid_signals_poll_total",
         "grid_signals_ingest_dropped_total",
         "grid_signals_feedback_failures_total",
         "grid_signals_last_success_timestamp_seconds",
         "grid_signals_response_bytes",
+        "grid_provider_requests_total",
+        "grid_provider_config_reload_total",
     ];
 
     /// The per-site gauges, set once each so their help text renders.
-    const SITE_GAUGES: [&str; 14] = [
+    const SITE_GAUGES: [&str; 17] = [
         "grid_route_site_rho",
         "grid_route_site_rho_reported",
         "grid_route_site_rho_counted",
+        "grid_route_site_rho_derived",
+        "grid_route_site_rho_published",
+        "grid_route_site_capacity_implied",
         "grid_route_site_weight",
         "grid_route_site_ceiling",
         "grid_route_site_ceiling_soft",
@@ -59,19 +79,45 @@ mod tests {
         ai_grid_filters::describe_metrics();
 
         metrics::counter!("grid_route_decisions_total").increment(1);
+        metrics::counter!("grid_route_fenced_total", "cause" => "zone_required", "enforced" => "true").increment(1);
         metrics::counter!("grid_route_selections_total", "path" => "cross_site").increment(1);
         metrics::counter!("grid_route_prefix_affinity_total", "outcome" => "hit").increment(1);
+        metrics::gauge!("grid_route_prefix_index_entries", "cluster" => "east").set(1.0);
+        metrics::gauge!("grid_route_prefix_index_capacity", "cluster" => "east").set(1.0);
+        metrics::counter!("grid_route_prefix_index_evictions_total", "cluster" => "east", "reason" => "capacity")
+            .increment(1);
         metrics::counter!("grid_serving_config_reload_total", "result" => "ok").increment(1);
         metrics::counter!("grid_route_site_silent_transitions_total", "to" => "silent").increment(1);
         for name in SITE_GAUGES {
             metrics::gauge!(name, "site" => "east").set(1.0);
         }
+        metrics::gauge!(
+            "grid_route_site_score_unavailable",
+            "site" => "east",
+            "cluster" => "pool-east",
+            "reason" => "absent"
+        )
+        .set(1.0);
         metrics::gauge!("grid_route_shedding", "model" => "llama").set(0.0);
+        metrics::gauge!("grid_route_candidate_info", "site" => "east", "cluster" => "pool-east", "model" => "llama")
+            .set(1.0);
         metrics::counter!("grid_signals_poll_total", "result" => "ok").increment(1);
         metrics::counter!("grid_signals_ingest_dropped_total", "reason" => "skew").increment(1);
         metrics::counter!("grid_signals_feedback_failures_total", "reason" => "status").increment(1);
         metrics::gauge!("grid_signals_last_success_timestamp_seconds").set(1.0);
         metrics::gauge!("grid_signals_response_bytes").set(1.0);
+        for name in [
+            "grid_serving_unbound_provider_hops",
+            "grid_serving_undialable_clusters",
+            "grid_serving_refused_dial_clusters",
+            "grid_serving_dial_shadowed_clusters",
+        ] {
+            metrics::gauge!(name).set(0.0);
+        }
+        metrics::gauge!("grid_dial_down", "cluster" => "east").set(0.0);
+        metrics::counter!("grid_dial_failures_total", "cluster" => "east").increment(1);
+        metrics::counter!("grid_provider_requests_total", "result" => "served").increment(1);
+        metrics::counter!("grid_provider_config_reload_total", "result" => "applied").increment(1);
 
         let text = praxis_protocol::http::pingora::metrics::render_prometheus().expect("recorder installed");
         for name in DOCUMENTED {
@@ -89,10 +135,16 @@ mod tests {
     /// emit sites out of the source instead.
     #[test]
     fn every_emitted_grid_metric_is_documented() {
-        const SOURCES: [&str; 3] = [
+        const SOURCES: [&str; 9] = [
             include_str!("../crates/ai-grid-filters/src/snapshot.rs"),
             include_str!("../crates/ai-grid-filters/src/signals.rs"),
             include_str!("../crates/ai-grid-filters/src/decisions.rs"),
+            include_str!("../crates/ai-grid-filters/src/control.rs"),
+            include_str!("../crates/ai-grid-filters/src/dial.rs"),
+            include_str!("../crates/ai-grid-filters/src/health.rs"),
+            include_str!("../crates/ai-grid-filters/src/provider.rs"),
+            include_str!("../crates/ai-grid-filters/src/prefix/affinity.rs"),
+            include_str!("../crates/ai-grid-filters/src/prefix/index.rs"),
         ];
 
         let mut emitted: Vec<&str> = SOURCES
@@ -102,6 +154,8 @@ mod tests {
                 name.bytes()
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
             })
+            // The provider filter registers under its own name, which is not a metric.
+            .filter(|name| *name != "grid_provider")
             .collect();
         emitted.sort_unstable();
         emitted.dedup();

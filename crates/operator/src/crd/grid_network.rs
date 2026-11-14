@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::crd::inference_provider::Condition;
 
+/// Gateway model-discovery contract version required for dynamic model routes.
+pub const MODEL_DISCOVERY_CONTRACT_VERSION: &str = "v1";
+
 // ---------------------------------------------------------------------------
 // Routing policy
 // ---------------------------------------------------------------------------
@@ -169,10 +172,65 @@ pub struct SelectionPolicyConfig {
     pub mode: SelectionMode,
 }
 
+/// Where a site learns its members from.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum MembershipMode {
+    /// SWIM gossip discovers the members.
+    #[default]
+    #[value(name = "Swim")]
+    Swim,
+    /// Declared `GridSite` objects supply peers, whose catalogs and signals are polled over HTTPS.
+    #[value(name = "Local")]
+    Local,
+}
+
+impl MembershipMode {
+    /// The mode `name` names, ignoring case and surrounding space, `None` for any other value.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        [Self::Swim, Self::Local]
+            .into_iter()
+            .find(|mode| mode.as_str().eq_ignore_ascii_case(name))
+    }
+
+    /// The name the API, charts, and signals response use.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Swim => "Swim",
+            Self::Local => "Local",
+        }
+    }
+}
+
+/// Grid-wide membership selection, overriding the install's startup setting when present.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct MembershipConfig {
+    /// Membership source. Local requires `signalTransport.mode: poll`.
+    pub mode: MembershipMode,
+
+    /// SWIM seed peers used when `mode` is `Swim`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swim: Option<SwimConfig>,
+}
+
+impl MembershipConfig {
+    /// Whether this membership mode permits a SWIM configuration block.
+    #[must_use]
+    pub const fn swim_config_matches_mode(&self) -> bool {
+        match self.mode {
+            MembershipMode::Swim => true,
+            MembershipMode::Local => self.swim.is_none(),
+        }
+    }
+}
+
 /// How signals propagate across the sites of a grid.
 ///
-/// The mode names the dissemination path, not the transport: SWIM membership
-/// runs in both modes. Only where the load signal travels changes.
+/// SWIM membership can use either path; Local membership requires polling.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "camelCase")]
 pub enum SignalMode {
@@ -209,6 +267,17 @@ pub enum PeerTrustMode {
     Spiffe,
 }
 
+/// Whether grid-scoped SWIM state must carry a verified signature.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SignedStateMode {
+    /// State is neither signed nor verified.
+    #[default]
+    Off,
+    /// State is signed with the site identity, and unverified peer state is refused.
+    Enforce,
+}
+
 /// Grid-wide peer trust, the same at every site.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -216,6 +285,10 @@ pub enum PeerTrustMode {
 pub struct PeerTrustConfig {
     /// Peer trust mode.
     pub mode: PeerTrustMode,
+
+    /// Signed state, `off` when absent. Switch every site together: an enforcing site refuses unsigned peers.
+    #[serde(default)]
+    pub signed_state: SignedStateMode,
 }
 
 /// Explicit static provider-capacity placement strategy.
@@ -578,8 +651,7 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
 
 /// Specification for a [`GridNetwork`].
 ///
-/// Defines the grid's seed peers, gateway associations, SWIM
-/// tuning, and TLS secret references.
+/// Defines the grid's gateway associations, membership, and TLS secret references.
 #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, Serialize)]
 #[kube(
     group = "grid.praxis.fast",
@@ -590,25 +662,39 @@ fn add_tls_config_legacy_fields(schema: &mut schemars::Schema) {
     status = "GridNetworkStatus",
     namespaced = false,
     printcolumn = r#"{"name":"Grid ID","type":"string","jsonPath":".status.gridId"}"#,
-    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
-    printcolumn = r#"{"name":"Sites","type":"integer","jsonPath":".status.connectedSites"}"#
+    printcolumn = r#"{"name":"Sites","type":"integer","jsonPath":".status.connectedSites"}"#,
+    printcolumn = r#"{"name":"Available","type":"string","jsonPath":".status.conditions[?(@.type==\"Available\")].status"}"#,
+    printcolumn = r#"{"name":"Progressing","type":"string","jsonPath":".status.conditions[?(@.type==\"Progressing\")].status"}"#,
+    printcolumn = r#"{"name":"Degraded","type":"string","jsonPath":".status.conditions[?(@.type==\"Degraded\")].status"}"#,
+    printcolumn = r#"{"name":"Since","type":"date","jsonPath":".status.conditions[?(@.type==\"Available\")].lastTransitionTime"}"#,
+    printcolumn = r#"{"name":"Message","type":"string","jsonPath":".status.conditions[?(@.type==\"Available\")].message","priority":1}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase","priority":1}"#,
+    printcolumn = r#"{"name":"Enrolled","type":"string","jsonPath":".status.conditions[?(@.type==\"Enrolled\")].status","priority":1}"#,
+    printcolumn = r#"{"name":"Identity","type":"string","jsonPath":".status.conditions[?(@.type==\"IdentityValid\")].status","priority":1}"#
 )]
 #[schemars(extend("x-kubernetes-validations" = [{
     "rule": "has(self.placementPolicy) == (has(self.selectionPolicy) && self.selectionPolicy.mode == 'weightedRandom')",
     "message": "placementPolicy must be set if and only if selectionPolicy.mode is weightedRandom"
+}, {
+    "rule": "!has(oldSelf.gridId) || oldSelf.gridId == '' || (has(self.gridId) && self.gridId == oldSelf.gridId)",
+    "message": "gridId cannot change once set"
+}, {
+    "rule": "!has(self.membership) || self.membership.mode != 'Local' || (has(self.signalTransport) && self.signalTransport.mode == 'poll')",
+    "message": "membership.mode Local requires signalTransport.mode poll"
+}, {
+    "rule": "!has(self.membership) || self.membership.mode == 'Swim' || !has(self.membership.swim)",
+    "message": "membership.swim is only valid when membership.mode is Swim"
 }]))]
 #[schemars(transform = add_grid_network_spec_legacy_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct GridNetworkSpec {
-    /// Grid ID for tenancy. Empty on creation; auto-generated
-    /// on first join with another site.
+    /// The grid this network belongs to, set once by bootstrap or its delivery automation.
+    /// The operator waits until this is declared and never generates a grid ID.
+    /// A grid ID that operators before #474 kept only in status is copied here once, and status then mirrors spec.
+    /// Moving to another grid means recreating the network.
     #[serde(default)]
+    #[schemars(length(max = 63), regex(pattern = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"))]
     pub grid_id: String,
-
-    /// Initial SWIM seed peer endpoints in host:port form. Literal IPv4, bracketed
-    /// IPv6, and DNS hostnames are accepted.
-    #[serde(default)]
-    pub seeds: Vec<String>,
 
     /// References to Praxis Gateways that participate in this grid.
     #[serde(default, alias = "gatewayRefs")]
@@ -616,10 +702,6 @@ pub struct GridNetworkSpec {
 
     /// Region where this site is deployed.
     pub region: Option<String>,
-
-    /// SWIM protocol configuration.
-    #[serde(default)]
-    pub swim: SwimConfig,
 
     /// TLS secret references for grid certificate management.
     #[serde(default)]
@@ -676,6 +758,11 @@ pub struct GridNetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_policy: Option<SelectionPolicyConfig>,
 
+    /// Grid-wide membership source. When absent, the install's startup setting applies.
+    /// A change causes the operator to restart gracefully into the declared mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<MembershipConfig>,
+
     /// Grid-wide signal transport.
     ///
     /// **Default (absent):** `gossip`, the established SWIM and CRDT overlay
@@ -685,7 +772,8 @@ pub struct GridNetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_transport: Option<SignalTransportConfig>,
 
-    /// Grid-wide peer trust on the signals path, `pin` when absent, read at operator start.
+    /// Grid-wide peer trust: signals-path mode, `pin` when absent, read at operator start; signed state, read each
+    /// reconcile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_trust: Option<PeerTrustConfig>,
 
@@ -776,10 +864,21 @@ pub struct GatewayRef {
     #[serde(default, alias = "localSiteName")]
     pub site_name: Option<String>,
 
+    /// Model-discovery contract version supported by the running gateway.
+    ///
+    /// Set this only after the gateway is running an image that understands
+    /// the `expires_at` routing-candidate field and enforces its deadline.
+    /// The operator includes discovered model candidates only when this is
+    /// exactly `v1`; absent or other values keep dynamic candidates withheld.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_discovery_contract_version: Option<String>,
+
     /// Explicit mTLS provider-hop endpoints for the embedded `grid-gateway`
-    /// serving config. This allowlist is independent of `praxisConfig`, so a
-    /// missing or disabled generated Praxis config cannot alter embedded
-    /// serving behavior. Every entry must declare `mutual_tls` and a nonblank
+    /// serving config. With the default `praxisConfig.siteRouter`
+    /// `intelligentRoute` this allowlist is independent of `praxisConfig`, so a
+    /// missing or disabled generated Praxis config cannot alter embedded serving
+    /// behavior. With `gridSiteRoute` the hops are the generated config's mutual
+    /// TLS endpoints instead, and this must be empty. Every entry must declare `mutual_tls` and a nonblank
     /// SNI. The embedded gateway compares each declaration against the
     /// loaded Praxis load-balancer's verified mTLS backend before it sends
     /// provider-hop context. Changing Praxis backend transport requires a
@@ -792,10 +891,9 @@ pub struct GatewayRef {
     /// When absent or `generate: false`, this gateway behaves exactly as before:
     /// only the routing overlay `ConfigMap` is applied.  When `generate: true`, the
     /// operator additionally renders a consumer Praxis `ConfigMap` containing the
-    /// inference-model `intelligent_route` candidates (with credential
-    /// `secretRef` data), a `credential_inject` section for credential-bearing
-    /// inference candidates, and a `load_balancer` section with one cluster
-    /// entry per unique inference cluster. Other capability kinds remain in the
+    /// routing filter `siteRouter` selects, `intelligent_route` or `grid_site_route`,
+    /// a `credential_inject` section for credential-bearing inference candidates, and a `load_balancer` section with
+    /// one cluster entry per unique inference cluster. Other capability kinds remain in the
     /// routing overlay for dedicated data-plane pipelines.
     ///
     /// The generated `ConfigMap` contains no token bytes. Credential-bearing
@@ -805,12 +903,24 @@ pub struct GatewayRef {
     pub praxis_config: Option<ConsumerConfig>,
 }
 
+impl GatewayRef {
+    /// Whether the declared running gateway supports model-discovery contract `v1`, including candidate expiry.
+    #[must_use]
+    pub fn supports_model_discovery_contract(&self) -> bool {
+        self.model_discovery_contract_version.as_deref() == Some(MODEL_DISCOVERY_CONTRACT_VERSION)
+    }
+}
+
+/// Admission rule refusing a sovereignty fence under any router but `gridSiteRoute`.
+pub(crate) const SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE: &str =
+    "!has(self.sovereignty) || (has(self.siteRouter) && self.siteRouter == 'gridSiteRoute')";
+
 /// Opt-in configuration for operator-generated consumer Praxis config.
 ///
 /// When `generate` is `true` on a [`GatewayRef`], the `GridNetwork` controller
 /// renders a `praxis.yaml`-keyed `ConfigMap` in the gateway namespace in addition
 /// to the normal routing overlay `ConfigMap`.  The generated config includes the
-/// inference-model `intelligent_route` candidates, `credential_inject` (when
+/// routing filter `siteRouter` selects, `credential_inject` (when
 /// credential-bearing inference candidates are present), and a `load_balancer`
 /// section.
 ///
@@ -828,6 +938,10 @@ pub struct GatewayRef {
     reason = "wire-compatible opt-in and attestation fields are separate"
 )]
 #[schemars(transform = add_consumer_config_legacy_fields)]
+#[schemars(extend("x-kubernetes-validations" = [{
+    "rule": SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE,
+    "message": "sovereignty is applied only by siteRouter gridSiteRoute"
+}]))]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumerConfig {
     /// Enable operator-managed consumer Praxis config generation for this gateway.
@@ -903,8 +1017,8 @@ pub struct ConsumerConfig {
     #[serde(default = "default_tls_cert_mount_path")]
     pub tls_cert_mount_path: String,
 
-    /// Derive the endpoint topology from the declarations of named providers,
-    /// instead of requiring a `clusterEndpoints` entry per candidate.
+    /// Settings for the endpoint topology the operator derives for each candidate
+    /// with no `clusterEndpoints` entry. Absent still derives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive_topology: Option<DeriveTopology>,
 
@@ -935,6 +1049,79 @@ pub struct ConsumerConfig {
     /// into this `ConfigMap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<GatewayTelemetryConfig>,
+
+    /// The filter that picks a candidate for each request.
+    ///
+    /// `gridSiteRoute` reads the serving config, so it needs the operator's
+    /// poll signal transport. It also needs an enabled `mountReconciliation`,
+    /// whose rollout per config revision re-reads the provider-hop backends,
+    /// and an empty `providerHopEndpoints`, since hops follow `clusterEndpoints`.
+    /// Every cluster is health-checked, so the gateway's readiness probe must
+    /// ask Praxis `/healthy`: `/ready` fails while any one site is down.
+    ///
+    /// Default: `intelligentRoute`.
+    #[serde(default)]
+    pub site_router: SiteRouter,
+
+    /// The sovereignty fence `gridSiteRoute` applies: the header naming the zones a request
+    /// may be served in, and whether it refuses or only audits. Admission rejects it under
+    /// any other router.
+    ///
+    /// Default: unset, no fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sovereignty: Option<SovereigntyFence>,
+}
+
+/// A `gridSiteRoute` sovereignty fence.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SovereigntyFence {
+    /// Request header naming the zones a request may be served in: one zone, or a
+    /// comma-separated list in a single header line, matched against each `GridSite`
+    /// `sovereigntyZone`. The upstream that sets it must replace, never append to, a
+    /// caller's copy.
+    #[schemars(regex(pattern = "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$"), length(max = 63))]
+    pub header: String,
+
+    /// What the fence does with a request it does not admit.
+    ///
+    /// Default: `enforce`.
+    #[serde(default)]
+    pub mode: FenceMode,
+}
+
+/// What a sovereignty fence does with a request it does not admit.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FenceMode {
+    /// Refuse it: 400 for no valid zone, 403 when no site in its zones serves it.
+    #[default]
+    Enforce,
+    /// Route it as if unfenced, and log and count what would be refused.
+    Audit,
+}
+
+impl FenceMode {
+    /// The value `grid_site_route` reads.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Audit => "audit",
+        }
+    }
+}
+
+/// The filter an operator-generated consumer config routes with.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SiteRouter {
+    /// `intelligent_route` over the routing overlay.
+    #[default]
+    IntelligentRoute,
+    /// `grid_site_route` over the serving config.
+    GridSiteRoute,
 }
 
 /// Maximum batch interval accepted by Praxis telemetry configuration.
@@ -997,10 +1184,6 @@ impl GatewayTelemetryConfig {
     ///
     /// Returns an explanatory message for invalid strings, sampling rates, or
     /// batch settings outside their supported ranges.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "validates all telemetry settings before CRD rendering"
-    )]
     pub fn validate(&self) -> Result<(), String> {
         if self.otlp_endpoint.as_ref().is_some_and(|endpoint| {
             if endpoint.is_empty() {
@@ -1068,11 +1251,14 @@ impl Default for ConsumerConfig {
             mount_reconciliation: None,
             listener_port: default_listener_port(),
             telemetry: None,
+            site_router: SiteRouter::IntelligentRoute,
+            sovereignty: None,
         }
     }
 }
 
-/// Providers a gateway derives its endpoint topology from. Empty derives nothing.
+/// How a gateway derives its endpoint topology. Every local provider of the network
+/// derives, and so does every candidate a member's catalog offers under Local membership.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -1081,7 +1267,8 @@ impl Default for ConsumerConfig {
     "message": "deriveTopology.transport mode must be tls"
 }]))]
 pub struct DeriveTopology {
-    /// Routing identities whose declarations this gateway derives from.
+    /// Remote routing identities this gateway derives a hop for without a member catalog,
+    /// as under SWIM membership.
     ///
     /// Each entry is a provider's `clusterName`, or its `metadata.name`
     /// when that is unset. At most 64 entries, each named once.
@@ -1186,8 +1373,9 @@ pub struct EndpointCaSecretRef {
     #[schemars(length(min = 1))]
     pub name: String,
 
-    /// Optional key containing the CA bundle. Defaults to `ca.crt`.
-    #[schemars(length(min = 1))]
+    /// Optional key containing the CA bundle. Defaults to `ca.crt`. A Secret key: no `/`, not `.`
+    /// or `..`, and not starting with `..`.
+    #[schemars(length(min = 1), regex(pattern = r"^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$"))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 }
@@ -1259,21 +1447,18 @@ fn default_listener_port() -> u16 {
     8080
 }
 
-/// SWIM protocol tuning parameters.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// Optional SWIM membership configuration.
+///
+/// The controller passes seeds to the SWIM runtime for peer discovery.
+/// Protocol tuning values are not exposed because the runtime does not consume them.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct SwimConfig {
-    /// Fanout for indirect probes.
-    #[serde(default = "default_gossip_nodes")]
-    pub gossip_nodes: u32,
-
-    /// WAN probe interval (e.g. "5s").
-    #[serde(default = "default_probe_interval")]
-    pub probe_interval: String,
-
-    /// Suspicion timeout before declaring dead (e.g. "10s").
-    #[serde(default = "default_suspicion_timeout")]
-    pub suspicion_timeout: String,
+    /// SWIM peer endpoints in host:port form. Literal IPv4, bracketed IPv6,
+    /// and DNS hostnames are accepted.
+    #[serde(default)]
+    pub seeds: Vec<String>,
 }
 
 /// TLS configuration for grid certificate management.
@@ -1397,10 +1582,6 @@ pub struct GridNetworkStatus {
     /// Grid does not enforce budget limits itself (see [`BudgetPolicyConfig`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_status: Vec<TenantBudgetStatus>,
-
-    /// This site's identity certificate: when it expires and when rotation is due.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<SiteIdentityStatus>,
 }
 
 /// Whether a separately owned status flag can be omitted from reconciliation.
@@ -1422,7 +1603,7 @@ pub struct GatewayAgeReport {
     /// Random process identity, unchanged across poller reloads.
     #[schemars(regex(pattern = "^[0-9a-f]{32}$"))]
     pub epoch: String,
-    /// Last durably accepted sequence.
+    /// Last durably recorded sequence; live sequence watermarks are process-local.
     #[schemars(range(min = 1))]
     pub sequence: i64,
     /// Cumulative skew rejection count.
@@ -1435,27 +1616,6 @@ pub struct GatewayAgeReport {
     /// Receipt time for inspection; freshness uses the operator's monotonic clock.
     #[schemars(extend("format" = "date-time"))]
     pub received_at: String,
-}
-
-/// This site's identity certificate.
-#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SiteIdentityStatus {
-    /// When the certificate expires, RFC 3339.
-    pub not_after: String,
-    /// When rotation is due, a third of the lifetime before `notAfter`, RFC 3339. Empty
-    /// under pin peer trust, or when this site's operator does not rotate.
-    pub rotate_after: String,
-    /// SHA-256 of the certificate DER, the digest peers pin.
-    pub fingerprint: String,
-    /// `IdentityExpired` once the certificate has expired, `IdentityUnreadable` when the
-    /// Secret holds no usable certificate.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    #[schemars(regex(pattern = "^(IdentityExpired|IdentityUnreadable)$"))]
-    pub reason: String,
-    /// How to recover.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub message: String,
 }
 
 /// Phase of an operator-generated consumer Praxis `ConfigMap` for one gateway.
@@ -1672,31 +1832,6 @@ pub struct OverlayRevisionStatus {
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Default SWIM gossip fanout.
-fn default_gossip_nodes() -> u32 {
-    3
-}
-
-/// Default WAN probe interval.
-fn default_probe_interval() -> String {
-    "5s".to_owned()
-}
-
-/// Default suspicion timeout.
-fn default_suspicion_timeout() -> String {
-    "10s".to_owned()
-}
-
-impl Default for SwimConfig {
-    fn default() -> Self {
-        Self {
-            gossip_nodes: default_gossip_nodes(),
-            probe_interval: default_probe_interval(),
-            suspicion_timeout: default_suspicion_timeout(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1720,11 +1855,92 @@ mod tests {
     }
 
     #[test]
-    fn default_swim_config() {
-        let cfg = SwimConfig::default();
-        assert_eq!(cfg.gossip_nodes, 3, "default gossip nodes");
-        assert_eq!(cfg.probe_interval, "5s", "default probe interval");
-        assert_eq!(cfg.suspicion_timeout, "10s", "default suspicion timeout");
+    fn membership_swim_is_optional_and_only_allowed_for_swim_mode() {
+        let crd = crd_json();
+        let spec = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec")
+            .unwrap_or_else(|| std::process::abort());
+        let spec_properties = spec
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            !spec_properties.contains_key("seeds"),
+            "top-level seeds must be removed"
+        );
+        assert!(
+            !spec_properties.contains_key("swim"),
+            "top-level swim tuning must be removed"
+        );
+
+        let membership = spec_properties
+            .get("membership")
+            .unwrap_or_else(|| std::process::abort());
+        let swim_schema = membership
+            .pointer("/properties/swim")
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            swim_schema.get("default").is_none(),
+            "membership.swim must not have a schema default"
+        );
+        assert!(
+            !membership
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|required| { required.iter().any(|field| field.as_str() == Some("swim")) }),
+            "membership.swim must be optional"
+        );
+        let validations = spec
+            .get("x-kubernetes-validations")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| std::process::abort());
+        assert!(
+            validations.iter().any(|validation| {
+                validation.get("rule").and_then(serde_json::Value::as_str)
+                    == Some("!has(self.membership) || self.membership.mode == 'Swim' || !has(self.membership.swim)")
+            }),
+            "CRD must reject membership.swim for Local mode"
+        );
+        let configured_swim = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Swim",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            configured_swim.swim_config_matches_mode(),
+            "Swim mode must accept membership.swim"
+        );
+        let local = serde_json::from_value::<MembershipConfig>(serde_json::json!({
+            "mode": "Local",
+            "swim": {"seeds": ["peer.example:7946"]}
+        }))
+        .unwrap_or_else(|_| std::process::abort());
+        assert!(
+            !local.swim_config_matches_mode(),
+            "Local mode must reject membership.swim"
+        );
+        assert!(
+            serde_json::from_value::<MembershipConfig>(serde_json::json!({
+                "mode": "Swim",
+                "swim": {"probeInterval": "2s"}
+            }))
+            .is_err(),
+            "unsupported tuning fields must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_backend_ca_key_is_a_file_name_never_a_path() {
+        let schema = schemars::schema_for!(EndpointCaSecretRef);
+        assert_eq!(
+            schema
+                .as_value()
+                .pointer("/properties/key/pattern")
+                .and_then(serde_json::Value::as_str),
+            Some(r"^\.?[-_A-Za-z0-9][-._A-Za-z0-9]*$"),
+            "what Kubernetes accepts as a Secret key: `root..crt` and `.hidden` pass, `/`, `.`, `..` \
+             and a `..` prefix do not"
+        );
     }
 
     #[test]
@@ -1745,14 +1961,19 @@ mod tests {
     fn spec_serde_round_trip() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": ["grid.cluster-b:7946"],
             "consumerGateways": [{"name": "gw", "namespace": "ns"}],
-            "swim": {"probeInterval": "3s"},
+            "membership": {"mode": "Swim", "swim": {"seeds": ["grid.cluster-b:7946"]}},
             "tls": {}
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
-        assert_eq!(spec.seeds.len(), 1, "should have 1 seed");
-        assert_eq!(spec.swim.probe_interval, "3s", "custom probe interval");
+        assert_eq!(
+            spec.membership
+                .as_ref()
+                .and_then(|membership| membership.swim.as_ref())
+                .map(|swim| swim.seeds.len()),
+            Some(1),
+            "membership SWIM config carries its seed"
+        );
     }
 
     #[test]
@@ -1927,9 +2148,7 @@ mod tests {
     #[test]
     fn stale_candidate_ttl_defaults_to_none_when_absent() {
         let json = serde_json::json!({
-            "gridId": "",
-            "seeds": [],
-            "swim": {}
+            "gridId": ""
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -1942,7 +2161,6 @@ mod tests {
     fn stale_candidate_ttl_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "staleCandidateTtlSeconds": 3600
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -1956,7 +2174,7 @@ mod tests {
     #[test]
     fn stale_candidate_ttl_serializes_only_when_present() {
         // absent field must not appear in serialized output
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2023,6 +2241,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_consumer_config_path_refuses_sovereignty_without_grid_site_route() {
+        let crd = crd_json();
+        let spec = "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties";
+        for gateways in ["consumerGateways", "gatewayRefs"] {
+            for config in ["praxisConfig", "consumerConfig"] {
+                let path = format!("{spec}/{gateways}/items/properties/{config}");
+                let schema = crd.pointer(&path).unwrap_or_else(|| std::process::abort());
+                let rules = schema
+                    .get("x-kubernetes-validations")
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap_or_else(|| std::process::abort());
+                assert!(
+                    rules.iter().any(|rule| {
+                        rule.get("rule").and_then(serde_json::Value::as_str)
+                            == Some(SOVEREIGNTY_REQUIRES_GRID_SITE_ROUTE)
+                    }),
+                    "{path} must refuse sovereignty without gridSiteRoute: {rules:?}"
+                );
+                let description = schema
+                    .pointer("/properties/sovereignty/description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    description.contains("Admission rejects it under"),
+                    "{path} sovereignty description must name admission rejection: {description:?}"
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ConsumerConfig tests
     // -----------------------------------------------------------------------
@@ -2038,7 +2287,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "round-trip test covers all ConsumerConfig fields")]
     fn consumer_config_enabled_round_trips() {
         let json = serde_json::json!({
             "name": "gw",
@@ -2144,10 +2392,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts every ConsumerConfig default as one contract"
-    )]
     fn consumer_config_defaults_when_subfields_absent() {
         let json = serde_json::json!({
             "name": "gw",
@@ -2181,6 +2425,33 @@ mod tests {
         assert_eq!(
             cc.tls_cert_mount_path, "/etc/praxis/tls",
             "tlsCertMountPath must use default"
+        );
+    }
+
+    #[test]
+    fn model_discovery_contract_requires_exact_supported_version() {
+        let parse_gateway = |version: Option<&str>| {
+            let mut value = serde_json::json!({"name": "gw", "namespace": "ns"});
+            if let Some(version) = version {
+                let Some(object) = value.as_object_mut() else {
+                    std::process::abort();
+                };
+                object.insert("modelDiscoveryContractVersion".to_owned(), serde_json::json!(version));
+            }
+            serde_json::from_value::<GatewayRef>(value).unwrap_or_else(|_| std::process::abort())
+        };
+
+        assert!(
+            parse_gateway(Some("v1")).supports_model_discovery_contract(),
+            "known model discovery contract must enable discovered routes"
+        );
+        assert!(
+            !parse_gateway(None).supports_model_discovery_contract(),
+            "missing gateway contract must fail closed"
+        );
+        assert!(
+            !parse_gateway(Some("v2")).supports_model_discovery_contract(),
+            "unknown future contract must fail closed"
         );
     }
 
@@ -2262,6 +2533,34 @@ mod tests {
                 .any(|rule| rule.get("rule").and_then(serde_json::Value::as_str)
                     == Some("!has(self.transport) || self.transport.mode == 'tls'")),
             "a derived backend is server-authenticated TLS or plaintext by its scheme: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn grid_site_route_is_opt_in() {
+        let crd = crd_json();
+        let praxis = crd
+            .pointer("/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/consumerGateways/items/properties/praxisConfig")
+            .unwrap_or_else(|| std::process::abort());
+        let router = praxis
+            .pointer("/properties/siteRouter")
+            .unwrap_or_else(|| std::process::abort());
+        assert_eq!(
+            router.get("default"),
+            Some(&serde_json::json!("intelligentRoute")),
+            "siteRouter defaults to intelligentRoute, so gridSiteRoute stays opt-in"
+        );
+        assert_eq!(
+            router.get("enum"),
+            Some(&serde_json::json!(["intelligentRoute", "gridSiteRoute"])),
+            "siteRouter admits exactly the two routers"
+        );
+        let parsed: ConsumerConfig =
+            serde_json::from_value(serde_json::json!({"generate": true})).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            parsed.site_router,
+            SiteRouter::IntelligentRoute,
+            "an existing gateway keeps its router"
         );
     }
 
@@ -2350,6 +2649,7 @@ mod tests {
             name: "gw".to_owned(),
             namespace: "ns".to_owned(),
             site_name: None,
+            model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
         };
@@ -2361,10 +2661,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "asserts generated telemetry fields and all opt-in security boundaries"
-    )]
     fn grid_network_crd_has_consumer_config_field_on_gateway_ref() {
         let crd = crd_json();
         let gateway_ref_properties = crd
@@ -2380,6 +2676,10 @@ mod tests {
         assert!(
             gateway_ref_properties.contains_key("providerHopEndpoints"),
             "CRD schema must include independent providerHopEndpoints on GatewayRef"
+        );
+        assert!(
+            gateway_ref_properties.contains_key("modelDiscoveryContractVersion"),
+            "CRD schema must expose the gateway's model discovery contract version"
         );
         let consumer_config_properties = gateway_ref_properties
             .get("praxisConfig")
@@ -2630,9 +2930,7 @@ mod tests {
     #[test]
     fn routing_policy_defaults_to_none_when_absent() {
         let json = serde_json::json!({
-            "gridId": "",
-            "seeds": [],
-            "swim": {}
+            "gridId": ""
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2645,7 +2943,6 @@ mod tests {
     fn routing_policy_geography_first_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "routingPolicy": "geographyFirst"
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2660,7 +2957,6 @@ mod tests {
     fn routing_policy_score_first_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "routingPolicy": "scoreFirst"
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2673,7 +2969,7 @@ mod tests {
 
     #[test]
     fn routing_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -2719,7 +3015,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::too_many_lines, reason = "full-field struct construction and assertion")]
     fn overlay_status_distributed_serialization() {
         let status = OverlayRevisionStatus {
             gateway_name: "gw".to_owned(),
@@ -2824,7 +3119,7 @@ mod tests {
 
     #[test]
     fn scoring_policy_absent_defaults_to_none() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(
             spec.scoring_policy.is_none(),
@@ -2836,7 +3131,6 @@ mod tests {
     fn scoring_policy_queue_depth_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "queueDepth" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2852,7 +3146,6 @@ mod tests {
     fn scoring_policy_no_metrics_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "noMetrics" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2868,7 +3161,6 @@ mod tests {
     fn scoring_policy_kv_cache_pressure_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "kvCachePressure" }
         });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
@@ -2884,7 +3176,6 @@ mod tests {
     fn scoring_policy_rejects_removed_profile_shape() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "profile": "balanced" }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -2893,7 +3184,7 @@ mod tests {
 
     #[test]
     fn scoring_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -3030,7 +3321,6 @@ mod tests {
     fn scoring_policy_rejects_unknown_strategy() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": { "strategy": "prefixAware" }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3040,7 +3330,6 @@ mod tests {
     #[test]
     fn selection_policy_round_trips_and_rejects_unknown_mode() {
         let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
-            "seeds": [],
             "selectionPolicy": { "mode": "roundRobin" }
         }))
         .unwrap_or_else(|_| std::process::abort());
@@ -3050,7 +3339,6 @@ mod tests {
         );
 
         let result = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-            "seeds": [],
             "selectionPolicy": { "mode": "not-a-mode" }
         }));
         let Err(error) = result else {
@@ -3060,26 +3348,77 @@ mod tests {
     }
 
     #[test]
+    fn membership_round_trips_without_defaulting_absent_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let bare: GridNetworkSpec = serde_json::from_value(serde_json::json!({}))?;
+        assert!(bare.membership.is_none(), "legacy networks retain the install setting");
+        assert!(serde_json::to_value(bare)?.get("membership").is_none());
+        for (value, mode) in [("Local", MembershipMode::Local), ("Swim", MembershipMode::Swim)] {
+            let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
+                "membership": {"mode": value}, "signalTransport": {"mode": "poll"}
+            }))?;
+            assert_eq!(spec.membership.as_ref().map(|policy| policy.mode), Some(mode));
+            assert_eq!(
+                serde_json::to_value(spec)?.pointer("/membership/mode"),
+                Some(&serde_json::json!(value))
+            );
+        }
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"mode": "local"}),
+            serde_json::json!({"mode": "Other"}),
+            serde_json::json!({"mode": "Local", "extra": true}),
+        ] {
+            let error = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"membership": invalid}))
+                .err()
+                .ok_or("invalid membership was accepted")?;
+            assert!(error.is_data());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn peer_trust_round_trips_and_rejects_unknown_mode() {
-        let spec: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({"seeds": [], "peerTrust": {"mode": "spiffe"}}))
-                .unwrap_or_else(|_| std::process::abort());
+        let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({"peerTrust": {"mode": "spiffe"}}))
+            .unwrap_or_else(|_| std::process::abort());
         assert_eq!(spec.peer_trust.map(|trust| trust.mode), Some(PeerTrustMode::Spiffe));
         let bare: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({"seeds": []})).unwrap_or_else(|_| std::process::abort());
+            serde_json::from_value(serde_json::json!({})).unwrap_or_else(|_| std::process::abort());
         assert!(bare.peer_trust.is_none(), "absent stays absent");
         assert_eq!(PeerTrustMode::default(), PeerTrustMode::Pin);
-        let Err(_unknown) =
-            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"seeds": [], "peerTrust": {"mode": "x"}}))
+        let Err(_unknown) = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"peerTrust": {"mode": "x"}}))
         else {
             std::process::abort();
         };
     }
 
     #[test]
+    fn signed_state_is_off_unless_enforced() {
+        let parse = |peer_trust: serde_json::Value| {
+            serde_json::from_value::<GridNetworkSpec>(serde_json::json!({"peerTrust": peer_trust}))
+                .map(|spec| spec.peer_trust.map(|trust| trust.signed_state))
+        };
+
+        assert_eq!(
+            parse(serde_json::json!({"mode": "pin"})).ok().flatten(),
+            Some(SignedStateMode::Off),
+            "absent signedState keeps state unsigned"
+        );
+        assert_eq!(
+            parse(serde_json::json!({"mode": "pin", "signedState": "enforce"}))
+                .ok()
+                .flatten(),
+            Some(SignedStateMode::Enforce),
+            "enforce parses"
+        );
+        assert!(
+            parse(serde_json::json!({"mode": "pin", "signedState": "sign"})).is_err(),
+            "unknown signedState is rejected"
+        );
+    }
+
+    #[test]
     fn signal_transport_round_trips_and_rejects_unknown_mode() {
         let spec: GridNetworkSpec = serde_json::from_value(serde_json::json!({
-            "seeds": [],
             "signalTransport": { "mode": "poll" }
         }))
         .unwrap_or_else(|_| std::process::abort());
@@ -3087,12 +3426,11 @@ mod tests {
 
         // Absent policy resolves to the gossip default.
         let bare: GridNetworkSpec =
-            serde_json::from_value(serde_json::json!({ "seeds": [] })).unwrap_or_else(|_| std::process::abort());
+            serde_json::from_value(serde_json::json!({})).unwrap_or_else(|_| std::process::abort());
         assert!(bare.signal_transport.is_none());
         assert_eq!(SignalMode::default(), SignalMode::Gossip);
 
         let Err(unknown_mode) = serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-            "seeds": [],
             "signalTransport": { "mode": "not-a-mode" }
         })) else {
             std::process::abort();
@@ -3102,7 +3440,6 @@ mod tests {
         // deny_unknown_fields: an extra key is rejected.
         assert!(
             serde_json::from_value::<GridNetworkSpec>(serde_json::json!({
-                "seeds": [],
                 "signalTransport": { "mode": "poll", "extra": true }
             }))
             .is_err(),
@@ -3123,7 +3460,6 @@ mod tests {
     fn scoring_policy_rejects_removed_weights_field() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "scoringPolicy": {
                 "strategy": "queueDepth",
                 "weights": { "locality": 1.0 }
@@ -3419,14 +3755,14 @@ mod tests {
 
     #[test]
     fn budget_policy_absent_defaults_to_none() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         assert!(spec.budget_policy.is_none(), "absent budgetPolicy must default to None");
     }
 
     #[test]
     fn budget_policy_absent_not_serialized() {
-        let json = serde_json::json!({ "gridId": "", "seeds": [] });
+        let json = serde_json::json!({ "gridId": "" });
         let spec: GridNetworkSpec = serde_json::from_value(json).unwrap_or_else(|_| std::process::abort());
         let serialized = serde_json::to_value(&spec).unwrap_or_else(|_| std::process::abort());
         assert!(
@@ -3439,7 +3775,6 @@ mod tests {
     fn budget_policy_with_tenants_round_trips() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "budgetPolicy": {
                 "tenants": [
                     { "tenantId": "tenant-a", "capUsd": 100.0 },
@@ -3487,7 +3822,6 @@ mod tests {
     fn budget_policy_rejects_unknown_shape() {
         let json = serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "budgetPolicy": { "caps": [] }
         });
         let result = serde_json::from_value::<GridNetworkSpec>(json);
@@ -3625,7 +3959,6 @@ mod tests {
     fn legacy_spec_json() -> serde_json::Value {
         serde_json::json!({
             "gridId": "",
-            "seeds": [],
             "gatewayRefs": [{
                 "name": "consumer-gw",
                 "namespace": "praxis-system",
@@ -3635,7 +3968,6 @@ mod tests {
                     "credentialMountBase": "/run/secrets/legacy-provider"
                 }
             }],
-            "swim": {},
             "tls": {
                 "swimKeyRef": { "name": "legacy-swim-key", "namespace": "praxis-system" }
             }

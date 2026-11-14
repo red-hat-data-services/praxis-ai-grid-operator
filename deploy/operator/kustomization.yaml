@@ -13,14 +13,22 @@ resources:
   - clusterrolebinding-crd.yaml
   - clusterrolebinding-metrics-scraper.yaml
   - deployment.yaml
+  - role-leader-election.yaml
   - role-metrics-scraper-token.yaml
+  - role-operator-config.yaml
+  - rolebinding-leader-election.yaml
   - rolebinding-metrics-scraper-token.yaml
+  - rolebinding-operator-config.yaml
   - rolebinding-resources.yaml
   - service-metrics.yaml
   - service-signals.yaml
   - service-swim.yaml
   - serviceaccount-metrics-scraper.yaml
   - serviceaccount.yaml
+  - validatingadmissionpolicy-endpointslice-cleanup.yaml
+  - validatingadmissionpolicy-protect-config.yaml
+  - validatingadmissionpolicybinding-endpointslice-cleanup.yaml
+  - validatingadmissionpolicybinding-protect-config.yaml
 
 labels:
   - pairs:
