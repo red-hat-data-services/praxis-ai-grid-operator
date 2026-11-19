@@ -605,6 +605,33 @@ This field is independent of `praxisConfig`; absent or disabled generated
 consumer Praxis config cannot make embedded serving fail validation or change
 its provider-hop allowlist.
 
+### GatewayRef.regionalPolicy
+
+`spec.consumerGateways[].regionalPolicy` is an optional per-gateway contract
+for regional eligibility. It applies to every candidate in that gateway's
+overlay; omitting it preserves the existing routing behavior. Grid reads
+region and sovereignty only from trusted `GridSite` metadata. A caller cannot
+change policy eligibility with a request header.
+
+| Field | Applies to | Meaning |
+|---|---|---|
+| `mode: affinity` | affinity | Use `preferredRegions`, or the region of the trusted `siteName` `GridSite` when it is omitted. `crossRegionFallback` defaults to `deny`; `allow` creates a fallback group used only when no preferred candidate admits new work. |
+| `mode: locked` | locked | Requires non-empty `allowedRegions`; candidates outside the set never enter routing. `preferredRegions` and `crossRegionFallback` are invalid in this mode. |
+| `allowedSovereigntyZones` | both modes | Optional independent hard allowlist. A candidate must pass both this set and its regional rule; comparison uses the shared sovereignty-zone canonical form (trimmed, lowercased tokens). |
+
+`preferredRegions` and `allowedRegions` are unordered Kubernetes sets of 1–64
+non-empty values containing no whitespace, each at most 253 characters.
+`allowedSovereigntyZones` uses the shared sovereignty-zone token grammar: ASCII
+letters, digits, `.`, `_`, or `-`, at most 63 characters; values are compared
+case-insensitively, so `EU` and `eu` denote the same zone. A valid policy with
+unresolved required site metadata, or with no
+permitted candidate, publishes an authoritative empty revision and fails
+closed. An invalid policy update is rejected before it can
+replace the last-known-good revision. See the
+[regional-policy example](../../examples/gateway/regional-policy.yaml) and
+[routing guide](../routing.md#regional-policy-affinity-locking-and-sovereignty)
+for complete behavior, updates, sessions, and observability.
+
 ### GatewayRef.modelDiscoveryContractVersion
 
 Set `spec.consumerGateways[].modelDiscoveryContractVersion: v1` only after the
@@ -1601,6 +1628,14 @@ telemetry-only labels (`grid_mcp_probe_total`, Events), not persisted to
 
 Represents A2A agents available over the grid.
 
+This API is experimental and is disabled from the default Grid build and
+installation. Enable the operator `a2a` Cargo feature, which activates the
+`experimental` marker, and the chart value `experimental.a2a.enabled=true`
+before installing or using this CRD.
+The current contract is API-only; Agent Card discovery and routing are
+follow-up tasks. A2A metrics configuration is not part of this contract and
+will be designed with future A2A scoring work.
+
 ```yaml
 apiVersion: grid.praxis.fast/v1alpha1
 kind: AgentToAgentProvider
@@ -1608,17 +1643,73 @@ metadata:
   name: claims-agent
 spec:
   gridNetworkRef: production
-  protocol: a2a
-  endpoint: http://claims-agent.agents:8080
+  binding: JSONRPC
+  endpoint: https://claims-agent.agents:8443
   agentCard:
-    skills: [claims-processing, document-review]
-    modalities: [text]
+    path: /.well-known/agent-card.json
+    skillAllowlist: [claims-processing, document-review]
   auth:
     strategy: mtls_only
+  tls:
+    caSecretRef:
+      name: claims-agent-ca
+      namespace: grid-system
+    clientCertificateSecretRef:
+      name: claims-agent-client-cert
+      namespace: grid-system
+      certificateKey: tls.crt
+      privateKeyKey: tls.key
   accessPolicy:
     siteSelector:
       matchLabels:
         grid.praxis.fast/site: cluster-a
 ```
 
+`binding` currently accepts only `JSONRPC`, meaning JSON-RPC over HTTP(S).
+When `agentCard` is omitted, discovery uses
+`/.well-known/agent-card.json` on the origin of `spec.endpoint`. A configured
+`agentCard.path` is also resolved against that origin, rather than appended to
+an endpoint path. For example, an endpoint of
+`https://agent.example/a2a/v1` with the default path resolves to
+`https://agent.example/.well-known/agent-card.json`.
+
+Set at most one of `agentCard.url` and `agentCard.path`. Discovery follows no
+redirects and rejects loopback, link-local, unspecified, unique-local, and
+cloud-metadata addresses using the same SSRF policy as the AgentToolProvider
+probe. Authentication and TLS client identity are sent only to the HTTPS
+origin of `spec.endpoint`; an explicit card URL on another origin is fetched
+without those credentials. A discovered card never changes the configured
+endpoint used for the private agent hop. `skillAllowlist` is empty by default
+and identifies skills by the Agent Card `id`, not by display name.
+
 **Phases**: Pending → Available → Degraded → Unavailable
+
+`status.discoveredCard` is deliberately bounded. It contains the observed
+agent name/version, card-level default input/output modes,
+protocol-interface binding metadata, streaming capability, and each allowed
+skill's ID, name, and effective input/output modes. Effective skill modes use
+the skill override when present and the card-level defaults otherwise. Full
+Agent Card JSON, descriptions, examples, schemas, URLs, and all credentials
+are excluded from status and future SWIM/CRDT records. The bounded status
+contains at most 128 skills and 8 ASCII modes per direction per list. Agent
+and skill display names are bounded to 128 characters; the schema and a
+maximum-size serialization test keep the complete status below 512 KiB.
+
+#### AgentToAgentProvider reason codes
+
+| Reason | Phase | Meaning |
+|---|---|---|
+| `ProviderConfigInvalid` | Unavailable | Static endpoint, selector, card URL/path, or binding validation failed. |
+| `GridNetworkNotFound` | Unavailable | `spec.gridNetworkRef` does not resolve to a `GridNetwork`. |
+| `UnsupportedAuthStrategy` | Unavailable | The configured authentication strategy is not supported by the controller. |
+| `CredentialSecretRefInvalid` | Unavailable | The authentication Secret reference is absent or malformed. |
+| `CredentialSecretMissing` | Unavailable | The configured authentication Secret cannot be resolved. |
+| `CredentialSecretKeyMissing` | Unavailable | The configured authentication key is absent. |
+| `CredentialSecretValueInvalid` | Unavailable | The resolved credential is not valid UTF-8 or cannot be sent safely. |
+| `EndpointTlsSecretMissing` | Unavailable | A referenced TLS Secret does not exist. |
+| `EndpointTlsKeyMissing` | Unavailable | A referenced TLS key is absent or empty. |
+| `EndpointTlsMaterialInvalid` | Unavailable | CA or client certificate material cannot be parsed. |
+| `AgentCardUnreachable` | Unavailable | Card discovery failed due to transport, DNS, timeout, or policy rejection. |
+| `AgentCardInvalid` | Unavailable | The response is not a bounded, valid A2A Agent Card. |
+| `AgentCardUnsupportedBinding` | Unavailable | The card does not expose the configured JSON-RPC binding. |
+| `AgentCardNoRoutableSkills` | Unavailable | No discovered skill remains after validation and the configured allowlist. |
