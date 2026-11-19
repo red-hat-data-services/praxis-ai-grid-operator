@@ -99,7 +99,9 @@ Before opening a release preparation pull request:
 - [ ] Run `make test` and `make doc` for the root workspace.
 - [ ] Run `cargo test --locked --manifest-path crates/gateway/Cargo.toml --workspace`
       for the separate Gateway workspace.
-- [ ] Run `make codegen-check`, `make crds-check`, and `make deploy-check`.
+- [ ] Run `make codegen-check` and `make crds-check`. When the opt-in A2A API
+      changes, also run `make crds-check-experimental`.
+- [ ] Run `make deploy-check`.
 - [ ] Run `git diff --check` and validate the release workflow with
       `actionlint`.
 - [ ] Lint and render the six release charts with their required values.
@@ -133,19 +135,32 @@ this workflow: its validation and runner intentionally support only the fixed
 modes above. The GLB `--no-ingress` variant is also omitted because the
 Triggered Integration Test does not expose that topology selector.
 
-Only quick-mode qualifications have daily scheduled workflows. Full runs
-remain available for manual dispatch only; `combined-site` is also manual-only
-because its only supported mode is `--full`. Scheduled start times are UTC and
-are spaced one hour apart to avoid overlapping the approximately 30-minute
-runs. The original daily quick-GLB schedule remains enabled at 18:00
-`America/New_York` (22:00 UTC during daylight time, 23:00 UTC during standard
-time); consequently, `glb-quick` also has that legacy run.
+The quick-mode qualifications have daily scheduled workflows. The Triggered
+Integration Test also runs `combined-site` in full mode each day at 19:00 UTC,
+using the standard operator image. Its direct `glb-quick` schedule runs at
+18:00 UTC. The separate quick-mode starts are spaced one hour apart.
 
 | Scheduled workflow | Release qualification | Daily UTC start |
 |---|---|---:|
 | `Scheduled GLB Quick Qualification` | `glb-quick` | 00:00 |
 | `Scheduled Static-Weighted Qualification` | `static-weighted` | 01:00 |
 | `Scheduled llm-d Pool-Metrics Quick Qualification` | `llmd-pool-metrics-quick` | 02:00 |
+
+The manual and reusable workflow also accept `operator_image_mode` (`standard`
+or `fips`). It defaults to `standard`, and scheduled runs use `standard`. The
+optional `fips` mode builds and selects the FIPS operator image
+on a self-hosted `linux`/`fips` runner, whose kernel must report
+`/proc/sys/crypto/fips_enabled=1`; the operator's startup verification
+additionally checks OpenSSL's effective FIPS properties. FIPS mode refuses PR
+merge sources because it runs on a self-hosted runner, but it does not assess
+whether a repository branch is trusted; operators must select a trusted branch.
+The destructive disk-pruning step runs only in standard mode, so the self-hosted
+FIPS runner must be provisioned with sufficient free disk. A successful FIPS
+combined-site run qualifies Grid operator startup only, not the Praxis AI
+gateway, overlay-sync, or the whole deployment as FIPS-compliant. The image mode
+is included in the uploaded artifact name, image manifest, and job summary. FIPS
+image build/packaging checks remain separate from the standard nightly Kind
+runtime qualification.
 
 The scheduled workflows call the same reusable Triggered Integration Test
 workflow as manual runs, so source resolution, image selection, evidence
@@ -162,7 +177,7 @@ directory can lose its clusters even when it uses a different config file.
 
 | Area | Command | Topology/config path | Classification | Required when | Feature docs |
 |---|---|---|---|---|---|
-| Provider traffic selection and round-robin | `cargo xtask env run-grid-provider-traffic-qualification --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-provider-traffic/forge.yaml` | Release qualification | Routing, provider candidates, overlay selection policy, provider attribution, or gateway compatibility changes | [README](../tests/e2e/topologies/grid-provider-traffic/README.md) |
+| Provider traffic selection, regional policy, and round-robin | `GRID_XTASK_GRID_GATEWAY_IMAGE="grid-gateway:$IMAGE_TAG" cargo xtask env run-grid-provider-traffic-qualification --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-provider-traffic/forge.yaml` | Release qualification | Routing, `regionalPolicy`, trusted geography or sovereignty metadata, provider candidates, overlay selection policy, provider attribution, or gateway compatibility changes | [README](../tests/e2e/topologies/grid-provider-traffic/README.md) |
 | Operator-derived local routing and passive-health recovery | `cargo xtask env run-grid-operator-routing-qualification --forge-config tests/e2e/topologies/grid-operator-routing/forge.yaml --teardown --keep-on-failure --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-operator-routing/forge.yaml` | Experimental integration qualification | Operator-derived local backend dials, embedded Gateway passive health, backend endpoint replacement, or related local routing changes | [README](../tests/e2e/topologies/grid-operator-routing/README.md) |
 | Static weighted provider selection | `GRID_XTASK_SIM_IMAGE=ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 cargo xtask env run-grid-static-weighted-qualification --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml --quick --teardown --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-static-weighted/forge.yaml` | Release qualification | `weightedRandom`, static placement, provider capacity, weighted overlay, final-provider withdrawal/restoration, or cross-site capacity propagation changes | [README](../tests/e2e/topologies/grid-static-weighted/README.md) |
 | Distributed token quota | `cargo xtask env run-grid-token-rate-limit-qualification --forge-config tests/e2e/topologies/grid-token-rate-limit/forge.yaml --image-tag "$IMAGE_TAG" --evidence-dir "$EVIDENCE_DIR"` | `tests/e2e/topologies/grid-token-rate-limit/forge.yaml` | Experimental integration qualification | Quota, identity, Basic Auth, Valkey, gateway image, or shared-consumer changes | [README](../tests/e2e/topologies/grid-token-rate-limit/README.md) |
@@ -179,7 +194,7 @@ topologies require the filters documented in their READMEs and may use the
 official compatible AI image where applicable.
 
 ```console
-cargo xtask env run-grid-provider-traffic-qualification --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
+GRID_XTASK_GRID_GATEWAY_IMAGE="grid-gateway:$IMAGE_TAG" cargo xtask env run-grid-provider-traffic-qualification --forge-config tests/e2e/topologies/grid-provider-traffic/forge.yaml --full --teardown --evidence-dir "$EVIDENCE_DIR"
 cargo xtask env run-grid-operator-routing-qualification --forge-config tests/e2e/topologies/grid-operator-routing/forge.yaml --teardown --keep-on-failure --evidence-dir "$EVIDENCE_DIR"
 GRID_XTASK_SIM_IMAGE=ghcr.io/llm-d/llm-d-inference-sim:v0.10.2 cargo xtask env run-grid-static-weighted-qualification --forge-config tests/e2e/topologies/grid-static-weighted/forge.yaml --quick --teardown --evidence-dir "$EVIDENCE_DIR"
 cargo xtask env run-grid-token-rate-limit-qualification --forge-config tests/e2e/topologies/grid-token-rate-limit/forge.yaml --image-tag "$IMAGE_TAG" --evidence-dir "$EVIDENCE_DIR"
@@ -212,6 +227,7 @@ Typical local overrides are:
 
 ```console
 export GRID_XTASK_GATEWAY_IMAGE=praxis-ai:$IMAGE_TAG
+export GRID_XTASK_GRID_GATEWAY_IMAGE=grid-gateway:$IMAGE_TAG
 export GRID_XTASK_OPERATOR_IMAGE=grid-operator:$IMAGE_TAG
 export GRID_XTASK_OVERLAY_SYNC_IMAGE=grid-overlay-sync:$IMAGE_TAG
 export GRID_XTASK_MOCK_PROVIDER_IMAGE=grid-mock-providers:$IMAGE_TAG
@@ -220,8 +236,9 @@ export GRID_XTASK_IMAGE_PULL_POLICY=Never
 ```
 
 In the current qualification tooling, `GRID_XTASK_GATEWAY_IMAGE` names the
-Praxis AI gateway image used by the fixtures. It does not refer to the
-project-owned `grid-gateway` operand.
+Praxis AI gateway image used by the fixtures. `GRID_XTASK_GRID_GATEWAY_IMAGE`
+names the separately built project-owned `grid-gateway` operand used by the
+full provider-traffic qualification.
 
 The distributed token-quota qualification requires the optional Praxis AI
 `token-rate-limit-filter`. Praxis AI 0.4.0 already includes Basic Auth; a
@@ -268,7 +285,7 @@ notes, run it and report its evidence independently.
 
 | Area | Behavior proved | Images and overrides | Evidence, runtime, and cleanup | Feature docs |
 |---|---|---|---|---|
-| Provider traffic selection and round-robin | Grid publishes stable provider candidates and groups; Praxis AI accepts the overlay and returns trusted attribution while eligible providers receive round-robin traffic. | Official compatible Praxis AI gateway image, plus locally built `grid-operator`, `grid-overlay-sync`, and VCR simulator images. Use the `GRID_XTASK_*_IMAGE` overrides above when validating unreleased Grid code. | Write to the run's UTC-stamped `EVIDENCE_DIR`; the full run is typically several minutes. Verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-provider-traffic/README.md) |
+| Provider traffic selection, regional policy, and round-robin | Grid publishes stable provider candidates and groups; the full run also proves affinity, sovereignty exclusion, locked no-route behavior, session invalidation, and accepted serving revisions for both supported consumers. | Official compatible Praxis AI gateway image, plus locally built `grid-operator`, `grid-overlay-sync`, VCR simulator, and `grid-gateway` images. For release evidence, set `GRID_XTASK_GRID_GATEWAY_IMAGE=grid-gateway:$IMAGE_TAG` so the full run selects the freshly built image rather than the qualification default tag. Use the `GRID_XTASK_*_IMAGE` overrides above when validating unreleased Grid code. | Write to the run's UTC-stamped `EVIDENCE_DIR`; the full run is typically several minutes. Verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-provider-traffic/README.md) |
 | Operator-derived local routing and passive-health recovery | The operator derives local backend dials from InferenceProvider endpoints, publishes them, and the embedded Gateway serves those dials. Attributed requests prove initial routing, passive-health demotion after inference-connect failures, same-endpoint recovery, and eventual routing to a replacement endpoint. The replacement scenario does not isolate passive-health reset from the normal cooldown or promise request continuity during convergence. It does not duplicate cross-site/EPP signal routing or administrative drain proofs. | Build the Grid operator, Grid Gateway, and mock-provider image from the same checkout; use the three `GRID_XTASK_*_IMAGE` overrides and `GRID_XTASK_IMAGE_PULL_POLICY=Never` documented by the topology README. The qualification client image remains a public pull. | Save ConfigMap and mounted-dial revisions, attributed requests, Gateway passive-health logs, local image IDs and runtime Pod imageIDs under `EVIDENCE_DIR`. Use `--teardown --keep-on-failure`; diagnostics are captured before a failed run is retained. | [README](../tests/e2e/topologies/grid-operator-routing/README.md) |
 | Static weighted provider selection | Three weighted distributions, followed by sequential withdrawal to an authoritative empty revision and restoration. The proof checks the published and mounted revisions, Praxis accepted/serving revision, affinity-bound and new no-route responses, provider/backend counters, and gateway restart identity. | Requires the planned Praxis AI 0.7.0 image, built from Praxis 0.7.4, with support for empty versioned routing snapshots. Also use locally built `grid-operator` and VCR images. | Write structured results and the revision transition under `EVIDENCE_DIR`; runtime is typically several minutes. A run with an incompatible gateway image is failed, not a completed release qualification. Verify teardown against the run inventory. | [README](../tests/e2e/topologies/grid-static-weighted/README.md) |
 | Distributed token quota | Basic Auth precedes admission; Alice's sliding-window budget is shared across consumers; routing spans sites; concurrency, expiry, restart persistence, Valkey fail-closed behavior, recovery, and NetworkPolicy are exercised. | Praxis AI 0.4.0 includes Basic Auth; a custom quota image must enable `token-rate-limit-filter` and declare both available filters in its image label. Use `--image-tag` and the exact image required by the README. | Record structured quota and routing evidence under `EVIDENCE_DIR`; runtime is variable and materially longer than a smoke test. The command attempts cleanup on normal completion or handled failure; do not use `--keep` for release evidence. | [README](../tests/e2e/topologies/grid-token-rate-limit/README.md) |

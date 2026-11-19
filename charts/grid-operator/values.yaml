@@ -6,6 +6,8 @@ site:
   region: ""
   # -- Availability zone.
   zone: ""
+  # -- Sovereignty zone a gateway's fence or regionalPolicy matches this site against.
+  sovereigntyZone: ""
 
 # -- The grid this site joins. Setting id renders the GridNetwork and this site's
 # GridSite, with site discovery on. They need the grid CRDs first, so plain Helm sets id
@@ -71,6 +73,13 @@ crds:
   enabled: true
   # -- Keep the CRDs on helm uninstall and an Argo CD delete or prune.
   keep: true
+
+# -- Experimental features. These are disabled by default and require an
+# operator image built with the matching Cargo feature.
+experimental:
+  a2a:
+    # -- Render the experimental AgentToAgentProvider CRD and RBAC.
+    enabled: false
 
 # -- Number of operator replicas. Every replica is ready and elects: one holds the operator
 # lease and runs everything that writes, and the signals and SWIM Services route to it alone
@@ -328,6 +337,10 @@ gateway:
   # -- GridNetwork consumerGateways[].praxisConfig for the site gateway, as the CRD
   # takes it. Empty renders no block.
   praxisConfig: {}
+  # -- GridNetwork consumerGateways[].regionalPolicy for the site gateway, as the CRD takes
+  # it: preferred regions and fallback behavior in affinity mode, allowed regions in locked
+  # mode, and an optional hard sovereignty-zone allowlist in either mode. Empty renders no block.
+  regionalPolicy: {}
   # -- Reachable site gateway host:port override. Set this for ClusterIP or
   # NodePort Services; the own GridSite uses it when gatewayEndpoint is absent.
   address: ""

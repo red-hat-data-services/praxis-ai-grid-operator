@@ -39,6 +39,16 @@ helm install grid-operator charts/grid-operator \
   --create-namespace
 ```
 
+The A2A provider API is experimental and disabled by default. Enable it only
+with an operator image built with the `a2a` Cargo feature, which activates the
+experimental marker, and the matching chart value:
+
+```bash
+helm upgrade --install grid-operator charts/grid-operator \
+  --namespace grid-system --create-namespace \
+  --set experimental.a2a.enabled=true
+```
+
 ## Versioning
 
 The chart follows [Semantic Versioning](https://semver.org/). In
@@ -68,7 +78,7 @@ custom resources:
 ```bash
 kubectl delete crd agenttoolproviders.grid.praxis.fast \
   gridnetworks.grid.praxis.fast gridsites.grid.praxis.fast \
-  inferenceproviders.grid.praxis.fast
+  inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast
 ```
 
 ## Upgrade
@@ -169,7 +179,7 @@ release annotation must be empty or this release:
 
 ```bash
 kubectl get crd agenttoolproviders.grid.praxis.fast gridnetworks.grid.praxis.fast \
-  gridsites.grid.praxis.fast inferenceproviders.grid.praxis.fast \
+  gridsites.grid.praxis.fast inferenceproviders.grid.praxis.fast siteinvites.grid.praxis.fast \
   -o custom-columns='NAME:.metadata.name,RELEASE:.metadata.annotations.meta\.helm\.sh/release-name'
 ```
 
@@ -183,7 +193,7 @@ helm upgrade grid-operator oci://ghcr.io/praxis-proxy/charts/grid-operator \
 With an older Helm, mark them as owned by the release, then upgrade as usual:
 
 ```bash
-RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
+RELEASE=grid-operator; NAMESPACE=grid-system; for crd in agenttoolproviders gridnetworks gridsites inferenceproviders siteinvites; do kubectl label crd "${crd}.grid.praxis.fast" app.kubernetes.io/managed-by=Helm --overwrite; kubectl annotate crd "${crd}.grid.praxis.fast" meta.helm.sh/release-name="${RELEASE}" meta.helm.sh/release-namespace="${NAMESPACE}" --overwrite; done
 ```
 
 ## Names across charts
@@ -217,9 +227,11 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 |-----|------|---------|-------------|
 | `crds.enabled` | bool | `true` | Install and upgrade the Grid CRDs. `false` when a platform owns them. |
 | `crds.keep` | bool | `true` | Keep the CRDs on `helm uninstall` and an Argo CD delete or prune. |
+| `experimental.a2a.enabled` | bool | `false` | Render the experimental A2A CRD and RBAC. Requires an operator image built with the `a2a` Cargo feature. |
 | `site.name` | string | `""` | This site's name, a DNS label. Defaults `swim.siteName`, and through it `enrollment.siteName`. |
 | `site.region` | string | `""` | Region on the rendered GridSite. Empty leaves it out. |
 | `site.zone` | string | `""` | Availability zone on the rendered GridSite. Empty leaves it out. |
+| `site.sovereigntyZone` | string | `""` | Sovereignty zone on the rendered GridSite, which a gateway's sovereignty fence or `regionalPolicy` matches the site against. Empty leaves it out. |
 | `grid.membership.source` | string | `Swim` | Where this site learns its members. `Swim` learns them over SWIM gossip. `Local` reads the GridSites this site's configuration lists and polls each peer's signals at the endpoint derived from its gateway. Local runs no SWIM, so `swim.service.enabled`, the seeds and `swim.advertiseAddress` fail the render, and `grid.signals` renders `poll`. Also writes `GridNetwork.spec.membership.mode` when `grid.id` is set. |
 | `grid.admissionPolicy` | object | stabilized, as grid-site | GridNetwork `admissionPolicy`, the grid-site chart's default. `null` leaves the CRD default, instantaneous admission. Pressure transitions need a `scoringPolicy` and matching provider `signalNames`. |
 | `grid.selectionPolicy.mode` | string | `roundRobin` | Local selection mode the gateway uses, the grid-site chart's default. `null` on `grid.selectionPolicy` leaves the gateway default, `deterministic`. |
@@ -299,6 +311,7 @@ namespace names in `metricsListener.fromNamespaces`, and on OpenShift defaults t
 | `gateway.allowSystemNamespace` | bool | `false` | Allow `gateway.namespace` to be `default`, `kube-*`, or `openshift-*`. |
 | `gateway.port` | string | `""` | Site gateway Service port override. Empty uses the first Service `spec.ports` entry, with `8080` as the fallback if no usable port exists. Maps to `GRID_GATEWAY_PORT`. |
 | `gateway.praxisConfig` | object | `{}` | `consumerGateways[].praxisConfig` for the site gateway on the rendered GridNetwork, as the CRD takes it. Empty renders no block. |
+| `gateway.regionalPolicy` | object | `{}` | `consumerGateways[].regionalPolicy` for the site gateway on the rendered GridNetwork, as the CRD takes it: preferred regions and fallback behavior in affinity mode, allowed regions in locked mode, and an optional hard sovereignty-zone allowlist in either mode. Empty renders no block. |
 | `gateway.discoveryEnabled` | bool | `true` | Discover and advertise a LoadBalancer address for the site gateway. Maps to `GRID_GATEWAY_DISCOVERY_ENABLED`. |
 | `modelDiscovery.intervalSeconds` | int or string | `""` | Seconds between discovery rounds, 1 to 2592000, as `GRID_MODEL_DISCOVERY_INTERVAL_SECS`. Empty keeps the operator's 60s. |
 | `modelDiscovery.timeoutSeconds` | int or string | `""` | Seconds one provider poll may take, 1 to 3600, as `GRID_MODEL_DISCOVERY_TIMEOUT_SECS`. Empty keeps the operator's 5s. |

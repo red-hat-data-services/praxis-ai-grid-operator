@@ -15,9 +15,9 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit lint gateway-lint gateway-fips-check lint-extra fmt doc audit \
-	generate-api-types codegen-check generate-crds crds-check generate-deploy deploy-check \
+	generate-api-types codegen-check generate-crds crds-check generate-crds-experimental crds-check-experimental generate-deploy deploy-check \
 	generate-go-types go-types-check \
-	coverage coverage-check \
+		coverage coverage-check \
 	mutants semver publish-dry-run \
 	require-container-engine \
 	images container operator-image operator-fips-image gateway-image \
@@ -66,12 +66,13 @@ test-unit:
 lint: gateway-lint
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --all -- --check
-	cargo machete
+	python3 scripts/check-unused-dependencies.py
 
 gateway-lint:
 	cargo clippy --manifest-path crates/gateway/Cargo.toml --workspace --all-targets -- -D warnings
 	cargo +$(NIGHTLY_RUSTFMT) fmt --manifest-path crates/gateway/Cargo.toml --all -- --check
-	cargo machete crates/gateway
+	python3 scripts/check-unused-dependencies.py crates/gateway
+	python3 scripts/test-gateway-dependencies.py
 	@set -eu; \
 	  tree="$$(cargo tree --manifest-path crates/gateway/Cargo.toml -p gateway -e normal --target all --prefix none --format '{p}')"; \
 	  printf '%s\n' "$$tree" | grep -q '^openssl-sys ' || { echo "positive control failed: openssl-sys is not in the tree" >&2; exit 1; }; \
@@ -131,6 +132,13 @@ go-types-check:
 	git diff --exit-code go/api/v1alpha1/zz_generated_types.go go/api/v1alpha1/zz_generated_deepcopy.go
 	cd go && $(GO) test ./...
 	cd go && $(GO) build -o /dev/null ./_example
+
+# Generate or verify the opt-in A2A CRD using the experimental operator feature.
+generate-crds-experimental:
+	./scripts/generate-deployment-crds.sh --experimental
+
+crds-check-experimental:
+	./scripts/generate-deployment-crds.sh --experimental --check
 
 # Regenerate the operator install manifests in deploy/operator (platform base) and
 # deploy/overlays/kind from charts/grid-operator and the values.yaml in each directory.
