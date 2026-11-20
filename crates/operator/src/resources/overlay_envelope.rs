@@ -216,7 +216,6 @@ pub fn compute_semantic_digest(overlay: &RoutingOverlay) -> Result<String, serde
     clippy::too_many_arguments,
     reason = "all arguments are distinct provenance/scope fields"
 )]
-#[expect(clippy::too_many_lines, reason = "flat struct construction with all fields")]
 pub fn build_overlay_envelope(
     overlay: &RoutingOverlay,
     gateway_name: &str,
@@ -307,6 +306,7 @@ mod tests {
                 site: "site-a".to_owned(),
                 cluster: "cluster-a".to_owned(),
                 fresh: true,
+                expires_at: None,
                 credential: None,
                 stable_id: Some("abcd1234".to_owned()),
                 admission_state: None,
@@ -315,6 +315,7 @@ mod tests {
                 score_breakdown: None,
                 rank: Some(0),
                 selection_group: None,
+                regional_policy_group: None,
                 traffic_weight: None,
                 capacity_weight: 1,
             }],
@@ -323,10 +324,6 @@ mod tests {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-candidate test fixture with full field coverage"
-    )]
     fn multi_candidate_overlay() -> RoutingOverlay {
         RoutingOverlay {
             network: "glb-demo".to_owned(),
@@ -339,6 +336,7 @@ mod tests {
                     site: "east-provider".to_owned(),
                     cluster: "sim-east-provider".to_owned(),
                     fresh: true,
+                    expires_at: None,
                     credential: Some(ProjectedCredential {
                         strategy: "bearer_token".to_owned(),
                         secret_ref: ProjectedCredentialRef {
@@ -354,6 +352,7 @@ mod tests {
                     score_breakdown: None,
                     rank: Some(0),
                     selection_group: None,
+                    regional_policy_group: None,
                     traffic_weight: None,
                     capacity_weight: 1,
                 },
@@ -363,6 +362,7 @@ mod tests {
                     site: "west-provider".to_owned(),
                     cluster: "sim-west-provider".to_owned(),
                     fresh: true,
+                    expires_at: None,
                     credential: None,
                     stable_id: Some("west5678".to_owned()),
                     admission_state: None,
@@ -371,6 +371,7 @@ mod tests {
                     score_breakdown: None,
                     rank: Some(1),
                     selection_group: None,
+                    regional_policy_group: None,
                     traffic_weight: None,
                     capacity_weight: 1,
                 },

@@ -30,6 +30,13 @@ Metrics and health are plaintext: this install has no grid identity to serve. Se
 grid.id or enrollment.enabled to serve the site identity, or metrics.tls.source.
 {{- end }}
 
+{{- if and (include "grid-operator.networkPolicy.enabled" .) (not .Values.networkPolicy.metricsFrom) (not (.Capabilities.APIVersions.Has "security.openshift.io/v1")) }}
+
+The NetworkPolicy admits only the OpenShift monitoring namespaces to the metrics port,
+because networkPolicy.metricsFrom is empty and this render saw no OpenShift API. Off
+OpenShift, set networkPolicy.metricsFrom to the namespace your Prometheus runs in.
+{{- end }}
+
 Next steps:
 
   1. Create TLS and SWIM encryption Secrets.
@@ -47,6 +54,8 @@ Resource access granted in additional namespaces:
 {{- end }}
 {{- if and (.Values.enrollment | default dict).enabled (not .Values.rbac.create) }}
 
-Auto-enroll is on with rbac.create=false: grant the operator ServiceAccount
-get, create, and patch on Secrets in {{ .Release.Namespace }}.
+Enrollment is on with rbac.create=false: grant the operator ServiceAccount
+get, create, and patch on Secrets, and get, list, and watch on ConfigMaps, in
+{{ .Release.Namespace }}. The site enrolls from the ConfigMap
+{{ include "grid-operator.operatorConfig.name" . }}.
 {{- end }}

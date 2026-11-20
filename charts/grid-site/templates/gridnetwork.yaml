@@ -18,15 +18,18 @@ spec:
   with "spec: Required value" on both create and update.
   */}}
   gridId: {{ .Values.gridNetwork.gridId | quote }}
+  membership:
+    mode: {{ .Values.grid.membership.source | quote }}
+    {{- with .Values.gridNetwork.seeds }}
+    swim:
+      seeds:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
   {{- with .Values.gridNetwork.region }}
   region: {{ . | quote }}
   {{- end }}
   {{- with .Values.gridNetwork.zone }}
   zone: {{ . | quote }}
-  {{- end }}
-  {{- with .Values.gridNetwork.seeds }}
-  seeds:
-    {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- with .Values.gridNetwork.routingPolicy }}
   routingPolicy: {{ . | quote }}
@@ -57,9 +60,12 @@ spec:
     mode: {{ .mode | quote }}
   {{- end }}
   {{- end }}
-  {{- with (.Values.gridNetwork.peerTrust).mode }}
+  {{- with .Values.gridNetwork.peerTrust }}
   peerTrust:
-    mode: {{ . | quote }}
+    mode: {{ .mode | quote }}
+    {{- with .signedState }}
+    signedState: {{ . | quote }}
+    {{- end }}
   {{- end }}
   {{- with .Values.gridNetwork.metricsRefreshInterval }}
   {{- if . }}
@@ -68,10 +74,6 @@ spec:
   {{- end }}
   {{- with .Values.gridNetwork.budgetPolicy }}
   budgetPolicy:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-  {{- with .Values.gridNetwork.swim }}
-  swim:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- with .Values.gridNetwork.tls }}

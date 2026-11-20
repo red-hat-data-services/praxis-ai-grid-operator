@@ -17,6 +17,7 @@ pub(crate) mod kubectl;
 pub(crate) mod llmd_pool_metrics_demo;
 pub(crate) mod operator;
 pub(crate) mod operator_overlay;
+pub(crate) mod operator_routing_qualification;
 pub(crate) mod provider_drain;
 pub(crate) mod provider_traffic_qualification;
 pub(crate) mod providers;
@@ -66,6 +67,16 @@ pub(crate) enum ExternalProvider {
     /// `OpenAI` API provider (api.openai.com).
     #[value(name = "openai")]
     OpenAi,
+}
+
+/// How the combined-site sites learn their peers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Membership {
+    /// SWIM gossip discovers each peer.
+    #[default]
+    Swim,
+    /// Each site declares its peers as `GridSite` objects and polls their catalogs and signals.
+    Local,
 }
 
 /// Scenario-selection options shared by GLB demo commands.
@@ -376,10 +387,10 @@ pub(crate) enum Action {
     /// 2. Install Grid CRDs and apply `InferenceProvider` fixtures.
     /// 3. Run the Grid operator out-of-cluster (spawned via `cargo run`).
     /// 4. Wait for provider reconciliation:
-    ///    - healthy → `Pending`
-    ///    - invalid → `Unavailable`
-    ///    - degraded → `Degraded`
-    ///    - api fallback → `Pending`
+    ///    - healthy -> `Pending`
+    ///    - invalid -> `Unavailable`
+    ///    - degraded -> `Degraded`
+    ///    - api fallback -> `Pending`
     /// 5. Verify the overlay `ConfigMap` (healthy present, unavailable excluded, scoring order).
     /// 6. Export the overlay to a temp file.
     /// 7. Deploy the consumer gateway from the operator-exported overlay.
@@ -405,7 +416,7 @@ pub(crate) enum Action {
     /// convergence, then applies a `GridNetwork` resource and polls until:
     ///
     /// - `status.phase = Active` (derived from live `MembershipSnapshot`)
-    /// - `status.connectedSites ≥ 1` (one SWIM peer confirmed alive)
+    /// - `status.connectedSites >= 1` (one SWIM peer confirmed alive)
     ///
     /// Uses available localhost UDP ports selected at runtime. Both operators
     /// connect to the same kind cluster (context resolved from `config` via
@@ -431,7 +442,7 @@ pub(crate) enum Action {
     /// cluster.  Each operator publishes real `InferenceProvider`-derived state
     /// as a CRDT `GridStateSnapshot` on `GridNetwork` reconcile.  After SWIM
     /// gossip convergence the remote operator's provider-state broadcast arrives and
-    /// `GridNetwork.status.remoteProviderCount` becomes ≥ 1.
+    /// `GridNetwork.status.remoteProviderCount` becomes >= 1.
     ///
     /// Proves that:
     /// - Operators use real foca UDP custom broadcasts (not direct injection).
@@ -451,18 +462,18 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
-    /// Prove that `GridNetwork.spec.seeds` drives SWIM mesh formation.
+    /// Prove that `GridNetwork.spec.membership.swim.seeds` drives SWIM mesh formation.
     ///
     /// Starts two out-of-cluster operator processes with
     /// `GRID_SWIM_SEEDS=""` (env-var seeds intentionally empty).  Applies a
-    /// `GridNetwork` with `spec.seeds` containing the primary operator's UDP
+    /// `GridNetwork` with `membership.swim.seeds` containing the primary operator's UDP
     /// address.  Both operators reconcile the `GridNetwork`, the secondary
-    /// reads `spec.seeds` and announces to the primary via the CRD-driven
+    /// reads `membership.swim.seeds` and announces to the primary via the CRD-driven
     /// seed path, and SWIM gossip converges.
     ///
     /// Asserts:
     /// - Both operators started with `GRID_SWIM_SEEDS=""`.
-    /// - `GridNetwork.spec.seeds` contains the primary's address.
+    /// - `GridNetwork.spec.membership.swim.seeds` contains the primary's address.
     /// - `status.phase = Active` and `status.connectedSites >= 1`.
     ///
     /// This proves that CRD-sourced seeds alone are sufficient for mesh
@@ -664,8 +675,8 @@ pub(crate) enum Action {
     /// for both.
     ///
     /// This is the minimal deterministic kind proof of:
-    ///   `InferenceProvider (west k8s) → CRDT over SWIM → overlay candidate →
-    ///    consumer intelligent_route → provider gateway → HTTP 200`
+    ///   `InferenceProvider (west k8s) -> CRDT over SWIM -> overlay candidate ->
+    ///    consumer intelligent_route -> provider gateway -> HTTP 200`
     ///
     /// Requires the two-provider kind environment.  Run
     /// `env up -c tests/env/operator-routing-two-provider.toml` and
@@ -750,7 +761,7 @@ pub(crate) enum Action {
     ///
     /// 1. Deploy provider gateways (idempotent).
     /// 2. Operator reconcile + overlay export.
-    /// 3. Deploy consumer gateway with `openai_responses_format` → `intelligent_route` filter chain.
+    /// 3. Deploy consumer gateway with `openai_responses_format` -> `intelligent_route` filter chain.
     /// 4. Send `/v1/responses` requests: each model returns HTTP 200 with valid Responses body, unknown model fails
     ///    closed.
     /// 5. Verify response model fields match the requested model.
@@ -818,7 +829,7 @@ pub(crate) enum Action {
     ///
     /// Starts a primary SWIM operator and a joining SWIM operator, waits for
     /// membership formation, then advances the joining `GridSite`'s lifecycle
-    /// through `Pending → Discovered → Connecting → Active`.  Only `Discovered`
+    /// through `Pending -> Discovered -> Connecting -> Active`.  Only `Discovered`
     /// is harness-patched; `Connecting` and `Active` are driven by the
     /// `GridSite` controller.  `Active` requires the TCP probe to succeed and
     /// the configured `spec.trust.certFingerprint` to match `status.publicCertPem`.
@@ -859,7 +870,7 @@ pub(crate) enum Action {
     /// identity, and asserts the final state is stable (no oscillation over
     /// a 30-second observation window).
     ///
-    /// Proves idempotent reconciliation: same inputs → same status patch,
+    /// Proves idempotent reconciliation: same inputs -> same status patch,
     /// `grid_site_status_needs_update` prevents redundant patches, and two
     /// replicas do not conflict on status ownership.
     ///
@@ -961,6 +972,24 @@ pub(crate) enum Action {
         site: Option<String>,
     },
 
+    /// Verify `GridSite` and `GridNetwork` peer-condition status under Local membership.
+    ///
+    /// Asserts three transitions on a running in-process operator:
+    ///
+    /// 1. Before the `GridNetwork` is delivered: no `GridSite` exists yet.
+    /// 2. After delivery with no endpoints: own `GridSite` is Pending/GatewayAddressMissing; `GridNetwork` peer
+    ///    conditions are Unknown/NoDeclaredPeers.
+    /// 3. After a peer `GridSite` is declared: peer conditions leave `NoDeclaredPeers`.
+    VerifyLocalSiteStatus {
+        /// Path to the environment config file.
+        #[arg(short, long, default_value = "tests/env/operator-routing.toml")]
+        config: PathBuf,
+
+        /// Kind cluster context to run against (first provider site by default).
+        #[arg(long)]
+        site: Option<String>,
+    },
+
     /// Verify Grid routing and the secure provider boundary.
     ///
     /// Covers Grid discovery, edge-local overlays, provider topology, mTLS and
@@ -1036,6 +1065,9 @@ pub(crate) enum Action {
         /// Path to the source Forge environment config file.
         #[arg(long, default_value = "tests/e2e/topologies/grid-combined-site/forge.yaml")]
         forge_config: PathBuf,
+        /// How the sites learn their peers.
+        #[arg(long, value_enum, default_value_t = Membership::Swim)]
+        membership: Membership,
         /// Demo mode and lifecycle options.
         #[command(flatten)]
         options: GlbDemoOptions,
@@ -1093,6 +1125,22 @@ pub(crate) enum Action {
         #[arg(long)]
         keep: bool,
         /// Evidence output directory.
+        #[arg(long)]
+        evidence_dir: Option<PathBuf>,
+    },
+
+    /// Qualify operator-derived local dials through the embedded Grid Gateway.
+    RunGridOperatorRoutingQualification {
+        /// Forge topology to deploy.
+        #[arg(long, default_value = "tests/e2e/topologies/grid-operator-routing/forge.yaml")]
+        forge_config: PathBuf,
+        /// Delete only this run's Kind cluster after the qualification.
+        #[arg(long)]
+        teardown: bool,
+        /// With `--teardown`, retain the run-owned cluster on failure for diagnosis.
+        #[arg(long, requires = "teardown")]
+        keep_on_failure: bool,
+        /// Evidence directory. Defaults to a timestamped path under the topology.
         #[arg(long)]
         evidence_dir: Option<PathBuf>,
     },
@@ -1289,6 +1337,7 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
         Action::VerifyFailoverUnderLostPeer { config } => env_verify_failover_under_lost_peer(config),
         Action::VerifyStaleGcTtl { config } => env_verify_stale_gc_ttl(config),
         Action::VerifyOperatorInstallRbac { config, site } => env_verify_operator_install_rbac(config, site.as_deref()),
+        Action::VerifyLocalSiteStatus { config, site } => env_verify_local_site_status(config, site.as_deref()),
         Action::VerifyGridGlbRouting { forge_config } => {
             glb::verify_grid_routing(&glb_demo::standalone_run_config(forge_config)?)
         },
@@ -1313,7 +1362,11 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
             glb_demo::setup(forge_config, ingress_mode).map(|_| ())
         },
         Action::RunGridGlbDemo { forge_config, options } => glb_demo::run(forge_config, options),
-        Action::RunGridCombinedSiteDemo { forge_config, options } => combined_site_demo::run(forge_config, options),
+        Action::RunGridCombinedSiteDemo {
+            forge_config,
+            membership,
+            options,
+        } => combined_site_demo::run(forge_config, *membership, options),
         Action::RunGridLlmdPoolMetricsDemo {
             forge_config,
             options,
@@ -1338,6 +1391,17 @@ pub(crate) fn run(action: &Action) -> Result<(), Box<dyn std::error::Error>> {
                 evidence_dir: evidence_dir.clone(),
             },
         ),
+        Action::RunGridOperatorRoutingQualification {
+            forge_config,
+            teardown,
+            keep_on_failure,
+            evidence_dir,
+        } => operator_routing_qualification::run(&operator_routing_qualification::Options {
+            forge_config: forge_config.clone(),
+            teardown: *teardown,
+            keep_on_failure: *keep_on_failure,
+            evidence_dir: evidence_dir.clone(),
+        }),
         Action::RunGridTokenRateLimitQualification {
             forge_config,
             evidence_dir,
@@ -1520,9 +1584,8 @@ fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error
 /// 3. Run the Grid operator to generate an overlay with both local and `api_provider` candidates.
 /// 4. Deploy the consumer gateway with a plain-HTTP cluster for the API-provider mock in addition to the standard mTLS
 ///    clusters for local providers.
-/// 5. Verify: `model-x` → local provider gateway (HTTP 200), `model-z` → mock API-provider (HTTP 200), unknown model →
-///    404.
-#[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
+/// 5. Verify: `model-x` -> local provider gateway (HTTP 200), `model-z` -> mock API-provider (HTTP 200), unknown model
+///    -> 404.
 fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,
@@ -1549,7 +1612,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
-    // Step 3: operator reconcile → overlay with local + api_provider
+    // Step 3: operator reconcile -> overlay with local + api_provider
     eprintln!("verify-api-fallback: [3/5] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
@@ -1626,13 +1689,13 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 
     // Step 5: verify routing + credential injection
     eprintln!("verify-api-fallback: [5/5] verifying API-provider fallback routing and credential injection...");
-    eprintln!("  local model ({provider_cluster}) → {provider_model} via provider gateway");
+    eprintln!("  local model ({provider_cluster}) -> {provider_model} via provider gateway");
     eprintln!(
-        "  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (injected credential)"
+        "  api fallback ({TEST_PROVIDER_API}) -> {API_FALLBACK_MODEL} via mock api-provider (injected credential)"
     );
 
     // Port-forward directly to the mock-api-provider (not through consumer gateway)
-    // for the negative credential proof: direct access without auth → 401.
+    // for the negative credential proof: direct access without auth -> 401.
     let mock_port = verify::find_free_port()?;
     let mut mock_pf =
         verify::PortForwardGuard::start(&consumer_ctx, kind::MOCK_API_SVC, mock_port, kind::MOCK_API_PORT)?;
@@ -1664,7 +1727,7 @@ fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<
 ///
 /// 1. Deploy provider gateways.
 /// 2. Deploy mock API-provider in consumer cluster.
-/// 3. Operator reconcile → overlay JSON with `credential.secretRef`.
+/// 3. Operator reconcile -> overlay JSON with `credential.secretRef`.
 /// 4. Validate the operator-generated consumer Praxis config.
 /// 5. Deploy the consumer gateway with the credential Secret mounted.
 /// 6. Verify routing, native injection, and token-absence invariants.
@@ -1697,7 +1760,7 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     let api_provider_endpoint = format!("{}.default.svc:{}", kind::MOCK_API_SVC, kind::MOCK_API_PORT);
     eprintln!("  api_provider endpoint: {api_provider_endpoint}");
 
-    // Step 3: operator reconcile → overlay with credential secretRef
+    // Step 3: operator reconcile -> overlay with credential secretRef
     eprintln!("verify-api-fallback-native: [3/8] operator reconcile + overlay export...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_validation_resources(&context)?;
@@ -1834,8 +1897,8 @@ fn env_verify_api_fallback_native(config: &Path, site: Option<&str>) -> Result<(
     // Step 6: verify routing + token-absence + native credential injection
     eprintln!("verify-api-fallback-native: [6/8] verifying routing with credential_inject...");
     eprintln!("  live consumer pod runs operator-generated config");
-    eprintln!("  local ({provider_cluster}) → {provider_model} via provider gateway");
-    eprintln!("  api fallback ({TEST_PROVIDER_API}) → {API_FALLBACK_MODEL} via mock api-provider (credential_inject)");
+    eprintln!("  local ({provider_cluster}) -> {provider_model} via provider gateway");
+    eprintln!("  api fallback ({TEST_PROVIDER_API}) -> {API_FALLBACK_MODEL} via mock api-provider (credential_inject)");
 
     let mock_port = verify::find_free_port()?;
     let mut mock_pf =
@@ -2138,10 +2201,6 @@ fn env_install_grid_crds(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 ///
 /// This is the shared core of both [`env_verify_operator_reconcile`] and
 /// [`env_validate_operator_routing`].
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential reconcile steps: CRD install, fixtures, operator spawn, poll, verify, export"
-)]
 fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     use operator::{
         API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS, CONFIGMAP_POLL_TIMEOUT,
@@ -2165,8 +2224,8 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     // Step 3: deploy metrics endpoint Pods.
     // Each Pod serves a fixed Prometheus gauge for queue depth.  They are deployed
     // before spawning the operator so they are ready when the first reconcile fires.
-    // - idle Pod → provider_queue_depth_normalized 0.1 (low queue → high score)
-    // - busy Pod → provider_queue_depth_normalized 0.9 (high queue → low score)
+    // - idle Pod -> provider_queue_depth_normalized 0.1 (low queue -> high score)
+    // - busy Pod -> provider_queue_depth_normalized 0.9 (high queue -> low score)
     operator::apply_and_wait_for_metrics_pods(context, POD_READY_TIMEOUT)?;
 
     // Step 4: port-forward all endpoints so the out-of-cluster operator can reach them.
@@ -2195,12 +2254,12 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     // api_provider is last to prove scoring is score-driven, not input-order-driven.
     //
     // clusterName controls overlay candidate identity:
-    // - op-e2e-healthy:       clusterName="site-a"           → candidate.site="site-a"
-    // - op-e2e-degraded:      clusterName="site-a"           → fresh=false
-    // - op-e2e-invalid:       blank endpoint                       → Unavailable, excluded
-    // - op-e2e-api-fallback:  no clusterName                 → cluster="op-e2e-api-fallback"
-    // - op-e2e-metrics-idle:  clusterName="site-metrics-idle" → metrics scraped (queue=0.1)
-    // - op-e2e-metrics-busy:  clusterName="site-metrics-busy" → metrics scraped (queue=0.9)
+    // - op-e2e-healthy:       clusterName="site-a"           -> candidate.site="site-a"
+    // - op-e2e-degraded:      clusterName="site-a"           -> fresh=false
+    // - op-e2e-invalid:       blank endpoint                       -> Unavailable, excluded
+    // - op-e2e-api-fallback:  no clusterName                 -> cluster="op-e2e-api-fallback"
+    // - op-e2e-metrics-idle:  clusterName="site-metrics-idle" -> metrics scraped (queue=0.1)
+    // - op-e2e-metrics-busy:  clusterName="site-metrics-busy" -> metrics scraped (queue=0.9)
     let healthy_endpoint = "http://mock-openai-provider.default.svc:8080";
     let api_endpoint = "https://api.anthropic.com";
     operator::apply_test_fixtures(context, healthy_endpoint)?;
@@ -2283,7 +2342,7 @@ fn run_operator_reconcile(context: &str) -> Result<PathBuf, Box<dyn std::error::
     result
 }
 
-/// Verify Grid operator reconciliation only (CRD install → overlay export).
+/// Verify Grid operator reconciliation only (CRD install -> overlay export).
 fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let context = resolve_operator_context(&cfg, site)?;
@@ -2306,10 +2365,6 @@ fn env_verify_operator_reconcile(config: &Path, site: Option<&str>) -> Result<()
 /// - `providers` must contain at least two entries (caller's responsibility).
 /// - Each `(site_name, models)` pair becomes one `InferenceProvider` with `clusterName = site_name` and the given model
 ///   list.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential reconcile steps: CRD install, fixtures, operator spawn, poll, verify, export"
-)]
 fn run_multi_provider_reconcile(
     context: &str,
     providers: &[(&str, &[String])],
@@ -2373,7 +2428,7 @@ fn run_multi_provider_reconcile(
 /// **Single-provider config (`site-a`):** runs the full fixture suite including
 /// health phases, degraded/API-fallback providers, and live metrics ordering.
 ///
-/// **Multi-provider config (≥2 provider sites):** runs a focused fixture suite
+/// **Multi-provider config (>=2 provider sites):** runs a focused fixture suite
 /// that proves the operator generates correct overlay candidates for every
 /// provider site and that the consumer can route to all declared models.
 fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -2415,7 +2470,7 @@ fn env_validate_operator_routing(config: &Path, site: Option<&str>) -> Result<()
 ///
 /// Starts two SWIM-enabled operator processes, waits for gossip convergence,
 /// applies a `GridNetwork` fixture, then polls until `phase = Active` and
-/// `connectedSites ≥ 1`.
+/// `connectedSites >= 1`.
 ///
 /// Both operators connect to the same kind cluster (the first provider site from
 /// `config`). They bind on available localhost UDP ports chosen at runtime.
@@ -2476,21 +2531,17 @@ fn env_verify_swim_membership(config: &Path, site: Option<&str>) -> Result<(), B
     Ok(())
 }
 
-/// Prove that `GridNetwork.spec.seeds` drives SWIM peer discovery without env-var seeds.
+/// Prove that `GridNetwork.spec.membership.swim.seeds` drives SWIM peer discovery without env-var seeds.
 ///
 /// **Why this proves the CRD path:**
 ///
 /// Both operators start with `GRID_SWIM_SEEDS=""`, so no startup seeds at all.
-/// After the `GridNetwork` fixture is applied with `spec.seeds = [bind1]`,
+/// After the `GridNetwork` fixture is applied with `membership.swim.seeds = [bind1]`,
 /// each operator resolves the resource and calls `announce_crd_seeds`; the
 /// local address is filtered and the secondary announces to the primary.
 ///
 /// SWIM gossip then converges and `GridNetwork.status.phase` becomes `Active`.
 /// The `GRID_SWIM_SEEDS` env var is empty for both operators throughout.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential CRD-seed kind steps: CRD install, two operator spawns, fixture apply with seeds, convergence wait, poll, cleanup"
-)]
 fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CRD_SEEDS_TEST_NETWORK, SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
@@ -2504,6 +2555,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     // Step 1: install Grid CRDs and remove any stale CRD-seed test resources.
     operator::install_grid_crds(&context)?;
     operator::cleanup_swim_crd_seeds_test_resources(&context)?;
+    operator::verify_swim_membership_crd_admission(&context)?;
 
     let (bind1, bind2) = reserve_swim_bind_addrs()?;
     let bind1_addr: std::net::SocketAddr = bind1
@@ -2511,19 +2563,21 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         .map_err(|e| format!("failed to parse bind1 addr {bind1:?}: {e}"))?;
 
     // Step 2: start primary operator with NO GRID_SWIM_SEEDS, no peer at startup.
-    // The primary will self-filter bind1 when it reads spec.seeds later.
+    // The primary will self-filter bind1 when it reads membership.swim.seeds later.
     let op1 = operator::spawn_operator_with_swim(&context, &bind1, &bind1, SWIM_NODE_PRIMARY_NAME, "", None)?;
     let mut op1_guard = ProcGuard(Some(op1), "operator-primary-crd");
 
     // Step 3: start secondary operator with NO GRID_SWIM_SEEDS, no peer at startup.
-    // The secondary will announce to bind1 only after reading spec.seeds from the CRD.
+    // The secondary will announce to bind1 only after reading membership.swim.seeds from the CRD.
     let op2 = operator::spawn_operator_with_swim(&context, &bind2, &bind2, SWIM_NODE_SECONDARY_NAME, "", None)?;
     let mut op2_guard = ProcGuard(Some(op2), "operator-secondary-crd");
 
-    // Step 4: Apply the GridNetwork fixture with an EMPTY spec.seeds.
+    // Step 4: Apply the GridNetwork fixture with an EMPTY membership.swim.seeds.
     // This proves that without seeds, both operators remain isolated (connectedSites = 0).
     operator::apply_swim_test_network_with_seeds(&context, &[])?;
-    eprintln!("  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty spec.seeds; verifying isolation...");
+    eprintln!(
+        "  GridNetwork {CRD_SEEDS_TEST_NETWORK} applied with empty membership.swim.seeds; verifying isolation..."
+    );
     // Allow one reconcile cycle to fire (operators are running and will reconcile the new CRD).
     operator::wait_for_swim_convergence(SWIM_CONVERGENCE_WAIT);
     // With empty seeds, the network must stay Pending or have connectedSites=0 (no SWIM join).
@@ -2539,7 +2593,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         }
         operator::cleanup_swim_crd_seeds_test_resources(&context)?;
         return Err(format!(
-            "verify-swim-crd-seeds: expected connectedSites=0 with empty spec.seeds, \
+            "verify-swim-crd-seeds: expected connectedSites=0 with empty membership.swim.seeds, \
              got connectedSites={}; SWIM must not auto-join without seeds",
             isolated_status.connected_sites
         )
@@ -2551,12 +2605,12 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
         isolated_status.phase, isolated_status.connected_sites
     );
 
-    // Step 5: Live-additive proof: patch spec.seeds to [bind1] while operators are running.
+    // Step 5: Live-additive proof: patch membership.swim.seeds to [bind1] while operators are running.
     // This is the core runtime update contract: adding a seed while the operator is live
     // causes SWIM join on the next reconcile cycle without operator restart.
     operator::apply_swim_test_network_with_seeds(&context, &[bind1_addr])?;
     eprintln!(
-        "  spec.seeds patched to [{bind1}] while operators are running; \
+        "  membership.swim.seeds patched to [{bind1}] while operators are running; \
          awaiting CRD-driven SWIM convergence..."
     );
 
@@ -2582,7 +2636,7 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
     eprintln!(
         "verify-swim-crd-seeds: PASS (connectedSites={connected_sites}; \
          CRD seed path proven: both operators started with no GRID_SWIM_SEEDS; \
-         live-additive: spec.seeds added {bind1} while running, SWIM converged without restart)"
+         live-additive: membership.swim.seeds added {bind1} while running, SWIM converged without restart)"
     );
     Ok(())
 }
@@ -2591,10 +2645,6 @@ fn env_verify_swim_crd_seeds(config: &Path, site: Option<&str>) -> Result<(), Bo
 ///
 /// Proves real `InferenceProvider`-derived CRDT state propagates over SWIM gossip.
 /// After convergence each operator's `remoteProviderCount` reflects remote provider records.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential SWIM state kind steps: CRD install, two operator spawns, fixture apply, convergence wait, poll, cleanup"
-)]
 fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT,
@@ -2662,10 +2712,6 @@ fn env_verify_swim_state(config: &Path, site: Option<&str>) -> Result<(), Box<dy
 /// `localhost` is intentional: the two out-of-cluster operators bind to
 /// distinct loopback ports, so this exercises the production hostname resolver
 /// without depending on public DNS or cluster DNS from the host.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one bounded qualification keeps startup, convergence, propagation, evidence, and cleanup together"
-)]
 fn env_verify_swim_dns_hostnames(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME, SWIM_STATUS_POLL_TIMEOUT, SWIM_TEST_NETWORK,
@@ -3045,7 +3091,7 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
         &context,
         SWIM_ENCRYPT_NODE_A,
         std::slice::from_ref(&bind_e_b),
-        true, // swimKeySecretRef → points at non-existent Secret
+        true, // swimKeySecretRef -> points at non-existent Secret
     )?;
 
     let missing_secret_error_result = operator::wait_for_operator_log_contains(
@@ -3089,10 +3135,6 @@ fn env_verify_swim_encryption(config: &Path, site: Option<&str>) -> Result<(), B
 /// distributed state propagation, then reads the overlay `ConfigMap` and asserts
 /// that at least one candidate has a `site` value originating from the remote
 /// operator (not the primary site).
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential SWIM overlay steps: CRD install, two operator spawns, fixture apply, convergence wait, poll, overlay verify, cleanup"
-)]
 fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_NODE_PRIMARY_NAME, SWIM_NODE_SECONDARY_NAME,
@@ -3174,7 +3216,7 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
     // Step 10: ROUTING ELIGIBILITY PROOF (after Active/TlsVerified): poll until the
     // secondary's CRDT provider candidate appears in the overlay. The controller must:
     //   (a) probe the mTLS server (succeeds; TLS fixture guard holds the process)
-    //   (b) verify CA chain + DNS SAN + canonical pin → promote Connecting → Active (TlsVerified)
+    //   (b) verify CA chain + DNS SAN + canonical pin -> promote Connecting -> Active (TlsVerified)
     //   (c) re-render the overlay to include secondary CRDT providers
     let verify_result = tls_fixture_result.and_then(|_guard| {
         operator::wait_for_site_candidate_in_overlay(
@@ -3219,10 +3261,6 @@ fn env_verify_swim_overlay(config: &Path, site: Option<&str>) -> Result<(), Box<
 /// After SWIM gossip, the east operator's overlay includes model-west as a
 /// remote CRDT candidate.  A consumer gateway is deployed from that overlay
 /// and routes requests for both models.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential steps: CRDs, fixtures, operators, wait, overlay, consumer deploy, E2E verify, cleanup"
-)]
 fn env_verify_swim_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         CONFIGMAP_POLL_TIMEOUT, SWIM_CONVERGENCE_WAIT, SWIM_ROUTING_GW, SWIM_ROUTING_NETWORK, SWIM_STATUS_POLL_TIMEOUT,
@@ -3401,7 +3439,7 @@ fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn s
 /// eligibility gating across a three-node mesh.
 ///
 /// Topology:
-///   A  ←seed-  B  ←seed-  C
+///   A  <-seed-  B  <-seed-  C
 ///
 /// A seeds nobody; B seeds A; C seeds B only.  A learns about C transitively.
 ///
@@ -3411,11 +3449,6 @@ fn reserve_three_swim_bind_addrs() -> Result<(String, String, String), Box<dyn s
 /// 3. After `Active`, C's candidate appears in A's overlay.
 /// 4. A wrong-network `GridNetwork` and `InferenceProvider` are applied and their model is confirmed absent from A's
 ///    correct-network overlay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential 11-step mesh proof: CRDs, three operators, CRDT convergence, \
-              eligibility before/after Active, wrong-network isolation, cleanup"
-)]
 #[expect(
     clippy::similar_names,
     reason = "op_a/op_b/op_c-style peer-pair naming is the clear, established idiom for the \
@@ -3440,7 +3473,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     let (bind_a, bind_b, bind_c) = reserve_three_swim_bind_addrs()?;
     eprintln!(
         "  A={bind_a}  B={bind_b}  C={bind_c} \
-         (topology: A←B←C, C does NOT seed A directly)"
+         (topology: A<-B<-C, C does NOT seed A directly)"
     );
 
     // Step 3: Spawn all three operators
@@ -3520,7 +3553,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
     let tls_fixture_result = isolation_result.and_then(|()| {
         eprintln!(
             "verify-swim-mesh-three-node: [10] configuring TLS identity trust for GridSite \
-             {c_site_k8s_name:?} (C) → waiting for Active/TlsVerified..."
+             {c_site_k8s_name:?} (C) -> waiting for Active/TlsVerified..."
         );
         operator::setup_tls_verified_gridsite(&context, &c_site_k8s_name, SWIM_MESH_NETWORK)
     });
@@ -3553,7 +3586,7 @@ fn env_verify_swim_mesh_three_node(config: &Path, site: Option<&str>) -> Result<
 
     eprintln!(
         "verify-swim-mesh-three-node: PASS: \
-         A→B→C transitive discovery proven; \
+         A->B->C transitive discovery proven; \
          C's CRDT state reached A through B (remoteProviderCount >= 2); \
          C absent before Active; C present after Active; \
          wrong-network model absent from A's overlay"
@@ -3771,10 +3804,6 @@ fn verify_llmd_compat_pod_restarts(
 /// 4. Deploy consumer gateway from overlay.
 /// 5. Verify consumer routing with model name checks.
 /// 6. Assert no unexpected pod restarts.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential demo proof steps: each step depends on the previous; splitting obscures the proof flow"
-)]
 fn env_verify_llmd_compat_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let providers = provider_clusters_from_config(&cfg);
@@ -3969,14 +3998,10 @@ fn verify_responses_pod_restarts(
 /// with Grid overlay routing:
 /// 1. Deploy provider gateways.
 /// 2. Operator reconcile + Grid overlay export.
-/// 3. Deploy consumer gateway with `openai_responses_format` → `intelligent_route` filter chain.
+/// 3. Deploy consumer gateway with `openai_responses_format` -> `intelligent_route` filter chain.
 /// 4. Verify `/v1/responses` routing: each model returns 200, unknown fails.
 /// 5. Verify response model fields match the requested model.
 /// 6. Assert no unexpected pod restarts.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential proof steps: each step depends on the previous; splitting obscures the proof flow"
-)]
 fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = EnvConfig::from_file(config)?;
     let providers = provider_clusters_from_config(&cfg);
@@ -4019,11 +4044,11 @@ fn env_verify_responses_routing(config: &Path) -> Result<(), Box<dyn std::error:
         },
     };
 
-    // Step 3: Deploy consumer gateway with openai_responses_format → intelligent_route filter chain.
+    // Step 3: Deploy consumer gateway with openai_responses_format -> intelligent_route filter chain.
     eprintln!("responses-routing: [3/6] deploying responses consumer gateway...");
     let consumer_ok = responses_record_step("consumer deploy", &mut results, || {
         consumer::deploy_consumer_for_responses(&cfg, Some(&overlay_path))?;
-        Ok("deployed with openai_responses_format → intelligent_route filter chain".to_owned())
+        Ok("deployed with openai_responses_format -> intelligent_route filter chain".to_owned())
     });
     if !consumer_ok {
         print_validate_all_table(&results);
@@ -4212,10 +4237,10 @@ fn env_verify_full_grid_routing(config: &Path) -> Result<(), Box<dyn std::error:
 
     // Step 5: verify routing for all four models
     eprintln!("verify-full-grid-routing: [5/6] verifying full-grid routing...");
-    eprintln!("  {FULL_GRID_MODEL_EAST} → site-east (local/self-hosted)");
-    eprintln!("  {FULL_GRID_MODEL_WEST} → site-west (remote/self-hosted)");
-    eprintln!("  {FULL_GRID_MODEL_CLOUD} → cloud mock ({FULL_GRID_PROVIDER_CLOUD})");
-    eprintln!("  {FULL_GRID_MODEL_API} → api mock ({FULL_GRID_PROVIDER_API}, injected credential)");
+    eprintln!("  {FULL_GRID_MODEL_EAST} -> site-east (local/self-hosted)");
+    eprintln!("  {FULL_GRID_MODEL_WEST} -> site-west (remote/self-hosted)");
+    eprintln!("  {FULL_GRID_MODEL_CLOUD} -> cloud mock ({FULL_GRID_PROVIDER_CLOUD})");
+    eprintln!("  {FULL_GRID_MODEL_API} -> api mock ({FULL_GRID_PROVIDER_API}, injected credential)");
     consumer::verify_full_grid_e2e(
         &cfg,
         FULL_GRID_MODEL_EAST,
@@ -4551,7 +4576,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// observed through at least one reconcile.  This proves the lifecycle type system is
 /// functional end-to-end.
 /// SWIM membership formation (two operators, east primary + west joining) provides the real
-/// distributed-system event that triggers the `Pending → Discovered` transition in production.
+/// distributed-system event that triggers the `Pending -> Discovered` transition in production.
 ///
 /// **Cross-network isolation:** a wrong-network `GridSite` and `InferenceProvider` are applied
 /// and their absence from the correct-network overlay is asserted by reading the overlay `ConfigMap`.
@@ -4562,7 +4587,7 @@ fn env_verify_metrics_routing(config: &Path) -> Result<(), Box<dyn std::error::E
 /// `spec.gatewayEndpoint.address` populated from the SWIM membership record.
 ///
 /// **Lifecycle proof (step 5):** a separate harness-created `GridSite` is advanced through
-/// `Pending → Discovered → Connecting → Active`.  Only `Discovered` is harness-patched;
+/// `Pending -> Discovered -> Connecting -> Active`.  Only `Discovered` is harness-patched;
 /// the controller drives `Connecting` (egress present) and `Active`
 /// (TCP probe succeeds + `spec.trust.certFingerprint` matches `status.publicCertPem`).
 #[expect(
@@ -4582,7 +4607,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     let providers = provider_clusters_from_config(&cfg);
     if providers.len() < 2 {
         return Err(format!(
-            "verify-site-join-discovery requires ≥ 2 provider clusters; got {}",
+            "verify-site-join-discovery requires >= 2 provider clusters; got {}",
             providers.len()
         )
         .into());
@@ -4665,7 +4690,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
         SITE_JOIN_NETWORK,
         SITE_JOIN_PHASE_POLL_TIMEOUT,
     )?;
-    // Wait for the GridSite controller to advance Discovered → Connecting.
+    // Wait for the GridSite controller to advance Discovered -> Connecting.
     // The GridNetwork controller sets Discovered; the GridSite controller then
     // advances to Connecting because the advertised gateway address is present.
     operator::wait_for_gridsite_phase(&east_ctx, &auto_site_name, "Connecting", SITE_JOIN_PHASE_POLL_TIMEOUT)?;
@@ -4724,14 +4749,14 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     eprintln!("  [OK] joining site: Pending (absent/unjoined state confirmed before SWIM event)");
 
     // Advance joining site to Discovered: simulates SWIM membership event.
-    // The Pending→Discovered transition requires SWIM membership, which the GridSite
+    // The Pending->Discovered transition requires SWIM membership, which the GridSite
     // controller does not have access to. The harness patches this to simulate the
     // SWIM Alive event (same as the GridNetwork controller does for auto-discovered sites).
     operator::patch_gridsite_phase(&east_ctx, SITE_JOIN_JOINING_SITE, "Discovered")?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
-    // The GridSite controller now drives Discovered → Connecting automatically when
+    // The GridSite controller now drives Discovered -> Connecting automatically when
     // spec.gatewayEndpoint.address is non-empty and reachable by TCP.
-    // Wait for Connecting — do NOT wait for Discovered, which would be immediately
+    // Wait for Connecting -- do NOT wait for Discovered, which would be immediately
     // superseded by the operator's automated transition.
     operator::wait_for_gridsite_phase(
         &east_ctx,
@@ -4741,12 +4766,12 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
     )?;
     eprintln!(
         "  [OK] joining site: Connecting \
-         (Discovered→Connecting driven by GridSite controller; egress address present)"
+         (Discovered->Connecting driven by GridSite controller; egress address present)"
     );
 
     // Advance to Active via identity-aware TLS probe. Spawn a local mTLS probe server and
     // configure the full identity trust chain (CA, client cert, canonical DER pin, serverName)
-    // so the controller promotes Connecting → Active (TlsVerified). This proves Active is only
+    // so the controller promotes Connecting -> Active (TlsVerified). This proves Active is only
     // reached when identity verification succeeds; TCP reachability alone is not sufficient.
     let _tls_guard = operator::setup_tls_verified_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE, SITE_JOIN_NETWORK)?;
     operator::bump_gridsite(&east_ctx, SITE_JOIN_JOINING_SITE)?;
@@ -4831,8 +4856,8 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 /// **Before partition:** east (local, `backendKind=local`) and west (remote CRDT) both serve
 /// `model-failover-shared`.  East sorts first in the overlay by locality score.
 ///
-/// **After killing the west operator:** SWIM marks west Dead →
-/// `apply_swim_staleness_override` downgrades the west CRDT provider to `Degraded` →
+/// **After killing the west operator:** SWIM marks west Dead ->
+/// `apply_swim_staleness_override` downgrades the west CRDT provider to `Degraded` ->
 /// overlay emits west with `fresh=false`.  East (local, `fresh=true`) remains the first
 /// candidate for the shared model.  A consumer request for the shared model returns HTTP 200,
 /// attributed to east via overlay-position evidence (both mocks echo the same model name in
@@ -4844,7 +4869,7 @@ fn env_verify_site_join_discovery(config: &Path) -> Result<(), Box<dyn std::erro
 /// so both SWIM runtimes lose their in-memory membership state.  East and west are
 /// then restarted with the same bind addresses, with west seeding east.  SWIM detects
 /// west as `Alive`, the staleness override is lifted, and the east overlay reflects
-/// west with `fresh=true` again.  This proves the lost-peer → clean-restart recovery
+/// west with `fresh=true` again.  This proves the lost-peer -> clean-restart recovery
 /// cycle without requiring fixture reapplication.
 ///
 /// **Honest boundaries:**
@@ -5053,7 +5078,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
         FAILOVER_GW,
         east_site,
         west_site,
-        true, // expect_west_stale = true: west is Dead → Degraded → fresh=false
+        true, // expect_west_stale = true: west is Dead -> Degraded -> fresh=false
     )?;
     eprintln!(
         "  [PASS] stale overlay: {FAILOVER_EAST_PROVIDER} fresh=true, \
@@ -5257,7 +5282,7 @@ fn env_verify_failover_under_lost_peer(config: &Path) -> Result<(), Box<dyn std:
 /// The `wait_for_remote_candidate_absent` helper bumps the `GridNetwork` every 5 s so
 /// a reconcile fires after each age-tick window.  Each reconcile calls
 /// `apply_stale_gc_filter` with the age read from the SWIM membership snapshot.  Once
-/// age ≥ TTL the stale candidate is omitted from the overlay.
+/// age >= TTL the stale candidate is omitted from the overlay.
 ///
 /// **Honest boundaries:**
 /// - Only overlay-level filtering is proven.  CRDT storage records are not deleted.
@@ -5431,10 +5456,6 @@ fn env_verify_stale_gc_ttl(config: &Path) -> Result<(), Box<dyn std::error::Erro
 /// the current metrics values are applied.  The consumer config is generated solely
 /// from the metrics-routing overlay (which only advertises the shared model), so
 /// dedicated-model alive checks are not performed here.
-#[expect(
-    clippy::too_many_lines,
-    reason = "overlay check + port-forward + shared model + unknown model assertions"
-)]
 fn verify_metrics_routing_phase(
     consumer_site: &str,
     overlay: &operator_overlay::RoutingOverlay,
@@ -5604,10 +5625,6 @@ pub(crate) fn print_validate_all_table(results: &[StepResult]) {
 ///
 /// Continues past individual step failures so the full picture is visible.
 /// Exit code is non-zero when any step has `FAIL` status.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential step list: each step is one match arm; no abstraction saves lines without hiding intent"
-)]
 fn env_validate_all(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let mut results: Vec<StepResult> = Vec::new();
 
@@ -5811,6 +5828,8 @@ fn rbac_can_i_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
         ("patch", "secrets", Some("default")),
         ("create", "configmaps", Some("default")),
         ("patch", "configmaps", Some("default")),
+        ("update", "configmaps", Some("default")),
+        ("delete", "configmaps/grid-operator-local-records", Some("grid-system")),
     ];
     for (verb, resource, ns) in checks {
         let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
@@ -5839,6 +5858,8 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
         ("delete", "gridnetworks.grid.praxis.fast", None),
         ("get", "secrets", Some("kube-system")),
         ("patch", "configmaps", Some("kube-system")),
+        ("delete", "configmaps", Some("default")),
+        ("delete", "configmaps/grid-operator-config", Some("grid-system")),
     ];
     for (verb, resource, ns) in checks {
         let allowed = operator::kubectl_auth_can_i(context, verb, resource, *ns)?;
@@ -5857,6 +5878,114 @@ fn rbac_negative_checks(context: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Runtime VAP check for the `protect-config` policy.
+///
+/// Tries to patch `grid-operator-config` as the operator `ServiceAccount` and verifies
+/// the admission policy denies it. Creates the fixture only when the `ConfigMap` is absent,
+/// and deletes it only when this check created it, so an existing operator `ConfigMap` is preserved.
+fn rbac_vap_configmap_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let created_fixture = !kubectl::resource_exists(context, "grid-system", "configmap", "grid-operator-config")?;
+    if created_fixture {
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "grid-operator-config", "namespace": "grid-system" },
+            "data": {}
+        });
+        kubectl::apply_manifest(context, &serde_json::to_string_pretty(&cm)?)?;
+    }
+
+    let patch_result = kubectl::patch_as_operator_sa(context, "grid-system", "configmap", "grid-operator-config");
+    if created_fixture {
+        kubectl::delete_ignoring_not_found(context, "grid-system", "configmap", "grid-operator-config")?;
+    }
+    match patch_result? {
+        kubectl::SaOutcome::DeniedByPolicy => {},
+        kubectl::SaOutcome::Allowed => {
+            return Err("VAP check failed: operator should NOT be able to patch grid-operator-config".into());
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure patching grid-operator-config: {msg}").into());
+        },
+    }
+    eprintln!("  [PASS] operator cannot patch grid-operator-config (VAP denied)");
+    Ok(())
+}
+
+/// Runtime VAP checks for the `endpointslice-cleanup` policy.
+///
+/// Creates `EndpointSlice` resources and tries to delete them as the operator
+/// `ServiceAccount`, verifying that the policy allows only controller-managed
+/// slices on the operator's own Services and denies everything else.
+fn rbac_vap_endpointslice_checks(context: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let decoy_slice = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "e2e-vap-decoy",
+            "namespace": "grid-system",
+            "labels": {
+                "kubernetes.io/service-name": "some-other-service",
+                "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": []
+    });
+    kubectl::apply_manifest(context, &serde_json::to_string_pretty(&decoy_slice)?)?;
+
+    let decoy_outcome = kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-decoy");
+    kubectl::delete_ignoring_not_found(context, "grid-system", "endpointslice", "e2e-vap-decoy")?;
+    match decoy_outcome? {
+        kubectl::SaOutcome::DeniedByPolicy => {},
+        kubectl::SaOutcome::Allowed => {
+            return Err(
+                "VAP check failed: operator should NOT be able to delete an EndpointSlice \
+                 belonging to an unrelated Service"
+                    .into(),
+            );
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure deleting e2e-vap-decoy: {msg}").into());
+        },
+    }
+    eprintln!("  [PASS] operator cannot delete an EndpointSlice of an unrelated Service (VAP denied)");
+
+    let swim_slice = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "e2e-vap-swim-ctrl",
+            "namespace": "grid-system",
+            "labels": {
+                "kubernetes.io/service-name": "grid-operator-swim",
+                "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": []
+    });
+    kubectl::apply_manifest(context, &serde_json::to_string_pretty(&swim_slice)?)?;
+
+    let swim_outcome = kubectl::delete_as_operator_sa(context, "grid-system", "endpointslice", "e2e-vap-swim-ctrl");
+    kubectl::delete_ignoring_not_found(context, "grid-system", "endpointslice", "e2e-vap-swim-ctrl")?;
+    match swim_outcome? {
+        kubectl::SaOutcome::Allowed => {},
+        kubectl::SaOutcome::DeniedByPolicy => {
+            return Err(
+                "VAP check failed: operator should be able to delete a controller-managed \
+                 EndpointSlice on its own SWIM Service"
+                    .into(),
+            );
+        },
+        kubectl::SaOutcome::OtherFailure(msg) => {
+            return Err(format!("unexpected failure deleting e2e-vap-swim-ctrl: {msg}").into());
+        },
+    }
+    eprintln!("  [PASS] operator can delete a controller-managed EndpointSlice on its own SWIM Service (VAP allowed)");
+    Ok(())
+}
+
 /// Validate operator install manifests, RBAC, and in-cluster reconcile.
 #[expect(
     clippy::too_many_lines,
@@ -5870,12 +5999,12 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     eprintln!("verify-operator-install-rbac: context={context}");
 
     // Step 1: preflight (CRDs + cleanup).
-    eprintln!("verify-operator-install-rbac: [1/11] preflight, CRDs, cleanup...");
+    eprintln!("verify-operator-install-rbac: [1/13] preflight, CRDs, cleanup...");
     operator::install_grid_crds(&context)?;
     operator::cleanup_install_rbac_test_resources(&context)?;
 
     // Step 2: prepare the selected local or registry-backed operator image.
-    eprintln!("verify-operator-install-rbac: [2/11] preparing operator image...");
+    eprintln!("verify-operator-install-rbac: [2/13] preparing operator image...");
     if image_overrides::should_skip_kind_image_loading() {
         eprintln!(
             "  [OK] using registry-backed operator image {} with pull policy {}",
@@ -5889,26 +6018,30 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     }
 
     // Step 3: apply install manifests.
-    eprintln!("verify-operator-install-rbac: [3/11] applying install manifests...");
+    eprintln!("verify-operator-install-rbac: [3/13] applying install manifests...");
     operator::apply_install_manifests(&context)?;
     operator::override_operator_image_for_kind(&context)?;
     eprintln!("  [OK] install manifests applied");
 
-    // Steps 4-5: RBAC can-i checks (positive + negative).
-    eprintln!("verify-operator-install-rbac: [4/11] positive RBAC checks...");
+    // Steps 4-7: RBAC can-i checks (positive, negative) and VAP runtime checks.
+    eprintln!("verify-operator-install-rbac: [4/13] positive RBAC checks...");
     rbac_can_i_checks(&context)?;
-    eprintln!("verify-operator-install-rbac: [5/11] negative RBAC checks...");
+    eprintln!("verify-operator-install-rbac: [5/13] negative RBAC checks...");
     rbac_negative_checks(&context)?;
+    eprintln!("verify-operator-install-rbac: [6/13] VAP EndpointSlice delete checks...");
+    rbac_vap_endpointslice_checks(&context)?;
+    eprintln!("verify-operator-install-rbac: [7/13] VAP ConfigMap protect checks...");
+    rbac_vap_configmap_checks(&context)?;
 
-    // Step 6: patch Deployment env vars + wait for rollout.
-    eprintln!("verify-operator-install-rbac: [6/11] starting in-cluster operator...");
+    // Step 8: patch Deployment env vars + wait for rollout.
+    eprintln!("verify-operator-install-rbac: [8/13] starting in-cluster operator...");
     let test_site_name = "rbac-test-site";
     operator::patch_operator_deployment_env(&context, test_site_name)?;
     kubectl::wait_for_rollout_ns(&context, "grid-operator", "grid-system", &cluster_name)?;
     eprintln!("  [OK] grid-operator Deployment available");
 
-    // Step 7: apply fixtures with TLS Secret refs.
-    eprintln!("verify-operator-install-rbac: [7/11] applying test fixtures...");
+    // Step 9: apply fixtures with TLS Secret refs.
+    eprintln!("verify-operator-install-rbac: [9/13] applying test fixtures...");
     let network_name = "op-e2e-rbac-net";
     let gw_name = "op-e2e-rbac-gw";
     let provider_name = "op-e2e-rbac-prov";
@@ -5965,8 +6098,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     kubectl::apply_manifest(&context, &provider_manifest)?;
     eprintln!("  [OK] InferenceProvider {provider_name} applied");
 
-    // Step 8: wait for in-cluster operator to reconcile.
-    eprintln!("verify-operator-install-rbac: [8/11] waiting for in-cluster reconcile...");
+    // Step 10: wait for in-cluster operator to reconcile.
+    eprintln!("verify-operator-install-rbac: [10/13] waiting for in-cluster reconcile...");
     let snap = operator::wait_for_gridnetwork_status(&context, network_name, operator::SWIM_STATUS_POLL_TIMEOUT)?;
     eprintln!(
         "  [PASS] GridNetwork {network_name} reconciled by in-cluster operator \
@@ -5974,8 +6107,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
         snap.phase, snap.connected_sites
     );
 
-    // Step 9: verify actual Secret writes (TLS CA + site cert).
-    eprintln!("verify-operator-install-rbac: [9/11] verifying Secret writes...");
+    // Step 11: verify actual Secret writes (TLS CA + site cert).
+    eprintln!("verify-operator-install-rbac: [11/13] verifying Secret writes...");
     if !kind::kubectl_secret_exists(&context, "default", ca_secret_name)? {
         return Err(format!("Secret {ca_secret_name} not found in default; operator failed to write CA Secret").into());
     }
@@ -5989,8 +6122,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
     }
     eprintln!("  [PASS] Secret {site_secret_name} exists (site cert written by in-cluster operator)");
 
-    // Step 10: verify overlay ConfigMap write.
-    eprintln!("verify-operator-install-rbac: [10/11] verifying overlay ConfigMap write...");
+    // Step 12: verify overlay ConfigMap write.
+    eprintln!("verify-operator-install-rbac: [12/13] verifying overlay ConfigMap write...");
     match kubectl::get_configmap_yaml(&context, "default", &overlay_cm_name) {
         Ok(_) => {
             eprintln!("  [PASS] ConfigMap {overlay_cm_name} exists (overlay written by in-cluster operator)");
@@ -6003,8 +6136,8 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
         },
     }
 
-    // Step 11: cleanup.
-    eprintln!("verify-operator-install-rbac: [11/11] cleanup...");
+    // Step 13: cleanup.
+    eprintln!("verify-operator-install-rbac: [13/13] cleanup...");
     operator::cleanup_install_rbac_test_resources(&context)?;
     operator::cleanup_install_manifests(&context)?;
 
@@ -6013,6 +6146,321 @@ fn env_verify_operator_install_rbac(config: &Path, site: Option<&str>) -> Result
          positive RBAC checks pass; negative RBAC checks (including namespace-scoped) pass; \
          in-cluster operator reconcile succeeds; Secret patch and ConfigMap patch verified"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verify-local-site-status
+// ---------------------------------------------------------------------------
+
+/// Verify `GridSite` and `GridNetwork` peer-condition status under Local membership.
+///
+/// Asserts six checkpoints against an out-of-cluster operator under Local membership:
+///
+/// 1. **Clean slate** - no `GridSite` exists before the network is delivered.
+/// 2. **Operator started** - operator spawned with `GRID_MEMBERSHIP_SOURCE=Local`.
+/// 3. **Site phase reasons** - own site advances `GatewayAddressMissing` then `SignalsAddressMissing`.
+/// 4. **Rollup** - all 5 peer conditions are `Unknown/NoDeclaredPeers`; `Available=True`; `Degraded=False/AsExpected`.
+/// 5. **Undialable peer declared** - all 5 peer conditions leave `NoDeclaredPeers`.
+/// 6. **Reachable peer** - a second Local operator serves mTLS signals and a catalog; per-peer response evidence and
+///    all 5 healthy network conditions are required.
+///
+/// Requires two configured kind clusters, with no other operators or networks running.
+fn env_verify_local_site_status(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        AS_EXPECTED, LOCAL_STATUS_CA_SECRET, LOCAL_STATUS_DNS_SAN, LOCAL_STATUS_NETWORK, LOCAL_STATUS_OWN_SITE,
+        LOCAL_STATUS_PEER_SITE, LOCAL_STATUS_POLL_TIMEOUT, LOCAL_STATUS_TLS_SECRET, NO_DECLARED_PEERS,
+        PEER_CATALOGS_ACCEPTED, PEER_MEMBERSHIP, PEER_POLLS_COMPLETE, PEER_SIGNALS_REACHABLE, PEER_TIME_VALID,
+        PEER_TIMESTAMPS_VALID, SIGNALS_ADDRESS_MISSING,
+    };
+
+    let cfg = EnvConfig::from_file(config)?;
+    let context = resolve_operator_context(&cfg, site)?;
+    let peer_context = resolve_local_status_peer_context(&cfg, &context)?;
+    eprintln!("verify-local-site-status: context={context}");
+
+    eprintln!("verify-local-site-status: [1/6] preflight: CRDs, clean slate, no stale GridSite...");
+    operator::install_grid_crds(&context)?;
+    operator::cleanup_local_status_resources(&context);
+    let _resources = LocalStatusResourcesGuard(&context);
+    operator::assert_gridsite_absent(&context, LOCAL_STATUS_OWN_SITE)?;
+    eprintln!("  [OK] no GridSite {LOCAL_STATUS_OWN_SITE:?} before network delivery");
+
+    eprintln!("verify-local-site-status: TLS + network...");
+    let ca = ::certs::generate_ca("local-status-test-ca").map_err(|e| format!("CA gen failed: {e}"))?;
+    let cert = ::certs::generate_dns_cert(&ca, LOCAL_STATUS_OWN_SITE, LOCAL_STATUS_DNS_SAN)
+        .map_err(|e| format!("site cert gen failed: {e}"))?;
+    let temp_dir = tempfile::tempdir()?;
+    let temp = temp_dir.path();
+    operator::create_tls_secret_from_pem(
+        &context,
+        "default",
+        LOCAL_STATUS_CA_SECRET,
+        &ca.cert_pem,
+        &cert.cert_pem,
+        &cert.key_pem,
+        temp,
+    )?;
+    operator::create_tls_secret_from_pem(
+        &context,
+        "default",
+        LOCAL_STATUS_TLS_SECRET,
+        &ca.cert_pem,
+        &cert.cert_pem,
+        &cert.key_pem,
+        temp,
+    )?;
+    let network_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": LOCAL_STATUS_NETWORK },
+        "spec": { "seeds": [], "gridId": "local-status-test", "membership": { "mode": "Local" }, "signalTransport": { "mode": "poll" } }
+    }))?;
+    kubectl::apply_manifest(&context, &network_json)?;
+    operator::patch_gridnetwork_tls_refs(
+        &context,
+        LOCAL_STATUS_NETWORK,
+        LOCAL_STATUS_CA_SECRET,
+        LOCAL_STATUS_TLS_SECRET,
+        "default",
+    )?;
+
+    eprintln!("verify-local-site-status: [2/6] spawning operator (Local, no auto-records)...");
+    let signals_addr = operator::reserve_metrics_addr()?;
+    let op = operator::spawn_local_operator(&context, LOCAL_STATUS_OWN_SITE, &signals_addr, temp)?;
+    let op_guard = ProcGuard(Some(op), "operator");
+    let peer_conditions = [
+        (PEER_SIGNALS_REACHABLE, PEER_SIGNALS_REACHABLE),
+        (PEER_CATALOGS_ACCEPTED, PEER_CATALOGS_ACCEPTED),
+        (PEER_POLLS_COMPLETE, PEER_POLLS_COMPLETE),
+        (PEER_TIME_VALID, PEER_TIMESTAMPS_VALID),
+        (PEER_MEMBERSHIP, PEER_MEMBERSHIP),
+    ];
+
+    let result = run_local_site_status_checks(
+        &context,
+        LOCAL_STATUS_OWN_SITE,
+        LOCAL_STATUS_NETWORK,
+        LOCAL_STATUS_PEER_SITE,
+        &peer_conditions,
+        NO_DECLARED_PEERS,
+        SIGNALS_ADDRESS_MISSING,
+        AS_EXPECTED,
+        LOCAL_STATUS_POLL_TIMEOUT,
+    )
+    .and_then(|()| run_local_status_reachable_peer((&context, &peer_context), &ca, &cert, temp, &peer_conditions));
+
+    drop(op_guard);
+
+    result.inspect_err(|e| eprintln!("verify-local-site-status: FAIL: {e}"))?;
+    eprintln!("verify-local-site-status: PASS");
+    Ok(())
+}
+
+/// Run the site-status assertions once the operator is running and the network exists.
+///
+/// 1. Applies own site with no endpoint, requiring `Pending/GatewayAddressMissing`.
+/// 2. Updates own site to a loopback address, requiring `Pending/SignalsAddressMissing`.
+/// 3. Confirms all `peer_conditions` are `Unknown/NoDeclaredPeers`.
+/// 4. Confirms `Available=True` and `Degraded=False/AsExpected` on the network.
+/// 5. Declares an undialable peer and confirms every condition leaves `no_peers_reason`. This transition alone makes no
+///    claim about a successful peer poll.
+///
+/// The caller is responsible for asserting that no `GridSite` exists before this runs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct field of the K8s condition object"
+)]
+fn run_local_site_status_checks(
+    context: &str,
+    own_site: &str,
+    network: &str,
+    peer_site: &str,
+    peer_conditions: &[(&str, &str)],
+    no_peers_reason: &str,
+    signals_address_missing: &str,
+    degraded_ok_reason: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!(
+        "verify-local-site-status: [3/6] own-site phase reasons: GatewayAddressMissing then SignalsAddressMissing..."
+    );
+    let own_site_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": own_site },
+        "spec": { "gridNetworkRef": network }
+    }))?;
+    kubectl::apply_manifest(context, &own_site_json)?;
+
+    operator::wait_for_gridsite_phase_and_reason_in_network(
+        context,
+        own_site,
+        network,
+        "Pending",
+        "GatewayAddressMissing",
+        timeout,
+    )?;
+    eprintln!("  [OK] GridSite {own_site:?}: Pending/GatewayAddressMissing");
+
+    let own_site_loopback_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": own_site },
+        "spec": { "gridNetworkRef": network, "gatewayEndpoint": { "address": "127.0.0.1:443" } }
+    }))?;
+    kubectl::apply_manifest(context, &own_site_loopback_json)?;
+
+    operator::wait_for_gridsite_phase_and_reason_in_network(
+        context,
+        own_site,
+        network,
+        "Pending",
+        signals_address_missing,
+        timeout,
+    )?;
+    eprintln!("  [OK] GridSite {own_site:?}: Pending/{signals_address_missing}");
+
+    eprintln!("verify-local-site-status: [4/6] peer conditions + network rollup...");
+    for &(type_, _) in peer_conditions {
+        operator::wait_for_network_condition(context, network, type_, "Unknown", no_peers_reason, timeout)?;
+    }
+    eprintln!("  [OK] all 5 peer conditions: Unknown/{no_peers_reason}");
+
+    operator::wait_for_network_condition(context, network, "Available", "True", "Available", timeout)?;
+    eprintln!("  [OK] GridNetwork {network:?}: Available=True");
+
+    operator::wait_for_network_condition(context, network, "Degraded", "False", degraded_ok_reason, timeout)?;
+    eprintln!("  [OK] GridNetwork {network:?}: Degraded=False/{degraded_ok_reason}");
+
+    let peer_site_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": peer_site },
+        "spec": {
+            "gridNetworkRef": network,
+            "gatewayEndpoint": { "address": "127.0.0.1:1" }
+        }
+    }))?;
+    kubectl::apply_manifest(context, &peer_site_json)?;
+
+    eprintln!("verify-local-site-status: [5/6] undialable peer declared: conditions leave NoDeclaredPeers...");
+    for &(type_, _) in peer_conditions {
+        operator::wait_for_network_condition_to_leave_no_peers(context, network, type_, timeout)?;
+    }
+    eprintln!("  [OK] all 5 peer conditions left NoDeclaredPeers; no successful poll asserted");
+    Ok(())
+}
+
+/// Select a different configured cluster so the peer cannot overwrite the tested status.
+fn resolve_local_status_peer_context(cfg: &EnvConfig, context: &str) -> Result<String, Box<dyn std::error::Error>> {
+    cfg.clusters
+        .names
+        .iter()
+        .map(|name| kind::kubectl_context(name))
+        .find(|candidate| candidate != context)
+        .ok_or_else(|| "verify-local-site-status requires two configured kind clusters".into())
+}
+
+/// Remove fixture resources even when setup or an assertion fails.
+struct LocalStatusResourcesGuard<'context>(&'context str);
+
+impl Drop for LocalStatusResourcesGuard<'_> {
+    fn drop(&mut self) {
+        operator::cleanup_local_status_resources(self.0);
+    }
+}
+
+/// Serve a real peer from an isolated cluster and require non-empty polling evidence.
+fn run_local_status_reachable_peer(
+    (context, peer_context): (&str, &str),
+    ca: &::certs::CaCert,
+    own_cert: &::certs::SiteCertOutput,
+    temp: &Path,
+    peer_conditions: &[(&str, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use operator::{
+        LOCAL_STATUS_CA_SECRET, LOCAL_STATUS_NETWORK, LOCAL_STATUS_OWN_SITE, LOCAL_STATUS_PEER_SITE,
+        LOCAL_STATUS_POLL_TIMEOUT, LOCAL_STATUS_TLS_SECRET,
+    };
+
+    eprintln!("verify-local-site-status: [6/6] real peer: mTLS signals, catalog, and healthy conditions...");
+    operator::install_grid_crds(peer_context)?;
+    operator::cleanup_local_status_resources(peer_context);
+    let _resources = LocalStatusResourcesGuard(peer_context);
+    let peer_addr = operator::reserve_local_signals_addr()?;
+    let peer_san = format!("{LOCAL_STATUS_PEER_SITE}-signals.grid.internal");
+    let peer_cert = ::certs::generate_dns_cert(ca, LOCAL_STATUS_PEER_SITE, &peer_san)
+        .map_err(|e| format!("peer cert gen failed: {e}"))?;
+    for secret in [LOCAL_STATUS_CA_SECRET, LOCAL_STATUS_TLS_SECRET] {
+        operator::create_tls_secret_from_pem(
+            peer_context,
+            "default",
+            secret,
+            &ca.cert_pem,
+            &peer_cert.cert_pem,
+            &peer_cert.key_pem,
+            temp,
+        )?;
+    }
+    let network_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridNetwork",
+        "metadata": { "name": LOCAL_STATUS_NETWORK },
+        "spec": {
+            "seeds": [], "gridId": "local-status-test",
+            "membership": { "mode": "Local" }, "signalTransport": { "mode": "poll" },
+            "tls": {
+                "caSecretRef": { "name": LOCAL_STATUS_CA_SECRET, "namespace": "default" },
+                "siteSecretRef": { "name": LOCAL_STATUS_TLS_SECRET, "namespace": "default" }
+            }
+        }
+    }))?;
+    kubectl::apply_manifest(peer_context, &network_json)?;
+    let caller_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": LOCAL_STATUS_OWN_SITE },
+        "spec": {
+            "gridNetworkRef": LOCAL_STATUS_NETWORK,
+            "trust": { "canonicalFingerprints": [operator::pem_fingerprint(&own_cert.cert_pem)?] }
+        }
+    }))?;
+    kubectl::apply_manifest(peer_context, &caller_json)?;
+    let peer_json = serde_json::to_string_pretty(&serde_json::json!({
+        "apiVersion": "grid.praxis.fast/v1alpha1",
+        "kind": "GridSite",
+        "metadata": { "name": LOCAL_STATUS_PEER_SITE },
+        "spec": {
+            "gridNetworkRef": LOCAL_STATUS_NETWORK,
+            "gatewayEndpoint": {
+                "address": peer_addr, "tls": { "mode": "Mutual", "serverName": peer_san }
+            },
+            "signalsEndpoint": { "address": peer_addr, "serverName": peer_san },
+            "trust": { "canonicalFingerprints": [operator::pem_fingerprint(&peer_cert.cert_pem)?] }
+        }
+    }))?;
+    kubectl::apply_manifest(peer_context, &peer_json)?;
+    let peer = operator::spawn_local_operator(peer_context, LOCAL_STATUS_PEER_SITE, &peer_addr, temp)?;
+    let mut peer_guard = ProcGuard(Some(peer), "local-status peer operator");
+    kubectl::apply_manifest(context, &peer_json)?;
+    for type_ in ["SignalsReachable", "CatalogAccepted"] {
+        operator::wait_for_local_status_peer_condition(context, type_, LOCAL_STATUS_POLL_TIMEOUT)?;
+    }
+    for &(type_, reason) in peer_conditions {
+        operator::wait_for_network_condition(
+            context,
+            LOCAL_STATUS_NETWORK,
+            type_,
+            "True",
+            reason,
+            LOCAL_STATUS_POLL_TIMEOUT,
+        )?;
+    }
+    if let Some(child) = peer_guard.0.as_mut() {
+        operator::assert_operator_alive(child)?;
+    }
+    eprintln!("  [OK] peer at {peer_addr} answered with verified TLS ({peer_san}); all 5 network conditions True");
     Ok(())
 }
 
@@ -6064,6 +6512,32 @@ mod multi_provider_tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn local_status_peer_context_is_distinct_from_selected_context() {
+        let cfg = make_config(&[
+            ("site-a", ClusterRole::Provider, vec!["model-x".to_owned()]),
+            ("site-b", ClusterRole::Provider, vec!["model-y".to_owned()]),
+        ]);
+        assert_eq!(
+            resolve_local_status_peer_context(&cfg, &kind::kubectl_context("site-a")).unwrap(),
+            kind::kubectl_context("site-b")
+        );
+        assert_eq!(
+            resolve_local_status_peer_context(&cfg, &kind::kubectl_context("site-b")).unwrap(),
+            kind::kubectl_context("site-a")
+        );
+    }
+
+    #[test]
+    fn local_status_peer_context_requires_another_cluster() {
+        let cfg = make_config(&[("site-a", ClusterRole::Provider, vec!["model-x".to_owned()])]);
+        let error = resolve_local_status_peer_context(&cfg, &kind::kubectl_context("site-a")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "verify-local-site-status requires two configured kind clusters"
+        );
     }
 
     #[test]
@@ -6468,7 +6942,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
     let remote_site_name = operator::auto_discovered_gridsite_name(ROTATION_NETWORK, ROTATION_REMOTE_SWIM_ID);
     operator::apply_rotation_remote_provider(&context)?;
 
-    // Step 4: Apply GridSite with [fp-A] → Active/TlsVerified
+    // Step 4: Apply GridSite with [fp-A] -> Active/TlsVerified
     eprintln!("verify-gridsite-rotation: [4] apply GridSite with fp-A");
 
     operator::apply_tls_verified_gridsite_for_eligibility(
@@ -6529,10 +7003,10 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!(
             "  [PASS] step 4b: remote CRDT candidate present in overlay \
-             (remote GridSite Active → routing eligible)"
+             (remote GridSite Active -> routing eligible)"
         );
 
-        // Step 5: Restart with cert-B, fp-A still configured → PinMismatch
+        // Step 5: Restart with cert-B, fp-A still configured -> PinMismatch
         eprintln!("verify-gridsite-rotation: [5] restart server with cert-B (fp-A configured)");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6552,7 +7026,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 5: Connecting/PinMismatch after cert swap");
 
-        // Step 6: Patch [fp-A, fp-B] → Active/TlsVerified (cert-B matches fp-B)
+        // Step 6: Patch [fp-A, fp-B] -> Active/TlsVerified (cert-B matches fp-B)
         eprintln!("verify-gridsite-rotation: [6] dual-pin overlap [fp-A, fp-B]");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_a, &fp_b])?;
         operator::bump_gridsite(&context, ROTATION_SITE)?;
@@ -6608,7 +7082,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         // No step for AdvertisedCertificateMismatch: it needs the remote TLS broadcast
         // secret patched apart from the probe cert, and no longer changes phase.
 
-        // Step 7: Patch [fp-B] only → still Active/TlsVerified
+        // Step 7: Patch [fp-B] only -> still Active/TlsVerified
         eprintln!("verify-gridsite-rotation: [7] single pin [fp-B]");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
         operator::bump_gridsite(&context, ROTATION_SITE)?;
@@ -6684,7 +7158,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 7c: TlsVerified, cert-B restored after C rejection");
 
-        // Step 8: Restart with expired cert → CertificateExpired
+        // Step 8: Restart with expired cert -> CertificateExpired
         eprintln!("verify-gridsite-rotation: [8] restart with expired cert");
         operator::patch_gridsite_fingerprints(&context, ROTATION_SITE, &[&fp_b])?;
         server_child = Some(operator::restart_tls_probe_server(
@@ -6705,7 +7179,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 8: Connecting/CertificateExpired");
 
-        // Routing eligibility: expired cert → remote GridSite also Connecting → excluded.
+        // Routing eligibility: expired cert -> remote GridSite also Connecting -> excluded.
         operator::wait_for_no_site_candidate_in_overlay(
             &context,
             ROTATION_NETWORK,
@@ -6715,10 +7189,10 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!(
             "  [PASS] step 8 eligibility: remote CRDT candidate excluded from overlay \
-             (remote GridSite Connecting → routing ineligible)"
+             (remote GridSite Connecting -> routing ineligible)"
         );
 
-        // Step 8a: Not-yet-valid cert → CertificateNotYetValid
+        // Step 8a: Not-yet-valid cert -> CertificateNotYetValid
         eprintln!("verify-gridsite-rotation: [8a] restart with not-yet-valid cert");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6738,7 +7212,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 8a: Connecting/CertificateNotYetValid");
 
-        // Step 9: Restore cert-B with [fp-B] → Active/TlsVerified
+        // Step 9: Restore cert-B with [fp-B] -> Active/TlsVerified
         eprintln!("verify-gridsite-rotation: [9] restore cert-B");
         server_child = Some(operator::restart_tls_probe_server(
             &mut server_child,
@@ -6758,7 +7232,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!("  [PASS] step 9: Active/TlsVerified recovered after full rotation matrix");
 
-        // Routing eligibility: recovery → remote GridSite also Active → included.
+        // Routing eligibility: recovery -> remote GridSite also Active -> included.
         operator::wait_for_site_candidate_in_overlay(
             &context,
             ROTATION_NETWORK,
@@ -6768,7 +7242,7 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
         )?;
         eprintln!(
             "  [PASS] step 9 eligibility: remote CRDT candidate returned to overlay \
-             (remote GridSite Active → routing eligible again)"
+             (remote GridSite Active -> routing eligible again)"
         );
 
         // Event validation
@@ -6812,14 +7286,14 @@ fn env_verify_gridsite_rotation(config: &Path, site: Option<&str>) -> Result<(),
 
     eprintln!(
         "verify-gridsite-rotation: PASS: \
-         rotation matrix verified with routing eligibility: initial → mismatch → dual-pin → \
-         partial rollout → convergence-B → single-pin → rollback-A → \
-         reject-C → restore-B → expired → not-yet-valid → recovery"
+         rotation matrix verified with routing eligibility: initial -> mismatch -> dual-pin -> \
+         partial rollout -> convergence-B -> single-pin -> rollback-A -> \
+         reject-C -> restore-B -> expired -> not-yet-valid -> recovery"
     );
     Ok(())
 }
 
-/// Reserve a single SWIM bind address (port 0 → OS-assigned).
+/// Reserve a single SWIM bind address (port 0 -> OS-assigned).
 fn reserve_single_bind_addr() -> Result<String, Box<dyn std::error::Error>> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?.to_string();
@@ -6835,7 +7309,7 @@ fn reserve_single_bind_addr() -> Result<String, Box<dyn std::error::Error>> {
 /// oscillation on a shared `GridSite`.
 #[expect(
     clippy::too_many_lines,
-    reason = "sequential convergence test: setup → verify → destabilize → recover → observe stability"
+    reason = "sequential convergence test: setup -> verify -> destabilize -> recover -> observe stability"
 )]
 #[expect(
     clippy::similar_names,
@@ -6926,7 +7400,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
     operator::assert_operator_alive(op_b_guard.0.as_mut().ok_or("operator-B missing after spawn")?)?;
     eprintln!("  [OK] both operator replicas alive after startup");
 
-    // Step 3: Apply GridSite with [fp-A] → Active/TlsVerified
+    // Step 3: Apply GridSite with [fp-A] -> Active/TlsVerified
     eprintln!("verify-gridsite-convergence: [3] apply GridSite with fp-A");
     operator::apply_tls_verified_gridsite_for_eligibility(
         &context,
@@ -6952,7 +7426,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
 
         let conv_metrics_baseline = operator::scrape_metrics(&convergence_metrics_addr)?;
 
-        // Step 4: Cause pin mismatch → Connecting/PinMismatch
+        // Step 4: Cause pin mismatch -> Connecting/PinMismatch
         eprintln!("verify-gridsite-convergence: [4] restart with cert-B (fp-A configured)");
         let port = probe_addr
             .split(':')
@@ -6973,7 +7447,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
         )?;
         eprintln!("  [PASS] step 4: Connecting/PinMismatch with two replicas");
 
-        // Step 5: Restore identity → Active/TlsVerified
+        // Step 5: Restore identity -> Active/TlsVerified
         eprintln!("verify-gridsite-convergence: [5] restore identity [fp-A, fp-B]");
         operator::patch_gridsite_fingerprints(&context, CONVERGENCE_SITE, &[&fp_a, &fp_b])?;
         operator::bump_gridsite(&context, CONVERGENCE_SITE)?;
@@ -7033,7 +7507,7 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
             let reason = operator::read_gridsite_reason(&context, CONVERGENCE_SITE);
             if reason != last_reason {
                 transitions += 1;
-                eprintln!("  [WARN] unexpected transition: {last_reason:?} → {reason:?}");
+                eprintln!("  [WARN] unexpected transition: {last_reason:?} -> {reason:?}");
                 last_reason = reason;
             }
         }
@@ -7111,7 +7585,6 @@ fn env_verify_gridsite_convergence(config: &Path, site: Option<&str>) -> Result<
 ///    configured tool list.
 /// 5. Apply a second `AgentToolProvider` pointed at a nonexistent Service and confirm it lands on `Unavailable` with a
 ///    populated `status.reason`.
-#[expect(clippy::too_many_lines, reason = "multi-step E2E orchestration")]
 fn env_verify_agenttoolprovider_convergence(
     config: &Path,
     site: Option<&str>,
@@ -7252,10 +7725,6 @@ fn env_verify_agenttoolprovider_convergence(
 /// 5. Bind TCP listener and apply plaintext egress to B's `GridSite`.
 /// 6. Wait for `IdentityVerificationRequired` while B remains `Connecting`.
 /// 7. Assert B's CRDT provider remains absent from the overlay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential routing-eligibility proof: 7 steps covering SWIM → overlay"
-)]
 #[expect(
     clippy::similar_names,
     reason = "op_a/op_b-style peer-pair naming is the clear, established idiom for symmetric two-node \
@@ -7615,5 +8084,97 @@ mod demo_root_tests {
         );
 
         drop(fs::remove_dir_all(&tmp));
+    }
+}
+
+#[cfg(test)]
+mod operator_routing_qualification_cli_tests {
+    use std::{error::Error, io, path::PathBuf};
+
+    use clap::Parser as _;
+
+    use super::Action;
+    use crate::{Cli, Command};
+
+    fn parse_env_action(args: &[&str]) -> Result<Action, Box<dyn Error>> {
+        let cli = Cli::try_parse_from(args)?;
+        if let Command::Env { action } = cli.command {
+            Ok(action)
+        } else {
+            Err(io::Error::other("parsed command was not the env command").into())
+        }
+    }
+
+    fn operator_routing_config(action: Action) -> Result<PathBuf, Box<dyn Error>> {
+        if let Action::RunGridOperatorRoutingQualification { forge_config, .. } = action {
+            Ok(forge_config)
+        } else {
+            Err(io::Error::other("parsed env action was not operator routing qualification").into())
+        }
+    }
+
+    #[test]
+    fn operator_routing_command_defaults_to_its_dedicated_topology() -> Result<(), Box<dyn Error>> {
+        let action = parse_env_action(&["xtask", "env", "run-grid-operator-routing-qualification"])?;
+        assert_eq!(
+            operator_routing_config(action)?,
+            PathBuf::from("tests/e2e/topologies/grid-operator-routing/forge.yaml"),
+            "the default command must use the operator-routing topology"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn another_env_action_is_not_accepted_as_operator_routing() -> Result<(), Box<dyn Error>> {
+        let action = parse_env_action(&["xtask", "env", "run-grid-static-weighted-qualification"])?;
+        assert!(
+            operator_routing_config(action).is_err(),
+            "the CLI test helper must reject a successfully parsed but unexpected action"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keep_on_failure_requires_explicit_teardown() {
+        let result = Cli::try_parse_from([
+            "xtask",
+            "env",
+            "run-grid-operator-routing-qualification",
+            "--keep-on-failure",
+        ]);
+        assert!(result.is_err(), "--keep-on-failure without --teardown must be rejected");
+    }
+
+    #[test]
+    fn operator_routing_command_accepts_custom_config_and_scoped_teardown() -> Result<(), Box<dyn Error>> {
+        let action = parse_env_action(&[
+            "xtask",
+            "env",
+            "run-grid-operator-routing-qualification",
+            "--forge-config",
+            "custom/forge.yaml",
+            "--teardown",
+            "--keep-on-failure",
+        ])?;
+        let Action::RunGridOperatorRoutingQualification {
+            forge_config,
+            teardown,
+            keep_on_failure,
+            ..
+        } = action
+        else {
+            return Err(io::Error::other("parsed action was not operator routing qualification").into());
+        };
+        assert_eq!(
+            forge_config,
+            PathBuf::from("custom/forge.yaml"),
+            "custom Forge path must be preserved"
+        );
+        assert!(teardown, "the explicit teardown option must be preserved");
+        assert!(
+            keep_on_failure,
+            "keep-on-failure must be preserved when teardown is enabled"
+        );
+        Ok(())
     }
 }

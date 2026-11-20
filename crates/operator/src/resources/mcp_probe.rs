@@ -56,7 +56,9 @@ const ENDPOINT_TLS_IDENTITY_MISMATCH: &str = "EndpointTlsIdentityMismatch";
 /// Bounds the Kubernetes status object's size against a server advertising
 /// an implausibly large tool catalog; ordinary MCP servers advertise a
 /// handful to a few dozen tools. Applied after deduplication, so it only
-/// discards genuinely distinct names beyond this limit.
+/// discards genuinely distinct names beyond this limit. Larger than the routing cap,
+/// [`crate::resources::routing_overlay::MAX_TOOLS_PER_PROVIDER`], so the `spec.tools`
+/// allowlist applies to the whole catalog before routing cuts it.
 const MAX_DISCOVERED_TOOLS: usize = 500;
 
 /// Maximum length, in bytes, of a single tool name persisted to
@@ -482,10 +484,6 @@ fn build_probe_client_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwes
 
 /// Read `client_ref`'s certificate and private key and attach them to
 /// `builder` as the mTLS client identity.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential cert and key reads, then eager PEM validation of each"
-)]
 async fn attach_tls_client_identity(
     builder: reqwest::ClientBuilder,
     kube_client: &kube::Client,
@@ -1269,10 +1267,6 @@ mod tests {
     /// Build a `kube::Client` backed by an in-memory Secret map keyed by
     /// Secret name, so a real `Api::<Secret>::get_opt` round-trips through
     /// this module's own `TlsFailureReason`-mapping logic.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test mock builder: 404-vs-200 branches are the whole point"
-    )]
     fn mock_kube_client_with_secrets(
         secrets: HashMap<&'static str, k8s_openapi::api::core::v1::Secret>,
     ) -> kube::Client {
@@ -1688,7 +1682,7 @@ mod integration_tests {
         BearerToken, McpProbeOutcome, ProbeRequest, build_probe_client, resolve_endpoint_for_probe, run_probe_session,
     };
 
-    /// Runs the same resolve → build-client → session pipeline as
+    /// Runs the same resolve -> build-client -> session pipeline as
     /// [`super::probe_agent_tool_provider`], skipping only its
     /// `validate_probe_url` SSRF/format gate.
     ///

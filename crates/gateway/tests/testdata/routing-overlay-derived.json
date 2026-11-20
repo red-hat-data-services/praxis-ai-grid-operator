@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.0.0",
+  "revision": {
+    "kind": "content_addressed",
+    "algorithm": "sha256",
+    "value": "a64db5eab2b149cc2864fd62b66ba5b8eb726b37f8a327aea9e8cf14ccc0ebe5"
+  },
+  "content_digest": {
+    "algorithm": "sha256",
+    "value": "a64db5eab2b149cc2864fd62b66ba5b8eb726b37f8a327aea9e8cf14ccc0ebe5"
+  },
+  "scope": {
+    "network": "net",
+    "gateway": "inference-gw",
+    "namespace": "praxis-system",
+    "local_site": "site-a"
+  },
+  "provenance": {
+    "producer": "grid-operator",
+    "producer_version": "fixture",
+    "source_name": "net",
+    "source_uid": "0f6c1b2e-5a3d-4c7e-9b1a-2d4f6e8a0c13",
+    "source_generation": 1,
+    "rendered_at": "2026-07-29T00:00:00Z"
+  },
+  "overlay": {
+    "network": "net",
+    "local_site": "site-a",
+    "candidates": [
+      {
+        "kind": "inference_model",
+        "name": "model-x",
+        "site": "site-a",
+        "cluster": "prov-a",
+        "fresh": true,
+        "stable_id": "d46cf009",
+        "admission_state": "new_and_existing",
+        "selection_tier": "same_site",
+        "score": 7.0,
+        "score_breakdown": {
+          "locality": 1.5,
+          "queue_depth": 1.5,
+          "kv_cache": 1.0,
+          "prefix_cache": 1.0,
+          "latency": 1.0,
+          "cost": 1.0,
+          "total": 7.0
+        },
+        "rank": 0,
+        "selection_group": 0
+      },
+      {
+        "kind": "inference_model",
+        "name": "model-x",
+        "site": "site-a",
+        "cluster": "prov-b",
+        "fresh": true,
+        "stable_id": "d16ceb50",
+        "admission_state": "new_and_existing",
+        "selection_tier": "same_site",
+        "score": 7.0,
+        "score_breakdown": {
+          "locality": 1.5,
+          "queue_depth": 1.5,
+          "kv_cache": 1.0,
+          "prefix_cache": 1.0,
+          "latency": 1.0,
+          "cost": 1.0,
+          "total": 7.0
+        },
+        "rank": 1,
+        "selection_group": 0
+      }
+    ]
+  }
+}

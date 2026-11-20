@@ -10,14 +10,22 @@ use std::{
     sync::Arc,
 };
 
-use praxis_core::connectivity::Upstream;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
-use crate::metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN};
+use crate::{
+    dial::Dialed,
+    metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN},
+};
 
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
+
+/// Highest accepted operator-assigned selection group.
+///
+/// A valid serving revision contains at most [`MAX_CANDIDATES`] candidates,
+/// so it never needs more distinct ordered groups than this bound.
+const MAX_SELECTION_GROUP: u32 = 1023;
 
 /// Maximum length for identifier strings.
 const MAX_NAME_LEN: usize = 256;
@@ -92,6 +100,10 @@ impl AdmissionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfig {
+    /// Unix-millisecond deadline for a discovered model; absent for static candidates.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+
     /// Whether it takes new requests, as the operator resolved it. Absent means it does.
     #[serde(default)]
     pub admission: AdmissionState,
@@ -118,6 +130,13 @@ pub struct CandidateConfig {
     #[serde(default = "default_fresh")]
     pub publishes_load: bool,
 
+    /// Grid-assigned priority boundary for new-session selection.
+    ///
+    /// Absent defaults to `0` for older serving configurations. A higher
+    /// group is considered only after no lower group can admit new work.
+    #[serde(default)]
+    pub selection_group: u32,
+
     /// Site that owns this capability.
     pub site: String,
 
@@ -125,6 +144,10 @@ pub struct CandidateConfig {
     /// gateways. Older/static configs may omit it and retain the derived ID.
     #[serde(default)]
     pub stable_id: Option<String>,
+
+    /// Declared capacity weight from the provider's `capacityWeight` CRD field.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// Default freshness state for candidates.
@@ -136,7 +159,8 @@ fn default_fresh() -> bool {
 ///
 /// Created by `validate_candidates` from raw config entries. All string
 /// fields are bounded and non-blank. The Grid-owned fields (`admission_state`,
-/// `rank`, `selection_tier`) are populated after validation from live signals.
+/// `rank`, `selection_tier`, `selection_group`) are populated from the serving
+/// revision or live signals after validation.
 ///
 /// `Clone` is cheap: every owned field is reference counted. The refresh step clones
 /// the base set each poll cycle to re-order it by live load.
@@ -146,6 +170,9 @@ fn default_fresh() -> bool {
     reason = "each flag is an independent fact the operator or the snapshot resolves"
 )]
 pub struct RouteCandidate {
+    /// Unix-millisecond deadline for a discovered model; absent for static candidates.
+    pub expires_at_ms: Option<u64>,
+
     /// Grid-operator admission state.
     pub admission_state: AdmissionState,
 
@@ -199,14 +226,34 @@ pub struct RouteCandidate {
     /// Grid-operator locality tier (e.g. `"same_region"`).
     pub selection_tier: Option<Arc<str>>,
 
+    /// Grid-operator priority boundary for new-session selection.
+    pub selection_group: u32,
+
     /// Site that owns this capability.
     pub site: Arc<str>,
+
+    /// The owning site's sovereignty zone, from the serving config's `sovereignty_zones`. `None` never passes a fence.
+    pub sovereignty_zone: Option<Arc<str>>,
 
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
 
-    /// Remote site's gateway, dialed directly instead of a `load_balancer` cluster.
-    pub upstream: Option<Upstream>,
+    /// The upstream the gateway built for this cluster from the serving config, sent to
+    /// directly instead of a `load_balancer` cluster.
+    pub dial: Option<Arc<Dialed>>,
+
+    /// Declared capacity weight from the provider CRD, defaulting to 1.
+    pub weight: u32,
+}
+
+impl RouteCandidate {
+    /// Whether this candidate is past its deadline after applying the mesh clock-skew margin.
+    pub(crate) fn expired_at(&self, now_ms: i64) -> bool {
+        self.expires_at_ms.is_some_and(|deadline| {
+            i128::from(now_ms).saturating_add(i128::from(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS))
+                >= i128::from(deadline)
+        })
+    }
 }
 
 /// Build a deterministic stable ID from candidate identity fields.
@@ -235,10 +282,6 @@ pub(crate) fn validate_serving_candidates(raw: Vec<CandidateConfig>) -> Result<V
 
 /// Validate candidate fields while allowing emptiness only for versioned
 /// serving snapshots.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one validation pass keeps all candidate invariants adjacent"
-)]
 fn validate_candidates_with_empty(
     raw: Vec<CandidateConfig>,
     allow_empty: bool,
@@ -259,6 +302,14 @@ fn validate_candidates_with_empty(
         validate_name(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_header_value(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_credential(index, cand.credential.as_ref())?;
+        if cand.selection_group > MAX_SELECTION_GROUP {
+            return Err(
+                format!("grid: candidates[{index}].selection_group exceeds maximum of {MAX_SELECTION_GROUP}").into(),
+            );
+        }
+        if cand.weight == Some(0) {
+            return Err(format!("grid: candidates[{index}].weight must not be zero").into());
+        }
 
         if !seen.insert((cand.kind, cand.name.clone(), cand.site.clone(), cand.cluster.clone())) {
             return Err(format!(
@@ -279,6 +330,7 @@ fn validate_candidates_with_empty(
             Arc::from,
         );
         candidates.push(RouteCandidate {
+            expires_at_ms: cand.expires_at_ms,
             admission_state: cand.admission,
             capacity: None,
             rho: None,
@@ -294,9 +346,12 @@ fn validate_candidates_with_empty(
             publishes_load: cand.publishes_load,
             rank: None,
             selection_tier: None,
+            selection_group: cand.selection_group,
             site: Arc::from(cand.site.as_str()),
+            sovereignty_zone: None,
             stable_id,
-            upstream: None,
+            dial: None,
+            weight: cand.weight.unwrap_or(1),
         });
     }
 
@@ -383,7 +438,7 @@ pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
 ///
 /// Site names go into stored-state ids and request paths, so a `.`, `/`, quote
 /// or backslash in one would break them.
-fn validate_site(field: &str, value: &str) -> Result<(), FilterError> {
+pub(crate) fn validate_site(field: &str, value: &str) -> Result<(), FilterError> {
     let bytes = value.as_bytes();
     let edge = |byte: Option<&u8>| byte.is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
     let label = (1..=63).contains(&bytes.len())
@@ -428,11 +483,14 @@ fn validate_header_value(field: &str, value: &str) -> Result<(), FilterError> {
     reason = "tests"
 )]
 mod tests {
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
     use super::*;
 
     fn candidate(kind_str: &str, name: &str, site: &str, cluster: &str) -> CandidateConfig {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();
         CandidateConfig {
+            expires_at_ms: None,
             admission: AdmissionState::default(),
             cluster: cluster.to_owned(),
             credential: None,
@@ -440,9 +498,35 @@ mod tests {
             kind,
             name: name.to_owned(),
             publishes_load: true,
+            selection_group: 0,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }
+    }
+
+    #[test]
+    fn inventory_expiry_is_enforced_at_the_clock_lag_boundary() {
+        let deadline = OffsetDateTime::parse("2030-01-01T00:01:00Z", &Rfc3339).unwrap();
+        let deadline_ms = u64::try_from(deadline.unix_timestamp_nanos().div_euclid(1_000_000)).unwrap();
+        let deadline_ms_i64 = i64::try_from(deadline_ms).unwrap();
+        let margin_ms = i64::try_from(grid_signals::CANDIDATE_EXPIRY_SKEW_MARGIN_MS).unwrap();
+        let mut raw = candidate("inference_model", "m", "site-a", "pool-a");
+        raw.expires_at_ms = Some(deadline_ms);
+        let candidates = validate_serving_candidates(vec![raw]).unwrap();
+        let candidate = candidates.first().unwrap();
+        assert!(
+            !candidate.expired_at(deadline_ms_i64.saturating_sub(margin_ms).saturating_sub(1)),
+            "route remains usable before the safety margin"
+        );
+        assert!(
+            candidate.expired_at(deadline_ms_i64.saturating_sub(margin_ms)),
+            "route expires exactly at the safety margin"
+        );
+        assert!(
+            candidate.expired_at(deadline_ms_i64),
+            "deadline never receives a grace period"
+        );
     }
 
     #[test]
@@ -463,6 +547,20 @@ mod tests {
         c.fresh = false;
         let candidates = validate_candidates(vec![c]).unwrap();
         assert!(!candidates[0].fresh);
+    }
+
+    #[test]
+    fn serving_expiry_is_parsed_and_applies_the_mesh_clock_skew_margin() {
+        let config: CandidateConfig = serde_yaml::from_str(
+            "admission: new_and_existing\ncluster: c\nexpires_at_ms: 100000\nfresh: true\nkind: inference_model\nname: m\npublishes_load: true\nsite: s\nstable_id: null\n",
+        )
+        .unwrap();
+        let candidates = validate_candidates(vec![config]).unwrap();
+        let parsed = candidates.first().unwrap();
+
+        assert_eq!(parsed.expires_at_ms, Some(100_000));
+        assert!(!parsed.expired_at(69_999));
+        assert!(parsed.expired_at(70_000));
     }
 
     #[test]
@@ -596,5 +694,41 @@ mod tests {
         let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
         assert!(parse(&format!("{{{base}}}")).unwrap());
         assert!(!parse(&format!(r#"{{{base},"publishes_load":false}}"#)).unwrap());
+    }
+
+    #[test]
+    fn selection_group_defaults_for_older_configs_and_preserves_operator_priority() {
+        let parse = |json: &str| serde_yaml::from_str::<CandidateConfig>(json);
+        let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
+
+        assert_eq!(parse(&format!("{{{base}}}")).unwrap().selection_group, 0);
+        let configured = parse(&format!(r#"{{{base},"selection_group":2}}"#)).unwrap();
+        assert_eq!(
+            validate_candidates(vec![configured]).unwrap()[0].selection_group,
+            2,
+            "the route selector must receive the operator's regional boundary"
+        );
+    }
+
+    #[test]
+    fn selection_group_is_bounded() {
+        let mut candidate = candidate("inference_model", "m", "s", "c");
+        candidate.selection_group = MAX_SELECTION_GROUP.saturating_add(1);
+
+        let error = validate_candidates(vec![candidate]).expect_err("out-of-range selection group is rejected");
+        assert!(error.to_string().contains("selection_group exceeds maximum"), "{error}");
+    }
+
+    #[test]
+    fn zero_weight_is_rejected() {
+        let raw = vec![CandidateConfig {
+            weight: Some(0),
+            ..candidate("inference_model", "m", "s", "c")
+        }];
+        let err = validate_candidates(raw).expect_err("zero weight must be rejected");
+        assert!(
+            err.to_string().contains("weight must not be zero"),
+            "unexpected error: {err}"
+        );
     }
 }
